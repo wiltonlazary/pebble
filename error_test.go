@@ -13,7 +13,6 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/errors"
-	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/errorfs"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/stretchr/testify/require"
@@ -33,14 +32,6 @@ type corruptFS struct {
 	vfs.FS
 	index     int32
 	bytesRead int32
-}
-
-func newCorruptFS(index int32) *corruptFS {
-	return &corruptFS{
-		FS:        vfs.NewMem(),
-		index:     index,
-		bytesRead: 0,
-	}
 }
 
 func (fs corruptFS) maybeCorrupt(n int32, p []byte) {
@@ -84,7 +75,7 @@ func expectLSM(expected string, d *DB, t *testing.T) {
 	t.Helper()
 	expected = strings.TrimSpace(expected)
 	d.mu.Lock()
-	actual := d.mu.versions.currentVersion().DebugString(base.DefaultFormatter)
+	actual := d.mu.versions.currentVersion().String()
 	d.mu.Unlock()
 	actual = strings.TrimSpace(actual)
 	if expected != actual {
@@ -122,7 +113,7 @@ func TestErrors(t *testing.T) {
 		if err := d.Flush(); err != nil {
 			return err
 		}
-		if err := d.Compact(nil, []byte("\xff")); err != nil {
+		if err := d.Compact(nil, []byte("\xff"), false); err != nil {
 			return err
 		}
 
@@ -190,7 +181,7 @@ func TestRequireReadError(t *testing.T) {
 		require.NoError(t, d.Set(key1, value, nil))
 		require.NoError(t, d.Set(key2, value, nil))
 		require.NoError(t, d.Flush())
-		require.NoError(t, d.Compact(key1, key2))
+		require.NoError(t, d.Compact(key1, key2, false))
 		require.NoError(t, d.DeleteRange(key1, key2, nil))
 		require.NoError(t, d.Set(key1, value, nil))
 		require.NoError(t, d.Flush())
@@ -292,7 +283,7 @@ func TestCorruptReadError(t *testing.T) {
 		require.NoError(t, d.Set(key1, value, nil))
 		require.NoError(t, d.Set(key2, value, nil))
 		require.NoError(t, d.Flush())
-		require.NoError(t, d.Compact(key1, key2))
+		require.NoError(t, d.Compact(key1, key2, false))
 		require.NoError(t, d.DeleteRange(key1, key2, nil))
 		require.NoError(t, d.Set(key1, value, nil))
 		require.NoError(t, d.Flush())
@@ -379,7 +370,7 @@ func TestDBWALRotationCrash(t *testing.T) {
 		opts := &Options{
 			FS:           fs,
 			Logger:       panicLogger{},
-			MemTableSize: 1024,
+			MemTableSize: 2048,
 		}
 		opts.private.disableTableStats = true
 		d, err := Open("", opts)

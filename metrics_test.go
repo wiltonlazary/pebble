@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/datadriven"
 	"github.com/cockroachdb/pebble/internal/humanize"
 	"github.com/cockroachdb/pebble/vfs"
@@ -28,8 +27,11 @@ func TestMetricsFormat(t *testing.T) {
 	m.Compact.ElisionOnlyCount = 29
 	m.Compact.MoveCount = 30
 	m.Compact.ReadCount = 31
+	m.Compact.RewriteCount = 32
+	m.Compact.MultiLevelCount = 33
 	m.Compact.EstimatedDebt = 6
 	m.Compact.InProgressBytes = 7
+	m.Compact.NumInProgress = 2
 	m.Flush.Count = 8
 	m.Filter.Hits = 9
 	m.Filter.Misses = 10
@@ -37,6 +39,8 @@ func TestMetricsFormat(t *testing.T) {
 	m.MemTable.Count = 12
 	m.MemTable.ZombieSize = 13
 	m.MemTable.ZombieCount = 14
+	m.Snapshots.Count = 4
+	m.Snapshots.EarliestSeqNum = 1024
 	m.Table.ZombieSize = 15
 	m.Table.ZombieCount = 16
 	m.TableCache.Size = 17
@@ -81,13 +85,14 @@ __level_____count____size___score______in__ingest(sz_cnt)____move(sz_cnt)___writ
       6       701   702 B       -   704 B   704 B     712   706 B     713   1.4 K   1.4 K   707 B       7     2.0
   total      2807   2.7 K       -   2.8 K   2.8 K   2.9 K   2.8 K   2.9 K   8.4 K   5.7 K   2.8 K      28     3.0
   flush         8
-compact         5     6 B             7 B          (size == estimated-debt, in = in-progress-bytes)
-  ctype        27      28      29      30      31  (default, delete, elision, move, read)
+compact         5     6 B     7 B       2          (size == estimated-debt, score = in-progress-bytes, in = num-in-progress)
+  ctype        27      28      29      30      31      32      33  (default, delete, elision, move, read, rewrite, multi-level)
  memtbl        12    11 B
 zmemtbl        14    13 B
    ztbl        16    15 B
  bcache         2     1 B   42.9%  (score == hit-rate)
  tcache        18    17 B   48.7%  (score == hit-rate)
+  snaps         4       -    1024  (score == earliest seq num)
  titers        21
  filter         -       -   47.4%  (score == utility)
 `
@@ -97,10 +102,17 @@ zmemtbl        14    13 B
 }
 
 func TestMetrics(t *testing.T) {
-	d, err := Open("", &Options{
+	opts := &Options{
 		FS:                    vfs.NewMem(),
 		L0CompactionThreshold: 8,
-	})
+	}
+
+	// Prevent foreground flushes and compactions from triggering asynchronous
+	// follow-up compactions. This avoids asynchronously-scheduled work from
+	// interfering with the expected metrics output and reduces test flakiness.
+	opts.DisableAutomaticCompactions = true
+
+	d, err := Open("", opts)
 	require.NoError(t, err)
 	defer func() {
 		require.NoError(t, d.Close())
@@ -129,7 +141,7 @@ func TestMetrics(t *testing.T) {
 			}
 
 			d.mu.Lock()
-			s := d.mu.versions.currentVersion().DebugString(base.DefaultFormatter)
+			s := d.mu.versions.currentVersion().String()
 			d.mu.Unlock()
 			return s
 
@@ -139,7 +151,7 @@ func TestMetrics(t *testing.T) {
 			}
 
 			d.mu.Lock()
-			s := d.mu.versions.currentVersion().DebugString(base.DefaultFormatter)
+			s := d.mu.versions.currentVersion().String()
 			d.mu.Unlock()
 			return s
 
@@ -216,13 +228,14 @@ __level_____count____size___score______in__ingest(sz_cnt)____move(sz_cnt)___writ
       6         0     0 B       -     0 B     0 B       0     0 B       0     0 B       0     0 B       0     0.0
   total         0     0 B       -     0 B     0 B       0     0 B       0     0 B       0     0 B       0     0.0
   flush         0
-compact         0     0 B             0 B          (size == estimated-debt, in = in-progress-bytes)
-  ctype         0       0       0       0       0  (default, delete, elision, move, read)
+compact         0     0 B     0 B       0          (size == estimated-debt, score = in-progress-bytes, in = num-in-progress)
+  ctype         0       0       0       0       0       0       0  (default, delete, elision, move, read, rewrite, multi-level)
  memtbl         0     0 B
 zmemtbl         0     0 B
    ztbl         0     0 B
  bcache         0     0 B    0.0%  (score == hit-rate)
  tcache         0     0 B    0.0%  (score == hit-rate)
+  snaps         0       -       0  (score == earliest seq num)
  titers         0
  filter         -       -    0.0%  (score == utility)
 `

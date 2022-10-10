@@ -15,6 +15,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/datadriven"
+	"github.com/cockroachdb/pebble/internal/keyspan"
 	"github.com/cockroachdb/pebble/internal/manifest"
 	"github.com/cockroachdb/pebble/internal/private"
 	"github.com/cockroachdb/pebble/internal/rangedel"
@@ -93,7 +94,7 @@ func TestCheckLevelsCornerCases(t *testing.T) {
 
 	var fileNum FileNum
 	newIters :=
-		func(file *manifest.FileMetadata, opts *IterOptions, bytesIterated *uint64) (internalIterator, internalIterator, error) {
+		func(file *manifest.FileMetadata, _ *IterOptions, _ internalIterOpts) (internalIterator, keyspan.FragmentIterator, error) {
 			r := readers[file.FileNum]
 			rangeDelIter, err := r.NewRawRangeDelIter()
 			if err != nil {
@@ -135,11 +136,10 @@ func TestCheckLevelsCornerCases(t *testing.T) {
 				keys := strings.Fields(line)
 				smallestKey := base.ParseInternalKey(keys[0])
 				largestKey := base.ParseInternalKey(keys[1])
-				*li = append(*li, &fileMetadata{
-					FileNum:  fileNum,
-					Smallest: smallestKey,
-					Largest:  largestKey,
-				})
+				m := (&fileMetadata{
+					FileNum: fileNum,
+				}).ExtendPointKeyBounds(cmp, smallestKey, largestKey)
+				*li = append(*li, m)
 
 				i++
 				line = lines[i]
@@ -162,12 +162,12 @@ func TestCheckLevelsCornerCases(t *testing.T) {
 						return fmt.Sprintf("unknown arg: %s", arg.Key)
 					}
 				}
-				var tombstones []rangedel.Tombstone
-				frag := rangedel.Fragmenter{
+				var tombstones []keyspan.Span
+				frag := keyspan.Fragmenter{
 					Cmp:    cmp,
 					Format: formatKey,
-					Emit: func(fragmented []rangedel.Tombstone) {
-						tombstones = append(tombstones, fragmented...)
+					Emit: func(fragmented keyspan.Span) {
+						tombstones = append(tombstones, fragmented)
 					},
 				}
 				keyvalues := strings.Fields(line)
@@ -182,7 +182,7 @@ func TestCheckLevelsCornerCases(t *testing.T) {
 							err = w.Add(ikey, value)
 							break
 						}
-						frag.Add(ikey, value)
+						frag.Add(rangedel.Decode(ikey, value, nil))
 					default:
 						err = w.Add(ikey, value)
 					}
@@ -192,7 +192,7 @@ func TestCheckLevelsCornerCases(t *testing.T) {
 				}
 				frag.Finish()
 				for _, v := range tombstones {
-					if err := w.Add(v.Start, v.End); err != nil {
+					if err := rangedel.Encode(&v, w.Add); err != nil {
 						return err.Error()
 					}
 				}

@@ -2,6 +2,7 @@
 // of this source code is governed by a BSD-style license that can be found in
 // the LICENSE file.
 
+//go:build make_test_find_db
 // +build make_test_find_db
 
 // Run using: go run -tags make_test_find_db make_test_find_db.go
@@ -123,7 +124,7 @@ func (d *db) flush() {
 }
 
 func (d *db) compact(start, end string) {
-	if err := d.db.Compact([]byte(start), []byte(end)); err != nil {
+	if err := d.db.Compact([]byte(start), []byte(end), false); err != nil {
 		log.Fatal(err)
 	}
 }

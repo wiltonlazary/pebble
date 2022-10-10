@@ -19,12 +19,13 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/cockroachdb/errors"
 )
 
 var (
@@ -186,7 +187,7 @@ func Walk(t *testing.T, path string, f func(t *testing.T, path string)) {
 		f(t, path)
 		return
 	}
-	files, err := ioutil.ReadDir(path)
+	files, err := os.ReadDir(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,47 +230,28 @@ type TestData struct {
 // td.ScanArgs(t, "arg3", &i2, &i3, &i4)
 func (td *TestData) ScanArgs(t *testing.T, key string, dests ...interface{}) {
 	t.Helper()
-	var arg CmdArg
-	for i := range td.CmdArgs {
-		if td.CmdArgs[i].Key == key {
-			arg = td.CmdArgs[i]
-			break
-		}
-	}
-	if arg.Key == "" {
+	arg := td.findArg(key)
+	if arg == nil {
 		t.Fatalf("missing argument: %s", key)
 	}
-	if len(dests) != len(arg.Vals) {
-		t.Fatalf("%s: got %d destinations, but %d values", arg.Key, len(dests), len(arg.Vals))
+	err := arg.scan(dests...)
+	if err != nil {
+		t.Fatal(err)
 	}
+}
 
-	for i := range dests {
-		val := arg.Vals[i]
-		switch dest := dests[i].(type) {
-		case *string:
-			*dest = val
-		case *int:
-			n, err := strconv.ParseInt(val, 10, 64)
-			if err != nil {
-				t.Fatal(err)
-			}
-			*dest = int(n) // assume 64bit ints
-		case *uint64:
-			n, err := strconv.ParseUint(val, 10, 64)
-			if err != nil {
-				t.Fatal(err)
-			}
-			*dest = n
-		case *bool:
-			b, err := strconv.ParseBool(val)
-			if err != nil {
-				t.Fatal(err)
-			}
-			*dest = b
-		default:
-			t.Fatalf("unsupported type %T for destination #%d (might be easy to add it)", dest, i+1)
+// HasArg determines if `key` appears in CmdArgs.
+func (td *TestData) HasArg(key string) bool {
+	return td.findArg(key) != nil
+}
+
+func (td *TestData) findArg(key string) *CmdArg {
+	for i := range td.CmdArgs {
+		if td.CmdArgs[i].Key == key {
+			return &td.CmdArgs[i]
 		}
 	}
+	return nil
 }
 
 // CmdArg contains information about an argument on the directive line. An
@@ -293,6 +275,41 @@ func (arg CmdArg) String() string {
 	default:
 		return fmt.Sprintf("%s=(%s)", arg.Key, strings.Join(arg.Vals, ", "))
 	}
+}
+
+func (arg CmdArg) scan(dests ...interface{}) error {
+	if len(dests) != len(arg.Vals) {
+		return errors.Errorf("%s: got %d destinations, but %d values", arg.Key, len(dests), len(arg.Vals))
+	}
+
+	for i := range dests {
+		val := arg.Vals[i]
+		switch dest := dests[i].(type) {
+		case *string:
+			*dest = val
+		case *int:
+			n, err := strconv.ParseInt(val, 10, 64)
+			if err != nil {
+				return err
+			}
+			*dest = int(n) // assume 64bit ints
+		case *uint64:
+			n, err := strconv.ParseUint(val, 10, 64)
+			if err != nil {
+				return err
+			}
+			*dest = n
+		case *bool:
+			b, err := strconv.ParseBool(val)
+			if err != nil {
+				return err
+			}
+			*dest = b
+		default:
+			return errors.Errorf("unsupported type %T for destination #%d (might be easy to add it)", dest, i+1)
+		}
+	}
+	return nil
 }
 
 // Fatalf wraps a fatal testing error with test file position information, so

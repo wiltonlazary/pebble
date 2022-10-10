@@ -14,11 +14,14 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/datadriven"
+	"github.com/cockroachdb/pebble/internal/testkeys"
 	"github.com/cockroachdb/pebble/record"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/exp/rand"
 )
 
 func readManifest(filename string) (*Version, error) {
@@ -76,7 +79,7 @@ func TestL0Sublevels_LargeImportL0(t *testing.T) {
 		var files []*FileMetadata
 		for i := range c.Files {
 			if c.FilesIncluded[i] {
-				c.Files[i].Compacting = true
+				c.Files[i].CompactionState = CompactionStateCompacting
 				files = append(files, c.Files[i])
 			}
 		}
@@ -95,7 +98,7 @@ func TestL0Sublevels_LargeImportL0(t *testing.T) {
 		var files []*FileMetadata
 		for i := range c.Files {
 			if c.FilesIncluded[i] {
-				c.Files[i].Compacting = true
+				c.Files[i].CompactionState = CompactionStateCompacting
 				c.Files[i].IsIntraL0Compacting = true
 				files = append(files, c.Files[i])
 			}
@@ -127,16 +130,16 @@ func visualizeSublevels(
 			buf.WriteByte(f.Smallest.UserKey[0])
 			middleChar := byte('-')
 			if isL0 {
-				if compactionFiles[f.l0Index] {
+				if compactionFiles[f.L0Index] {
 					middleChar = '+'
-				} else if f.Compacting {
+				} else if f.IsCompacting() {
 					if f.IsIntraL0Compacting {
 						middleChar = '^'
 					} else {
 						middleChar = 'v'
 					}
 				}
-			} else if f.Compacting {
+			} else if f.IsCompacting() {
 				middleChar = '='
 			}
 			if largestChar < f.Largest.UserKey[0] {
@@ -144,7 +147,7 @@ func visualizeSublevels(
 			}
 			if f.Smallest.UserKey[0] == f.Largest.UserKey[0] {
 				buf.WriteByte(f.Largest.UserKey[0])
-				if compactionFiles[f.l0Index] {
+				if compactionFiles[f.L0Index] {
 					buf.WriteByte('+')
 				} else if j < len(files)-1 {
 					buf.WriteByte(' ')
@@ -161,7 +164,7 @@ func visualizeSublevels(
 				buf.WriteByte(middleChar)
 				lastChar++
 			}
-			if f.Largest.Trailer == base.InternalKeyRangeDeleteSentinel &&
+			if f.Largest.IsExclusiveSentinel() &&
 				j < len(files)-1 && files[j+1].Smallest.UserKey[0] == f.Largest.UserKey[0] {
 				// This case happens where two successive files have
 				// matching end/start user keys but where the left-side file
@@ -214,12 +217,16 @@ func TestL0Sublevels(t *testing.T) {
 		}
 		fields := strings.Fields(parts[1])
 		keyRange := strings.Split(strings.TrimSpace(fields[0]), "-")
-		m := FileMetadata{
-			Smallest: base.ParseInternalKey(strings.TrimSpace(keyRange[0])),
-			Largest:  base.ParseInternalKey(strings.TrimSpace(keyRange[1])),
-		}
+		m := (&FileMetadata{}).ExtendPointKeyBounds(
+			base.DefaultComparer.Compare,
+			base.ParseInternalKey(strings.TrimSpace(keyRange[0])),
+			base.ParseInternalKey(strings.TrimSpace(keyRange[1])),
+		)
 		m.SmallestSeqNum = m.Smallest.SeqNum()
 		m.LargestSeqNum = m.Largest.SeqNum()
+		if m.Largest.IsExclusiveSentinel() {
+			m.LargestSeqNum = m.SmallestSeqNum
+		}
 		m.FileNum = base.FileNum(fileNum)
 		m.Size = uint64(256)
 
@@ -229,12 +236,12 @@ func TestL0Sublevels(t *testing.T) {
 				switch parts[0] {
 				case "base_compacting":
 					m.IsIntraL0Compacting = false
-					m.Compacting = true
+					m.CompactionState = CompactionStateCompacting
 				case "intra_l0_compacting":
 					m.IsIntraL0Compacting = true
-					m.Compacting = true
+					m.CompactionState = CompactionStateCompacting
 				case "compacting":
-					m.Compacting = true
+					m.CompactionState = CompactionStateCompacting
 				case "size":
 					sizeInt, err := strconv.Atoi(parts[1])
 					if err != nil {
@@ -245,10 +252,9 @@ func TestL0Sublevels(t *testing.T) {
 			}
 		}
 
-		return &m, nil
+		return m, nil
 	}
 
-	var level int
 	var err error
 	var fileMetas [NumLevels][]*FileMetadata
 	var explicitSublevels [][]*FileMetadata
@@ -258,14 +264,22 @@ func TestL0Sublevels(t *testing.T) {
 
 	datadriven.RunTest(t, "testdata/l0_sublevels", func(td *datadriven.TestData) string {
 		pickBaseCompaction := false
+		level := 0
+		addL0FilesOpt := false
 		switch td.Cmd {
+		case "add-l0-files":
+			addL0FilesOpt = true
+			level = 0
+			fallthrough
 		case "define":
-			fileMetas = [NumLevels][]*FileMetadata{}
+			if !addL0FilesOpt {
+				fileMetas = [NumLevels][]*FileMetadata{}
+				baseLevel = NumLevels - 1
+				activeCompactions = nil
+			}
 			explicitSublevels = [][]*FileMetadata{}
-			activeCompactions = nil
-			baseLevel = NumLevels - 1
 			sublevel := -1
-			sublevels = nil
+			addedL0Files := make([]*FileMetadata, 0)
 			for _, data := range strings.Split(td.Input, "\n") {
 				data = strings.TrimSpace(data)
 				switch data[:2] {
@@ -292,6 +306,9 @@ func TestL0Sublevels(t *testing.T) {
 						baseLevel = level
 					}
 					fileMetas[level] = append(fileMetas[level], meta)
+					if level == 0 {
+						addedL0Files = append(addedL0Files, meta)
+					}
 					if sublevel != -1 {
 						for len(explicitSublevels) <= sublevel {
 							explicitSublevels = append(explicitSublevels, []*FileMetadata{})
@@ -323,11 +340,25 @@ func TestL0Sublevels(t *testing.T) {
 
 			levelMetadata := makeLevelMetadata(base.DefaultComparer.Compare, 0, fileMetas[0])
 			if initialize {
-				sublevels, err = NewL0Sublevels(
-					&levelMetadata,
-					base.DefaultComparer.Compare,
-					base.DefaultFormatter,
-					int64(flushSplitMaxBytes))
+				if addL0FilesOpt {
+					SortBySeqNum(addedL0Files)
+					sublevels, err = sublevels.AddL0Files(addedL0Files, int64(flushSplitMaxBytes), &levelMetadata)
+					// Check if the output matches a full initialization.
+					sublevels2, _ := NewL0Sublevels(&levelMetadata, base.DefaultComparer.Compare, base.DefaultFormatter, int64(flushSplitMaxBytes))
+					if sublevels != nil && sublevels2 != nil {
+						require.Equal(t, sublevels.flushSplitUserKeys, sublevels2.flushSplitUserKeys)
+						require.Equal(t, sublevels.levelFiles, sublevels2.levelFiles)
+					}
+				} else {
+					sublevels, err = NewL0Sublevels(
+						&levelMetadata,
+						base.DefaultComparer.Compare,
+						base.DefaultFormatter,
+						int64(flushSplitMaxBytes))
+				}
+				if err != nil {
+					return err.Error()
+				}
 				sublevels.InitCompactingFileInfo(nil)
 			} else {
 				// This case is for use with explicitly-specified sublevels
@@ -491,7 +522,7 @@ func TestL0Sublevels(t *testing.T) {
 			for _, num := range fileNums {
 				for _, f := range fileMetas[0] {
 					if f.FileNum == num {
-						f.Compacting = true
+						f.CompactionState = CompactionStateCompacting
 						files = append(files, f)
 						break
 					}
@@ -512,6 +543,94 @@ func TestL0Sublevels(t *testing.T) {
 		}
 		return fmt.Sprintf("unrecognized command: %s", td.Cmd)
 	})
+}
+
+func TestAddL0FilesEquivalence(t *testing.T) {
+	seed := uint64(time.Now().UnixNano())
+	rng := rand.New(rand.NewSource(seed))
+	t.Logf("seed: %d", seed)
+
+	var inUseKeys [][]byte
+	const keyReusePct = 0.15
+	var fileMetas []*FileMetadata
+	var s, s2 *L0Sublevels
+	keySpace := testkeys.Alpha(8)
+
+	flushSplitMaxBytes := rng.Int63n(1 << 20)
+
+	// The outer loop runs once for each version edit. The inner loop(s) run
+	// once for each file, or each file bound.
+	for i := 0; i < 100; i++ {
+		var filesToAdd []*FileMetadata
+		numFiles := 1 + rng.Intn(9)
+		keys := make([][]byte, 0, 2*numFiles)
+		for j := 0; j < 2*numFiles; j++ {
+			if rng.Float64() <= keyReusePct && len(inUseKeys) > 0 {
+				keys = append(keys, inUseKeys[rng.Intn(len(inUseKeys))])
+			} else {
+				newKey := testkeys.Key(keySpace, rng.Intn(keySpace.Count()))
+				inUseKeys = append(inUseKeys, newKey)
+				keys = append(keys, newKey)
+			}
+		}
+		sort.Slice(keys, func(i, j int) bool {
+			return bytes.Compare(keys[i], keys[j]) < 0
+		})
+		for j := 0; j < numFiles; j++ {
+			startKey := keys[j*2]
+			endKey := keys[j*2+1]
+			if bytes.Equal(startKey, endKey) {
+				continue
+			}
+			meta := (&FileMetadata{
+				FileNum:        base.FileNum(i*10 + j + 1),
+				Size:           rng.Uint64n(1 << 20),
+				SmallestSeqNum: uint64(2*i + 1),
+				LargestSeqNum:  uint64(2*i + 2),
+			}).ExtendPointKeyBounds(
+				base.DefaultComparer.Compare,
+				base.MakeInternalKey(startKey, uint64(2*i+1), base.InternalKeyKindSet),
+				base.MakeRangeDeleteSentinelKey(endKey),
+			)
+			fileMetas = append(fileMetas, meta)
+			filesToAdd = append(filesToAdd, meta)
+		}
+		if len(filesToAdd) == 0 {
+			continue
+		}
+
+		levelMetadata := makeLevelMetadata(testkeys.Comparer.Compare, 0, fileMetas)
+		var err error
+
+		if s2 == nil {
+			s2, err = NewL0Sublevels(&levelMetadata, testkeys.Comparer.Compare, testkeys.Comparer.FormatKey, flushSplitMaxBytes)
+			require.NoError(t, err)
+		} else {
+			// AddL0Files relies on the indices in FileMetadatas pointing to that of
+			// the previous L0Sublevels. So it must be called before NewL0Sublevels;
+			// calling it the other way around results in out-of-bounds panics.
+			SortBySeqNum(filesToAdd)
+			s2, err = s2.AddL0Files(filesToAdd, flushSplitMaxBytes, &levelMetadata)
+			require.NoError(t, err)
+		}
+
+		s, err = NewL0Sublevels(&levelMetadata, testkeys.Comparer.Compare, testkeys.Comparer.FormatKey, flushSplitMaxBytes)
+		require.NoError(t, err)
+
+		// Check for equivalence.
+		require.Equal(t, s.flushSplitUserKeys, s2.flushSplitUserKeys)
+		require.Equal(t, s.orderedIntervals, s2.orderedIntervals)
+		require.Equal(t, s.levelFiles, s2.levelFiles)
+	}
+}
+
+func BenchmarkManifestApplyWithL0Sublevels(b *testing.B) {
+	b.ResetTimer()
+	for n := 0; n < b.N; n++ {
+		v, err := readManifest("testdata/MANIFEST_import")
+		require.NotNil(b, v)
+		require.NoError(b, err)
+	}
 }
 
 func BenchmarkL0SublevelsInit(b *testing.B) {

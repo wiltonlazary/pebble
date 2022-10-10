@@ -74,11 +74,13 @@ func TestOptionsString(t *testing.T) {
   cleaner=delete
   compaction_debt_concurrency=1073741824
   comparer=leveldb.BytewiseComparator
-  delete_range_flush_delay=0s
   disable_wal=false
+  flush_delay_delete_range=0s
+  flush_delay_range_key=0s
   flush_split_bytes=4194304
   format_major_version=1
   l0_compaction_concurrency=10
+  l0_compaction_file_threshold=500
   l0_compaction_threshold=4
   l0_stop_writes_threshold=12
   lbase_max_bytes=67108864
@@ -87,17 +89,18 @@ func TestOptionsString(t *testing.T) {
   max_open_files=1000
   mem_table_size=4194304
   mem_table_stop_writes_threshold=2
-  min_compaction_rate=4194304
   min_deletion_rate=0
-  min_flush_rate=1048576
   merger=pebble.concatenate
   read_compaction_rate=16000
   read_sampling_multiplier=16
   strict_wal_tail=true
   table_cache_shards=8
   table_property_collectors=[]
+  validate_on_ingest=false
   wal_dir=
   wal_bytes_per_sync=0
+  max_writer_concurrency=0
+  force_writer_parallelism=false
 
 [Level "0"]
   block_restart_interval=16
@@ -221,11 +224,14 @@ func TestOptionsParse(t *testing.T) {
 			opts.Levels[1].BlockSize = 2048
 			opts.Levels[2].BlockSize = 4096
 			opts.Experimental.CompactionDebtConcurrency = 100
-			opts.Experimental.DeleteRangeFlushDelay = 10 * time.Second
+			opts.FlushDelayDeleteRange = 10 * time.Second
+			opts.FlushDelayRangeKey = 11 * time.Second
 			opts.Experimental.MinDeletionRate = 200
 			opts.Experimental.ReadCompactionRate = 300
 			opts.Experimental.ReadSamplingMultiplier = 400
 			opts.Experimental.TableCacheShards = 500
+			opts.Experimental.MaxWriterConcurrency = 1
+			opts.Experimental.ForceWriterParallelism = true
 			opts.EnsureDefaults()
 			str := opts.String()
 

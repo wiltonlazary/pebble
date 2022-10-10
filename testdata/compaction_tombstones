@@ -13,6 +13,7 @@ wait-pending-table-stats
 ----
 num-entries: 2
 num-deletions: 2
+num-range-key-sets: 0
 point-deletions-bytes-estimate: 0
 range-deletions-bytes-estimate: 0
 
@@ -34,12 +35,13 @@ wait-pending-table-stats
 ----
 num-entries: 2
 num-deletions: 2
+num-range-key-sets: 0
 point-deletions-bytes-estimate: 0
 range-deletions-bytes-estimate: 0
 
 maybe-compact
 ----
-[JOB 100] compacted(elision-only) L6 [000004] (853 B) + L6 [] (0 B) -> L6 [] (0 B), in 1.0s, output rate 0 B/s
+[JOB 100] compacted(elision-only) L6 [000004] (853 B) + L6 [] (0 B) -> L6 [] (0 B), in 1.0s (2.0s total), output rate 0 B/s
 
 # Test a table that straddles a snapshot. It should not be compacted.
 define snapshots=(50)
@@ -54,6 +56,7 @@ wait-pending-table-stats
 ----
 num-entries: 2
 num-deletions: 1
+num-range-key-sets: 0
 point-deletions-bytes-estimate: 0
 range-deletions-bytes-estimate: 26
 
@@ -76,12 +79,13 @@ wait-pending-table-stats
 ----
 num-entries: 2
 num-deletions: 1
+num-range-key-sets: 0
 point-deletions-bytes-estimate: 0
 range-deletions-bytes-estimate: 0
 
 maybe-compact
 ----
-[JOB 100] compacted(elision-only) L6 [000004] (783 B) + L6 [] (0 B) -> L6 [000005] (771 B), in 1.0s, output rate 771 B/s
+[JOB 100] compacted(elision-only) L6 [000004] (783 B) + L6 [] (0 B) -> L6 [000005] (771 B), in 1.0s (2.0s total), output rate 771 B/s
 
 version
 ----
@@ -114,6 +118,7 @@ wait-pending-table-stats
 ----
 num-entries: 6
 num-deletions: 2
+num-range-key-sets: 0
 point-deletions-bytes-estimate: 0
 range-deletions-bytes-estimate: 76
 
@@ -129,7 +134,7 @@ close-snapshot
 close-snapshot
 103
 ----
-[JOB 100] compacted(elision-only) L6 [000004] (901 B) + L6 [] (0 B) -> L6 [] (0 B), in 1.0s, output rate 0 B/s
+[JOB 100] compacted(elision-only) L6 [000004] (901 B) + L6 [] (0 B) -> L6 [] (0 B), in 1.0s (2.0s total), output rate 0 B/s
 
 # Test a table that contains both deletions and non-deletions, but whose
 # non-deletions well outnumber its deletions. The table should not be
@@ -146,6 +151,7 @@ wait-pending-table-stats
 ----
 num-entries: 11
 num-deletions: 1
+num-range-key-sets: 0
 point-deletions-bytes-estimate: 149
 range-deletions-bytes-estimate: 0
 
@@ -189,6 +195,7 @@ wait-pending-table-stats
 ----
 num-entries: 5
 num-deletions: 1
+num-range-key-sets: 0
 point-deletions-bytes-estimate: 0
 range-deletions-bytes-estimate: 16488
 
@@ -201,7 +208,7 @@ range-deletions-bytes-estimate: 16488
 
 maybe-compact
 ----
-[JOB 100] compacted(default) L5 [000004 000005] (26 K) + L6 [000007] (17 K) -> L6 [000009] (25 K), in 1.0s, output rate 25 K/s
+[JOB 100] compacted(default) L5 [000004 000005] (26 K) + L6 [000007] (17 K) -> L6 [000009] (25 K), in 1.0s (2.0s total), output rate 25 K/s
 
 define level-max-bytes=(L5 : 1000) auto-compactions=off
 L5
@@ -225,6 +232,7 @@ wait-pending-table-stats
 ----
 num-entries: 3
 num-deletions: 3
+num-range-key-sets: 0
 point-deletions-bytes-estimate: 13167
 range-deletions-bytes-estimate: 0
 
@@ -235,4 +243,51 @@ range-deletions-bytes-estimate: 0
 
 maybe-compact
 ----
-[JOB 100] compacted(default) L5 [000004] (794 B) + L6 [000006] (13 K) -> L6 [] (0 B), in 1.0s, output rate 0 B/s
+[JOB 100] compacted(default) L5 [000004] (794 B) + L6 [000006] (13 K) -> L6 [] (0 B), in 1.0s (2.0s total), output rate 0 B/s
+
+# A table containing only range keys is not eligible for elision.
+# RANGEKEYDEL or RANGEKEYUNSET.
+
+define
+L6
+  rangekey:a-b:{(#1,RANGEKEYDEL)}
+L6
+  rangekey:b-c:{(#2,RANGEKEYUNSET,@1)}
+L6
+  rangekey:c-d:{(#3,RANGEKEYSET,@1)}
+----
+6:
+  000004:[a#1,RANGEKEYDEL-b#72057594037927935,RANGEKEYDEL]
+  000005:[b#2,RANGEKEYUNSET-c#72057594037927935,RANGEKEYUNSET]
+  000006:[c#3,RANGEKEYSET-d#72057594037927935,RANGEKEYSET]
+
+wait-pending-table-stats
+000004
+----
+num-entries: 0
+num-deletions: 0
+num-range-key-sets: 0
+point-deletions-bytes-estimate: 0
+range-deletions-bytes-estimate: 0
+
+wait-pending-table-stats
+000005
+----
+num-entries: 0
+num-deletions: 0
+num-range-key-sets: 0
+point-deletions-bytes-estimate: 0
+range-deletions-bytes-estimate: 0
+
+wait-pending-table-stats
+000006
+----
+num-entries: 0
+num-deletions: 0
+num-range-key-sets: 1
+point-deletions-bytes-estimate: 0
+range-deletions-bytes-estimate: 0
+
+maybe-compact
+----
+(none)

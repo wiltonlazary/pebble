@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -375,7 +376,7 @@ func TestLargeBatch(t *testing.T) {
 		return d.mu.log.queue[len(d.mu.log.queue)-1].fileNum
 	}
 	fileSize := func(fileNum FileNum) int64 {
-		info, err := d.opts.FS.Stat(base.MakeFilename(d.opts.FS, "", fileTypeLog, fileNum))
+		info, err := d.opts.FS.Stat(base.MakeFilepath(d.opts.FS, "", fileTypeLog, fileNum))
 		require.NoError(t, err)
 		return info.Size()
 	}
@@ -414,13 +415,13 @@ func TestLargeBatch(t *testing.T) {
 
 	// Verify this results in one L0 table being created.
 	require.NoError(t, try(100*time.Microsecond, 20*time.Second,
-		verifyLSM("0.0:\n  000005:[a-a]\n")))
+		verifyLSM("0.0:\n  000005:[a#1,SET-a#1,SET]\n")))
 
 	require.NoError(t, d.Set([]byte("b"), bytes.Repeat([]byte("b"), 512), nil))
 
 	// Verify this results in a second L0 table being created.
 	require.NoError(t, try(100*time.Microsecond, 20*time.Second,
-		verifyLSM("0.0:\n  000005:[a-a]\n  000007:[b-b]\n")))
+		verifyLSM("0.0:\n  000005:[a#1,SET-a#1,SET]\n  000007:[b#2,SET-b#2,SET]\n")))
 
 	// Allocate a bunch of batches to exhaust the batchPool. None of these
 	// batches should have a non-zero count.
@@ -660,6 +661,7 @@ func TestUnremovableSingleDelete(t *testing.T) {
 
 	require.NoError(t, d.Set(key, valFirst, nil))
 	ss := d.NewSnapshot()
+	defer ss.Close()
 	require.NoError(t, d.SingleDelete(key, nil))
 	require.NoError(t, d.Set(key, valSecond, nil))
 	require.NoError(t, d.Flush())
@@ -794,6 +796,9 @@ func TestMemTableReservation(t *testing.T) {
 	}
 	opts.testingRandomized()
 	opts.EnsureDefaults()
+	// We're going to be looking at and asserting the global memtable reservation
+	// amount below so we don't want to race with any triggered stats collections.
+	opts.private.disableTableStats = true
 
 	// Add a block to the cache. Note that the memtable size is larger than the
 	// cache size, so opening the DB should cause this block to be evicted.
@@ -888,7 +893,7 @@ func TestCacheEvict(t *testing.T) {
 		require.NoError(t, d.Delete(key, nil))
 	}
 
-	require.NoError(t, d.Compact([]byte("0"), []byte("1")))
+	require.NoError(t, d.Compact([]byte("0"), []byte("1"), false))
 
 	require.NoError(t, d.Close())
 
@@ -916,7 +921,7 @@ func TestRollManifest(t *testing.T) {
 		FS:                    vfs.NewMem(),
 		NumPrevManifest:       int(toPreserve),
 	}
-	opts.private.disableAutomaticCompactions = true
+	opts.DisableAutomaticCompactions = true
 	opts.testingRandomized()
 	d, err := Open("", opts)
 	require.NoError(t, err)
@@ -1001,7 +1006,7 @@ func TestDBClosed(t *testing.T) {
 
 	require.True(t, errors.Is(catch(func() { _ = d.Close() }), ErrClosed))
 
-	require.True(t, errors.Is(catch(func() { _ = d.Compact(nil, nil) }), ErrClosed))
+	require.True(t, errors.Is(catch(func() { _ = d.Compact(nil, nil, false) }), ErrClosed))
 	require.True(t, errors.Is(catch(func() { _ = d.Flush() }), ErrClosed))
 	require.True(t, errors.Is(catch(func() { _, _ = d.AsyncFlush() }), ErrClosed))
 
@@ -1040,7 +1045,7 @@ func TestDBConcurrentCommitCompactFlush(t *testing.T) {
 			var err error
 			switch i % 3 {
 			case 0:
-				err = d.Compact(nil, []byte("\xff"))
+				err = d.Compact(nil, []byte("\xff"), false)
 			case 1:
 				err = d.Flush()
 			case 2:
@@ -1059,10 +1064,13 @@ func TestDBConcurrentCompactClose(t *testing.T) {
 	// detects the close and finishes cleanly.
 	mem := vfs.NewMem()
 	for i := 0; i < 100; i++ {
-		d, err := Open("", testingRandomized(&Options{
-			FS:                       mem,
-			MaxConcurrentCompactions: 2,
-		}))
+		opts := &Options{
+			FS: mem,
+			MaxConcurrentCompactions: func() int {
+				return 2
+			},
+		}
+		d, err := Open("", testingRandomized(opts))
 		require.NoError(t, err)
 
 		// Ingest a series of files containing a single key each. As the outer
@@ -1072,7 +1080,9 @@ func TestDBConcurrentCompactClose(t *testing.T) {
 			path := fmt.Sprintf("ext%d", j)
 			f, err := mem.Create(path)
 			require.NoError(t, err)
-			w := sstable.NewWriter(f, sstable.WriterOptions{})
+			w := sstable.NewWriter(f, sstable.WriterOptions{
+				TableFormat: d.FormatMajorVersion().MaxTableFormat(),
+			})
 			require.NoError(t, w.Set([]byte(fmt.Sprint(j)), nil))
 			require.NoError(t, w.Close())
 			require.NoError(t, d.Ingest([]string{path}))
@@ -1139,7 +1149,7 @@ func TestCloseCleanerRace(t *testing.T) {
 		it := db.NewIter(nil)
 		require.NotNil(t, it)
 		require.NoError(t, db.DeleteRange([]byte("a"), []byte("b"), Sync))
-		require.NoError(t, db.Compact([]byte("a"), []byte("b")))
+		require.NoError(t, db.Compact([]byte("a"), []byte("b"), false))
 		// Only the iterator is keeping the sstables alive.
 		files, err := mem.List("/")
 		require.NoError(t, err)
@@ -1263,7 +1273,7 @@ func BenchmarkNewIterReadAmp(b *testing.B) {
 				FS:                    vfs.NewMem(),
 				L0StopWritesThreshold: 1000,
 			}
-			opts.private.disableAutomaticCompactions = true
+			opts.DisableAutomaticCompactions = true
 
 			d, err := Open("", opts)
 			require.NoError(b, err)
@@ -1303,4 +1313,84 @@ func verifyGetNotFound(t *testing.T, r Reader, key []byte) {
 	if err != base.ErrNotFound {
 		t.Fatalf("expected nil, but got %s", val)
 	}
+}
+
+func TestFlushIntervalMetrics(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test is flaky on windows")
+	}
+	sumIntervalMetrics := InternalIntervalMetrics{}
+	mem := vfs.NewMem()
+	d, err := Open("", testingRandomized(&Options{
+		FS: mem,
+	}))
+	require.NoError(t, err)
+	// Flush metrics are updated after and non-atomically with the memtable
+	// being removed from the queue.
+	waitAndAccumlateIntervalMetrics := func() {
+		begin := time.Now()
+		for {
+			metrics := d.InternalIntervalMetrics()
+			sumIntervalMetrics.Flush.WriteThroughput.Merge(metrics.Flush.WriteThroughput)
+			sumIntervalMetrics.LogWriter.WriteThroughput.Merge(metrics.LogWriter.WriteThroughput)
+			if sumIntervalMetrics.LogWriter.SyncLatencyMicros == nil {
+				sumIntervalMetrics.LogWriter.SyncLatencyMicros = metrics.LogWriter.SyncLatencyMicros
+			} else {
+				sumIntervalMetrics.LogWriter.SyncLatencyMicros.Merge(metrics.LogWriter.SyncLatencyMicros)
+			}
+
+			require.NotNil(t, metrics)
+			if int64(50<<10) < metrics.Flush.WriteThroughput.Bytes {
+				// The writes (during which the flush is idle) and the flush work
+				// should not be so fast as to be unrealistic. If these turn out to be
+				// flaky we could instead inject a clock.
+				tinyInterval := int64(50 * time.Microsecond)
+				require.Less(t, tinyInterval, int64(metrics.Flush.WriteThroughput.WorkDuration))
+				require.Less(t, tinyInterval, int64(metrics.Flush.WriteThroughput.IdleDuration))
+				return
+			}
+			if time.Since(begin) > 2*time.Second {
+				t.Fatal()
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	writeAndFlush := func() {
+		// Add the key "a" to the memtable, then fill up the memtable with the key
+		// prefix "b". The compaction will only overlap with the queued memtable,
+		// not the mutable memtable.
+		// NB: The initial memtable size is 256KB, which is filled up with random
+		// values which typically don't compress well. The test also appends the
+		// random value to the "b" key to limit overwriting of the same key, which
+		// would get collapsed at flush time since there are no open snapshots.
+		value := make([]byte, 50)
+		rand.Read(value)
+		require.NoError(t, d.Set([]byte("a"), value, nil))
+		for {
+			rand.Read(value)
+			require.NoError(t, d.Set(append([]byte("b"), value...), value, nil))
+			d.mu.Lock()
+			done := len(d.mu.mem.queue) == 2
+			d.mu.Unlock()
+			if done {
+				break
+			}
+		}
+
+		require.NoError(t, d.Compact([]byte("a"), []byte("a\x00"), false))
+		d.mu.Lock()
+		require.Equal(t, 1, len(d.mu.mem.queue))
+		d.mu.Unlock()
+	}
+
+	writeAndFlush()
+	waitAndAccumlateIntervalMetrics()
+	writeAndFlush()
+	waitAndAccumlateIntervalMetrics()
+
+	require.NoError(t, d.Close())
+	dbMetrics := d.Metrics()
+	require.Equal(t, dbMetrics.Flush.WriteThroughput.Bytes, sumIntervalMetrics.Flush.WriteThroughput.Bytes)
+	require.Equal(t, dbMetrics.LogWriter.SyncLatencyMicros.Export(), sumIntervalMetrics.LogWriter.SyncLatencyMicros.Export())
 }

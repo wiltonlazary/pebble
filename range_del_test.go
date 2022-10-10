@@ -7,32 +7,40 @@ package pebble
 import (
 	"bytes"
 	"fmt"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/datadriven"
+	"github.com/cockroachdb/pebble/internal/testkeys"
 	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/exp/rand"
 )
 
 func TestRangeDel(t *testing.T) {
 	var d *DB
 	defer func() {
 		if d != nil {
+			require.NoError(t, closeAllSnapshots(d))
 			require.NoError(t, d.Close())
 		}
 	}()
 	opts := &Options{}
-	opts.private.disableAutomaticCompactions = true
+	opts.DisableAutomaticCompactions = true
 
 	datadriven.RunTest(t, "testdata/range_del", func(td *datadriven.TestData) string {
 		switch td.Cmd {
 		case "define":
 			if d != nil {
+				if err := closeAllSnapshots(d); err != nil {
+					return err.Error()
+				}
 				if err := d.Close(); err != nil {
 					return err.Error()
 				}
@@ -46,7 +54,7 @@ func TestRangeDel(t *testing.T) {
 			d.mu.Lock()
 			// Disable the "dynamic base level" code for this test.
 			d.mu.versions.picker.forceBaseLevel1()
-			s := fmt.Sprintf("mem: %d\n%s", len(d.mu.mem.queue), d.mu.versions.currentVersion())
+			s := fmt.Sprintf("mem: %d\n%s", len(d.mu.mem.queue), d.mu.versions.currentVersion().String())
 			d.mu.Unlock()
 			return s
 
@@ -98,14 +106,19 @@ func TestRangeDel(t *testing.T) {
 	})
 }
 
-func TestDeleteRangeFlushDelay(t *testing.T) {
-	opts := &Options{FS: vfs.NewMem()}
-	opts.Experimental.DeleteRangeFlushDelay = 10 * time.Millisecond
+func TestFlushDelay(t *testing.T) {
+	opts := &Options{
+		FS:                    vfs.NewMem(),
+		Comparer:              testkeys.Comparer,
+		FlushDelayDeleteRange: 10 * time.Millisecond,
+		FlushDelayRangeKey:    10 * time.Millisecond,
+		FormatMajorVersion:    FormatNewest,
+	}
 	d, err := Open("", opts)
 	require.NoError(t, err)
 
-	// Ensure that all the various means of deleting a range trigger the flush
-	// delay.
+	// Ensure that all the various means of writing a rangedel or range key
+	// trigger their respective flush delays.
 	cases := []func(){
 		func() {
 			require.NoError(t, d.DeleteRange([]byte("a"), []byte("z"), nil))
@@ -139,6 +152,46 @@ func TestDeleteRangeFlushDelay(t *testing.T) {
 			require.NoError(t, b2.Commit(nil))
 			require.NoError(t, b.Close())
 		},
+		func() {
+			require.NoError(t, d.RangeKeySet([]byte("a"), []byte("z"), nil, nil, nil))
+		},
+		func() {
+			require.NoError(t, d.RangeKeyUnset([]byte("a"), []byte("z"), nil, nil))
+		},
+		func() {
+			require.NoError(t, d.RangeKeyDelete([]byte("a"), []byte("z"), nil))
+		},
+		func() {
+			b := d.NewBatch()
+			require.NoError(t, b.RangeKeySet([]byte("a"), []byte("z"), nil, nil, nil))
+			require.NoError(t, b.Commit(nil))
+		},
+		func() {
+			b := d.NewBatch()
+			require.NoError(t, b.RangeKeyUnset([]byte("a"), []byte("z"), nil, nil))
+			require.NoError(t, b.Commit(nil))
+		},
+		func() {
+			b := d.NewBatch()
+			require.NoError(t, b.RangeKeyDelete([]byte("a"), []byte("z"), nil))
+			require.NoError(t, b.Commit(nil))
+		},
+		func() {
+			b := d.NewBatch()
+			b2 := d.NewBatch()
+			require.NoError(t, b.RangeKeySet([]byte("a"), []byte("z"), nil, nil, nil))
+			require.NoError(t, b2.SetRepr(b.Repr()))
+			require.NoError(t, b2.Commit(nil))
+			require.NoError(t, b.Close())
+		},
+		func() {
+			b := d.NewBatch()
+			b2 := d.NewBatch()
+			require.NoError(t, b.RangeKeySet([]byte("a"), []byte("z"), nil, nil, nil))
+			require.NoError(t, b2.Apply(b, nil))
+			require.NoError(t, b2.Commit(nil))
+			require.NoError(t, b.Close())
+		},
 	}
 
 	for _, f := range cases {
@@ -149,6 +202,59 @@ func TestDeleteRangeFlushDelay(t *testing.T) {
 		<-flushed
 	}
 	require.NoError(t, d.Close())
+}
+
+func TestFlushDelayStress(t *testing.T) {
+	rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
+	opts := &Options{
+		FS:                    vfs.NewMem(),
+		Comparer:              testkeys.Comparer,
+		FlushDelayDeleteRange: time.Duration(rng.Intn(10)+1) * time.Millisecond,
+		FlushDelayRangeKey:    time.Duration(rng.Intn(10)+1) * time.Millisecond,
+		FormatMajorVersion:    FormatNewest,
+		MemTableSize:          8192,
+	}
+
+	const runs = 100
+	for run := 0; run < runs; run++ {
+		d, err := Open("", opts)
+		require.NoError(t, err)
+
+		now := time.Now().UnixNano()
+		writers := runtime.GOMAXPROCS(0)
+		var wg sync.WaitGroup
+		wg.Add(writers)
+		for i := 0; i < writers; i++ {
+			rng := rand.New(rand.NewSource(uint64(now) + uint64(i)))
+			go func() {
+				const ops = 100
+				defer wg.Done()
+
+				var k1, k2 [32]byte
+				for j := 0; j < ops; j++ {
+					switch rng.Intn(3) {
+					case 0:
+						randStr(k1[:], rng)
+						randStr(k2[:], rng)
+						require.NoError(t, d.DeleteRange(k1[:], k2[:], nil))
+					case 1:
+						randStr(k1[:], rng)
+						randStr(k2[:], rng)
+						require.NoError(t, d.RangeKeySet(k1[:], k2[:], []byte("@2"), nil, nil))
+					case 2:
+						randStr(k1[:], rng)
+						randStr(k2[:], rng)
+						require.NoError(t, d.Set(k1[:], k2[:], nil))
+					default:
+						panic("unreachable")
+					}
+				}
+			}()
+		}
+		wg.Wait()
+		time.Sleep(time.Duration(rng.Intn(10)+1) * time.Millisecond)
+		require.NoError(t, d.Close())
+	}
 }
 
 // Verify that range tombstones at higher levels do not unintentionally delete
@@ -177,7 +283,7 @@ func TestRangeDelCompactionTruncation(t *testing.T) {
 
 		lsm := func() string {
 			d.mu.Lock()
-			s := d.mu.versions.currentVersion().DebugString(base.DefaultFormatter)
+			s := d.mu.versions.currentVersion().String()
 			d.mu.Unlock()
 			return s
 		}
@@ -204,7 +310,7 @@ func TestRangeDelCompactionTruncation(t *testing.T) {
 		require.NoError(t, d.DeleteRange([]byte("a"), []byte("d"), nil))
 
 		// Compact to produce the L1 tables.
-		require.NoError(t, d.Compact([]byte("c"), []byte("c\x00")))
+		require.NoError(t, d.Compact([]byte("c"), []byte("c\x00"), false))
 		expectLSM(`
 1:
   000008:[a#3,RANGEDEL-b#72057594037927935,RANGEDEL]
@@ -212,7 +318,7 @@ func TestRangeDelCompactionTruncation(t *testing.T) {
 `)
 
 		// Compact again to move one of the tables to L2.
-		require.NoError(t, d.Compact([]byte("c"), []byte("c\x00")))
+		require.NoError(t, d.Compact([]byte("c"), []byte("c\x00"), false))
 		expectLSM(`
 1:
   000008:[a#3,RANGEDEL-b#72057594037927935,RANGEDEL]
@@ -261,24 +367,24 @@ func TestRangeDelCompactionTruncation(t *testing.T) {
 		// containing "c" will be compacted again with the L2 table creating two
 		// tables in L2. Lastly, the L2 table containing "c" will be compacted
 		// creating the L3 table.
-		require.NoError(t, d.Compact([]byte("c"), []byte("c\x00")))
+		require.NoError(t, d.Compact([]byte("c"), []byte("c\x00"), false))
 		if formatVersion < FormatSetWithDelete {
 			expectLSM(`
 1:
-  000012:[a#3,RANGEDEL-b#72057594037927935,RANGEDEL]
+  000008:[a#3,RANGEDEL-b#72057594037927935,RANGEDEL]
+2:
+  000012:[b#4,SET-c#72057594037927935,RANGEDEL]
 3:
-  000017:[b#4,SET-b#4,SET]
-  000018:[b#3,RANGEDEL-c#72057594037927935,RANGEDEL]
-  000019:[c#5,SET-d#72057594037927935,RANGEDEL]
+  000013:[c#5,SET-d#72057594037927935,RANGEDEL]
 `)
 		} else {
 			expectLSM(`
 1:
-  000012:[a#3,RANGEDEL-b#72057594037927935,RANGEDEL]
+  000008:[a#3,RANGEDEL-b#72057594037927935,RANGEDEL]
+2:
+  000012:[b#4,SETWITHDEL-c#72057594037927935,RANGEDEL]
 3:
-  000017:[b#4,SETWITHDEL-b#4,SETWITHDEL]
-  000018:[b#3,RANGEDEL-c#72057594037927935,RANGEDEL]
-  000019:[c#5,SETWITHDEL-d#72057594037927935,RANGEDEL]
+  000013:[c#5,SET-d#72057594037927935,RANGEDEL]
 `)
 		}
 
@@ -328,7 +434,7 @@ func TestRangeDelCompactionTruncation2(t *testing.T) {
 
 	lsm := func() string {
 		d.mu.Lock()
-		s := d.mu.versions.currentVersion().DebugString(base.DefaultFormatter)
+		s := d.mu.versions.currentVersion().String()
 		d.mu.Unlock()
 		return s
 	}
@@ -354,20 +460,18 @@ func TestRangeDelCompactionTruncation2(t *testing.T) {
 	require.NoError(t, d.DeleteRange([]byte("a"), []byte("d"), nil))
 
 	// Compact to produce the L1 tables.
-	require.NoError(t, d.Compact([]byte("b"), []byte("b\x00")))
+	require.NoError(t, d.Compact([]byte("b"), []byte("b\x00"), false))
 	expectLSM(`
 6:
-  000008:[a#3,RANGEDEL-b#2,SET]
-  000009:[b#1,RANGEDEL-d#72057594037927935,RANGEDEL]
+  000009:[a#3,RANGEDEL-d#72057594037927935,RANGEDEL]
 `)
 
 	require.NoError(t, d.Set([]byte("c"), bytes.Repeat([]byte("d"), 100), nil))
-	require.NoError(t, d.Compact([]byte("c"), []byte("c\x00")))
+	require.NoError(t, d.Compact([]byte("c"), []byte("c\x00"), false))
 	expectLSM(`
 6:
-  000012:[a#3,RANGEDEL-b#2,SET]
-  000013:[b#1,RANGEDEL-c#72057594037927935,RANGEDEL]
-  000014:[c#4,SET-d#72057594037927935,RANGEDEL]
+  000012:[a#3,RANGEDEL-c#72057594037927935,RANGEDEL]
+  000013:[c#4,SET-d#72057594037927935,RANGEDEL]
 `)
 }
 
@@ -394,7 +498,7 @@ func TestRangeDelCompactionTruncation3(t *testing.T) {
 
 	lsm := func() string {
 		d.mu.Lock()
-		s := d.mu.versions.currentVersion().DebugString(base.DefaultFormatter)
+		s := d.mu.versions.currentVersion().String()
 		d.mu.Unlock()
 		return s
 	}
@@ -429,43 +533,41 @@ func TestRangeDelCompactionTruncation3(t *testing.T) {
 
 	// Compact a few times to move the tables down to L3.
 	for i := 0; i < 3; i++ {
-		require.NoError(t, d.Compact([]byte("b"), []byte("b\x00")))
+		require.NoError(t, d.Compact([]byte("b"), []byte("b\x00"), false))
 	}
 	expectLSM(`
 3:
-  000012:[a#3,RANGEDEL-b#2,SET]
-  000013:[b#1,RANGEDEL-d#72057594037927935,RANGEDEL]
+  000009:[a#3,RANGEDEL-d#72057594037927935,RANGEDEL]
 `)
 
 	require.NoError(t, d.Set([]byte("c"), bytes.Repeat([]byte("d"), 100), nil))
 
-	require.NoError(t, d.Compact([]byte("c"), []byte("c\x00")))
+	require.NoError(t, d.Compact([]byte("c"), []byte("c\x00"), false))
 	expectLSM(`
+3:
+  000013:[a#3,RANGEDEL-c#72057594037927935,RANGEDEL]
 4:
-  000020:[a#3,RANGEDEL-b#2,SET]
-  000021:[b#1,RANGEDEL-c#72057594037927935,RANGEDEL]
-  000022:[c#4,SET-d#72057594037927935,RANGEDEL]
+  000014:[c#4,SET-d#72057594037927935,RANGEDEL]
 `)
 
-	require.NoError(t, d.Compact([]byte("c"), []byte("c\x00")))
+	require.NoError(t, d.Compact([]byte("c"), []byte("c\x00"), false))
 	expectLSM(`
+3:
+  000013:[a#3,RANGEDEL-c#72057594037927935,RANGEDEL]
 5:
-  000023:[a#3,RANGEDEL-b#2,SET]
-  000024:[b#1,RANGEDEL-c#72057594037927935,RANGEDEL]
-  000025:[c#4,SET-d#72057594037927935,RANGEDEL]
+  000014:[c#4,SET-d#72057594037927935,RANGEDEL]
 `)
 
 	if _, _, err := d.Get([]byte("b")); err != ErrNotFound {
 		t.Fatalf("expected not found, but found %v", err)
 	}
 
-	require.NoError(t, d.Compact([]byte("a"), []byte("a\x00")))
+	require.NoError(t, d.Compact([]byte("a"), []byte("a\x00"), false))
 	expectLSM(`
+4:
+  000013:[a#3,RANGEDEL-c#72057594037927935,RANGEDEL]
 5:
-  000025:[c#4,SET-d#72057594037927935,RANGEDEL]
-6:
-  000026:[a#3,RANGEDEL-b#2,SET]
-  000027:[b#1,RANGEDEL-c#72057594037927935,RANGEDEL]
+  000014:[c#4,SET-d#72057594037927935,RANGEDEL]
 `)
 
 	if v, _, err := d.Get([]byte("b")); err != ErrNotFound {
@@ -546,7 +648,7 @@ func benchmarkRangeDelIterate(b *testing.B, entries, deleted int, snapshotCompac
 	}
 
 	if snapshotCompact {
-		require.NoError(b, d.Compact(makeKey(0), makeKey(entries)))
+		require.NoError(b, d.Compact(makeKey(0), makeKey(entries), false))
 	}
 
 	b.ResetTimer()

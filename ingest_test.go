@@ -7,7 +7,7 @@ package pebble
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 	"sort"
 	"strconv"
@@ -21,7 +21,8 @@ import (
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/datadriven"
 	"github.com/cockroachdb/pebble/internal/errorfs"
-	"github.com/cockroachdb/pebble/internal/manifest"
+	"github.com/cockroachdb/pebble/internal/keyspan"
+	"github.com/cockroachdb/pebble/internal/rangekey"
 	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/kr/pretty"
@@ -35,12 +36,39 @@ func TestIngestLoad(t *testing.T) {
 	datadriven.RunTest(t, "testdata/ingest_load", func(td *datadriven.TestData) string {
 		switch td.Cmd {
 		case "load":
+			writerOpts := sstable.WriterOptions{}
+			var dbVersion FormatMajorVersion
+			for _, cmdArgs := range td.CmdArgs {
+				v, err := strconv.Atoi(cmdArgs.Vals[0])
+				if err != nil {
+					return err.Error()
+				}
+				switch k := cmdArgs.Key; k {
+				case "writer-version":
+					fmv := FormatMajorVersion(v)
+					writerOpts.TableFormat = fmv.MaxTableFormat()
+				case "db-version":
+					dbVersion = FormatMajorVersion(v)
+				default:
+					return fmt.Sprintf("unknown cmd %s\n", k)
+				}
+			}
 			f, err := mem.Create("ext")
 			if err != nil {
 				return err.Error()
 			}
-			w := sstable.NewWriter(f, sstable.WriterOptions{})
+			w := sstable.NewWriter(f, writerOpts)
 			for _, data := range strings.Split(td.Input, "\n") {
+				if strings.HasPrefix(data, "rangekey: ") {
+					data = strings.TrimPrefix(data, "rangekey: ")
+					s := keyspan.ParseSpan(data)
+					err := rangekey.Encode(&s, w.AddRangeKey)
+					if err != nil {
+						return err.Error()
+					}
+					continue
+				}
+
 				j := strings.Index(data, ":")
 				if j < 0 {
 					return fmt.Sprintf("malformed input: %s\n", data)
@@ -57,13 +85,15 @@ func TestIngestLoad(t *testing.T) {
 				Comparer: DefaultComparer,
 				FS:       mem,
 			}
-			meta, _, err := ingestLoad(opts, []string{"ext"}, 0, []FileNum{1})
+			meta, _, err := ingestLoad(opts, dbVersion, []string{"ext"}, 0, []FileNum{1})
 			if err != nil {
 				return err.Error()
 			}
 			var buf bytes.Buffer
 			for _, m := range meta {
 				fmt.Fprintf(&buf, "%d: %s-%s\n", m.FileNum, m.Smallest, m.Largest)
+				fmt.Fprintf(&buf, "  points: %s-%s\n", m.SmallestPointKey, m.LargestPointKey)
+				fmt.Fprintf(&buf, "  ranges: %s-%s\n", m.SmallestRangeKey, m.LargestRangeKey)
 			}
 			return buf.String()
 
@@ -77,6 +107,7 @@ func TestIngestLoadRand(t *testing.T) {
 	mem := vfs.NewMem()
 	rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
 	cmp := DefaultComparer.Compare
+	version := FormatNewest
 
 	randBytes := func(size int) []byte {
 		data := make([]byte, size)
@@ -94,10 +125,8 @@ func TestIngestLoadRand(t *testing.T) {
 		pending[i] = FileNum(rng.Int63())
 		expected[i] = &fileMetadata{
 			FileNum: pending[i],
-			Stats: manifest.TableStats{
-				Valid: true,
-			},
 		}
+		expected[i].StatsMarkValid()
 
 		func() {
 			f, err := mem.Create(paths[i])
@@ -114,10 +143,11 @@ func TestIngestLoadRand(t *testing.T) {
 				return base.InternalCompare(cmp, keys[i], keys[j]) < 0
 			})
 
-			expected[i].Smallest = keys[0]
-			expected[i].Largest = keys[len(keys)-1]
+			expected[i].ExtendPointKeyBounds(cmp, keys[0], keys[len(keys)-1])
 
-			w := sstable.NewWriter(f, sstable.WriterOptions{})
+			w := sstable.NewWriter(f, sstable.WriterOptions{
+				TableFormat: version.MaxTableFormat(),
+			})
 			var count uint64
 			for i := range keys {
 				if i > 0 && base.InternalCompare(cmp, keys[i-1], keys[i]) == 0 {
@@ -141,7 +171,7 @@ func TestIngestLoadRand(t *testing.T) {
 		Comparer: DefaultComparer,
 		FS:       mem,
 	}
-	meta, _, err := ingestLoad(opts, paths, 0, pending)
+	meta, _, err := ingestLoad(opts, version, paths, 0, pending)
 	require.NoError(t, err)
 
 	for _, m := range meta {
@@ -162,7 +192,7 @@ func TestIngestLoadInvalid(t *testing.T) {
 		Comparer: DefaultComparer,
 		FS:       mem,
 	}
-	if _, _, err := ingestLoad(opts, []string{"invalid"}, 0, []FileNum{1}); err == nil {
+	if _, _, err := ingestLoad(opts, FormatNewest, []string{"invalid"}, 0, []FileNum{1}); err == nil {
 		t.Fatalf("expected error, but found success")
 	}
 }
@@ -198,10 +228,8 @@ func TestIngestSortAndVerify(t *testing.T) {
 					if cmp(smallest.UserKey, largest.UserKey) > 0 {
 						return fmt.Sprintf("range %v-%v is not valid", smallest, largest)
 					}
-					meta = append(meta, &fileMetadata{
-						Smallest: smallest,
-						Largest:  largest,
-					})
+					m := (&fileMetadata{}).ExtendPointKeyBounds(cmp, smallest, largest)
+					meta = append(meta, m)
 					paths = append(paths, strconv.Itoa(i))
 				}
 				err := ingestSortAndVerify(cmp, meta, paths)
@@ -292,7 +320,7 @@ func TestIngestLink(t *testing.T) {
 					f, err := mem.Open(mem.PathJoin(dir, files[j]))
 					require.NoError(t, err)
 
-					data, err := ioutil.ReadAll(f)
+					data, err := io.ReadAll(f)
 					require.NoError(t, err)
 					require.NoError(t, f.Close())
 					if !bytes.Equal(contents[j], data) {
@@ -323,7 +351,7 @@ func TestIngestLinkFallback(t *testing.T) {
 	// We should be able to write bytes to src, and not have them show up in
 	// dest.
 	_, _ = src.Write([]byte("test"))
-	data, err := ioutil.ReadAll(dest)
+	data, err := io.ReadAll(dest)
 	require.NoError(t, err)
 	if len(data) != 0 {
 		t.Fatalf("expected copy, but files appear to be hard linked: [%s] unexpectedly found", data)
@@ -355,19 +383,22 @@ func TestIngestMemtableOverlaps(t *testing.T) {
 				if len(parts) != 2 {
 					t.Fatalf("malformed table spec: %s", s)
 				}
+				var smallest, largest base.InternalKey
 				if strings.Contains(parts[0], ".") {
 					if !strings.Contains(parts[1], ".") {
 						t.Fatalf("malformed table spec: %s", s)
 					}
-					meta.Smallest = base.ParseInternalKey(parts[0])
-					meta.Largest = base.ParseInternalKey(parts[1])
+					smallest = base.ParseInternalKey(parts[0])
+					largest = base.ParseInternalKey(parts[1])
 				} else {
-					meta.Smallest = InternalKey{UserKey: []byte(parts[0])}
-					meta.Largest = InternalKey{UserKey: []byte(parts[1])}
+					smallest = InternalKey{UserKey: []byte(parts[0])}
+					largest = InternalKey{UserKey: []byte(parts[1])}
 				}
-				if mem.cmp(meta.Smallest.UserKey, meta.Largest.UserKey) > 0 {
-					meta.Smallest, meta.Largest = meta.Largest, meta.Smallest
+				// If we're using a reverse comparer, flip the file bounds.
+				if mem.cmp(smallest.UserKey, largest.UserKey) > 0 {
+					smallest, largest = largest, smallest
 				}
+				meta.ExtendPointKeyBounds(comparer.Compare, smallest, largest)
 				return meta
 			}
 
@@ -418,6 +449,49 @@ func TestIngestMemtableOverlaps(t *testing.T) {
 	}
 }
 
+func BenchmarkIngestOverlappingMemtable(b *testing.B) {
+	assertNoError := func(err error) {
+		b.Helper()
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	for count := 1; count < 6; count++ {
+		b.Run(fmt.Sprintf("memtables=%d", count), func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				b.StopTimer()
+				mem := vfs.NewMem()
+				d, err := Open("", &Options{
+					FS: mem,
+				})
+				assertNoError(err)
+
+				// Create memtables.
+				for {
+					assertNoError(d.Set([]byte("a"), nil, nil))
+					d.mu.Lock()
+					done := len(d.mu.mem.queue) == count
+					d.mu.Unlock()
+					if done {
+						break
+					}
+				}
+
+				// Create the overlapping sstable that will force a flush when ingested.
+				f, err := mem.Create("ext")
+				assertNoError(err)
+				w := sstable.NewWriter(f, sstable.WriterOptions{})
+				assertNoError(w.Set([]byte("a"), nil))
+				assertNoError(w.Close())
+
+				b.StartTimer()
+				assertNoError(d.Ingest([]string{"ext"}))
+			}
+		})
+	}
+}
+
 func TestIngestTargetLevel(t *testing.T) {
 	var d *DB
 	defer func() {
@@ -428,15 +502,17 @@ func TestIngestTargetLevel(t *testing.T) {
 		}
 	}()
 
-	parseMeta := func(s string) fileMetadata {
+	parseMeta := func(s string) *fileMetadata {
 		parts := strings.Split(s, "-")
 		if len(parts) != 2 {
 			t.Fatalf("malformed table spec: %s", s)
 		}
-		return fileMetadata{
-			Smallest: InternalKey{UserKey: []byte(parts[0])},
-			Largest:  InternalKey{UserKey: []byte(parts[1])},
-		}
+		m := (&fileMetadata{}).ExtendPointKeyBounds(
+			d.cmp,
+			InternalKey{UserKey: []byte(parts[0])},
+			InternalKey{UserKey: []byte(parts[1])},
+		)
+		return m
 	}
 
 	datadriven.RunTest(t, "testdata/ingest_target_level", func(td *datadriven.TestData) string {
@@ -470,7 +546,7 @@ func TestIngestTargetLevel(t *testing.T) {
 			readState.unref()
 
 			d.mu.Lock()
-			s := d.mu.versions.currentVersion().DebugString(base.DefaultFormatter)
+			s := d.mu.versions.currentVersion().String()
 			d.mu.Unlock()
 			return s
 
@@ -479,7 +555,7 @@ func TestIngestTargetLevel(t *testing.T) {
 			for _, target := range strings.Split(td.Input, "\n") {
 				meta := parseMeta(target)
 				level, err := ingestTargetLevel(d.newIters, IterOptions{logger: d.opts.Logger},
-					d.cmp, d.mu.versions.currentVersion(), 1, d.mu.compact.inProgress, &meta)
+					d.cmp, d.mu.versions.currentVersion(), 1, d.mu.compact.inProgress, meta)
 				if err != nil {
 					return err.Error()
 				}
@@ -496,6 +572,7 @@ func TestIngestTargetLevel(t *testing.T) {
 func TestIngest(t *testing.T) {
 	var mem vfs.FS
 	var d *DB
+	var flushed bool
 	defer func() {
 		require.NoError(t, d.Close())
 	}()
@@ -512,10 +589,13 @@ func TestIngest(t *testing.T) {
 			L0CompactionThreshold: 100,
 			L0StopWritesThreshold: 100,
 			DebugCheck:            DebugCheckLevels,
+			EventListener: EventListener{FlushEnd: func(info FlushInfo) {
+				flushed = true
+			}},
 		}
 		// Disable automatic compactions because otherwise we'll race with
 		// delete-only compactions triggered by ingesting range tombstones.
-		opts.private.disableAutomaticCompactions = true
+		opts.DisableAutomaticCompactions = true
 
 		var err error
 		d, err = Open("", opts)
@@ -545,8 +625,18 @@ func TestIngest(t *testing.T) {
 			return ""
 
 		case "ingest":
+			flushed = false
 			if err := runIngestCmd(td, d, mem); err != nil {
 				return err.Error()
+			}
+			// Wait for a possible flush.
+			d.mu.Lock()
+			for d.mu.compact.flushing {
+				d.mu.compact.cond.Wait()
+			}
+			d.mu.Unlock()
+			if flushed {
+				return "memtable flushed"
 			}
 			return ""
 
@@ -645,7 +735,7 @@ func TestIngestError(t *testing.T) {
 func TestIngestIdempotence(t *testing.T) {
 	// Use an on-disk filesystem, because Ingest with a MemFS will copy, not
 	// link the ingested file.
-	dir, err := ioutil.TempDir("", "ingest-idempotence")
+	dir, err := os.MkdirTemp("", "ingest-idempotence")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 	fs := vfs.Default
@@ -794,12 +884,12 @@ func TestConcurrentIngestCompact(t *testing.T) {
 
 			compact := func(start, end string) {
 				t.Helper()
-				require.NoError(t, d.Compact([]byte(start), []byte(end)))
+				require.NoError(t, d.Compact([]byte(start), []byte(end), false))
 			}
 
 			lsm := func() string {
 				d.mu.Lock()
-				s := d.mu.versions.currentVersion().DebugString(base.DefaultFormatter)
+				s := d.mu.versions.currentVersion().String()
 				d.mu.Unlock()
 				return s
 			}
@@ -828,7 +918,7 @@ func TestConcurrentIngestCompact(t *testing.T) {
 `)
 
 			// At this point ingestion of an sstable containing only key "b" will be
-			// targetted at L6. Yet a concurrent compaction of sstables 5 and 7 will
+			// targeted at L6. Yet a concurrent compaction of sstables 5 and 7 will
 			// create a new sstable in L6 spanning ["a"-"c"]. So the ingestion must
 			// actually target L5.
 
@@ -909,11 +999,47 @@ func TestIngestFlushQueuedMemTable(t *testing.T) {
 			require.NoError(t, w.Set([]byte(k), nil))
 		}
 		require.NoError(t, w.Close())
-		require.NoError(t, d.Ingest([]string{"ext"}))
+		stats, err := d.IngestWithStats([]string{"ext"})
+		require.NoError(t, err)
+		require.Equal(t, stats.ApproxIngestedIntoL0Bytes, stats.Bytes)
+		require.Less(t, uint64(0), stats.Bytes)
 	}
 
 	ingest("a")
 
+	require.NoError(t, d.Close())
+}
+
+func TestIngestStats(t *testing.T) {
+	mem := vfs.NewMem()
+	d, err := Open("", &Options{
+		FS: mem,
+	})
+	require.NoError(t, err)
+
+	ingest := func(expectedLevel int, keys ...string) {
+		t.Helper()
+		f, err := mem.Create("ext")
+		require.NoError(t, err)
+
+		w := sstable.NewWriter(f, sstable.WriterOptions{})
+		for _, k := range keys {
+			require.NoError(t, w.Set([]byte(k), nil))
+		}
+		require.NoError(t, w.Close())
+		stats, err := d.IngestWithStats([]string{"ext"})
+		require.NoError(t, err)
+		if expectedLevel == 0 {
+			require.Equal(t, stats.ApproxIngestedIntoL0Bytes, stats.Bytes)
+		} else {
+			require.EqualValues(t, 0, stats.ApproxIngestedIntoL0Bytes)
+		}
+		require.Less(t, uint64(0), stats.Bytes)
+	}
+	ingest(6, "a")
+	ingest(0, "a")
+	ingest(6, "b", "g")
+	ingest(0, "c")
 	require.NoError(t, d.Close())
 }
 
@@ -1061,7 +1187,7 @@ func TestIngestFileNumReuseCrash(t *testing.T) {
 	const count = 10
 	// Use an on-disk filesystem, because Ingest with a MemFS will copy, not
 	// link the ingested file.
-	dir, err := ioutil.TempDir("", "ingest-filenum-reuse")
+	dir, err := os.MkdirTemp("", "ingest-filenum-reuse")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 	fs := vfs.Default
@@ -1069,7 +1195,7 @@ func TestIngestFileNumReuseCrash(t *testing.T) {
 	readFile := func(s string) []byte {
 		f, err := fs.Open(fs.PathJoin(dir, s))
 		require.NoError(t, err)
-		b, err := ioutil.ReadAll(f)
+		b, err := io.ReadAll(f)
 		require.NoError(t, err)
 		require.NoError(t, f.Close())
 		return b
@@ -1136,6 +1262,140 @@ func TestIngestFileNumReuseCrash(t *testing.T) {
 	}
 }
 
+func TestIngest_UpdateSequenceNumber(t *testing.T) {
+	mem := vfs.NewMem()
+	cmp := base.DefaultComparer.Compare
+	parse := func(input string) (*sstable.Writer, error) {
+		f, err := mem.Create("ext")
+		if err != nil {
+			return nil, err
+		}
+		w := sstable.NewWriter(f, sstable.WriterOptions{
+			TableFormat: sstable.TableFormatMax,
+		})
+		for _, data := range strings.Split(input, "\n") {
+			if strings.HasPrefix(data, "rangekey: ") {
+				data = strings.TrimPrefix(data, "rangekey: ")
+				s := keyspan.ParseSpan(data)
+				err := rangekey.Encode(&s, w.AddRangeKey)
+				if err != nil {
+					return nil, err
+				}
+				continue
+			}
+			j := strings.Index(data, ":")
+			if j < 0 {
+				return nil, errors.Newf("malformed input: %s\n", data)
+			}
+			key := base.ParseInternalKey(data[:j])
+			value := []byte(data[j+1:])
+			if err := w.Add(key, value); err != nil {
+				return nil, err
+			}
+		}
+		return w, nil
+	}
+
+	var (
+		seqnum uint64
+		err    error
+		metas  []*fileMetadata
+	)
+	datadriven.RunTest(t, "testdata/ingest_update_seqnums", func(td *datadriven.TestData) string {
+		switch td.Cmd {
+		case "starting-seqnum":
+			seqnum, err = strconv.ParseUint(td.Input, 10, 64)
+			if err != nil {
+				return err.Error()
+			}
+			return ""
+
+		case "reset":
+			metas = metas[:0]
+			return ""
+
+		case "load":
+			w, err := parse(td.Input)
+			if err != nil {
+				return err.Error()
+			}
+			if err = w.Close(); err != nil {
+				return err.Error()
+			}
+			defer w.Close()
+
+			// Format the bounds of the table.
+			wm, err := w.Metadata()
+			if err != nil {
+				return err.Error()
+			}
+
+			// Upper bounds for range dels and range keys are expected to be sentinel
+			// keys.
+			maybeUpdateUpperBound := func(key base.InternalKey) base.InternalKey {
+				switch k := key.Kind(); {
+				case k == base.InternalKeyKindRangeDelete:
+					key.Trailer = base.InternalKeyRangeDeleteSentinel
+				case rangekey.IsRangeKey(k):
+					return base.MakeExclusiveSentinelKey(k, key.UserKey)
+				}
+				return key
+			}
+
+			// Construct the file metadata from the writer metadata.
+			m := &fileMetadata{
+				SmallestSeqNum: 0, // Simulate an ingestion.
+				LargestSeqNum:  0,
+			}
+			if wm.HasPointKeys {
+				m.ExtendPointKeyBounds(cmp, wm.SmallestPoint, wm.LargestPoint)
+			}
+			if wm.HasRangeDelKeys {
+				m.ExtendPointKeyBounds(
+					cmp,
+					wm.SmallestRangeDel,
+					maybeUpdateUpperBound(wm.LargestRangeDel),
+				)
+			}
+			if wm.HasRangeKeys {
+				m.ExtendRangeKeyBounds(
+					cmp,
+					wm.SmallestRangeKey,
+					maybeUpdateUpperBound(wm.LargestRangeKey),
+				)
+			}
+			if err := m.Validate(cmp, base.DefaultFormatter); err != nil {
+				return err.Error()
+			}
+
+			// Collect this file.
+			metas = append(metas, m)
+
+			// Return an index number for the file.
+			return fmt.Sprintf("file %d\n", len(metas)-1)
+
+		case "update-files":
+			// Update the bounds across all files.
+			if err = ingestUpdateSeqNum(cmp, base.DefaultFormatter, seqnum, metas); err != nil {
+				return err.Error()
+			}
+
+			var buf bytes.Buffer
+			for i, m := range metas {
+				fmt.Fprintf(&buf, "file %d:\n", i)
+				fmt.Fprintf(&buf, "  combined: %s-%s\n", m.Smallest, m.Largest)
+				fmt.Fprintf(&buf, "    points: %s-%s\n", m.SmallestPointKey, m.LargestPointKey)
+				fmt.Fprintf(&buf, "    ranges: %s-%s\n", m.SmallestRangeKey, m.LargestRangeKey)
+			}
+
+			return buf.String()
+
+		default:
+			return fmt.Sprintf("unknown command %s\n", td.Cmd)
+		}
+	})
+}
+
 func TestIngestCleanup(t *testing.T) {
 	fns := []base.FileNum{0, 1, 2}
 
@@ -1176,7 +1436,7 @@ func TestIngestCleanup(t *testing.T) {
 			// Create the files in the VFS.
 			metaMap := make(map[base.FileNum]vfs.File)
 			for _, fn := range fns {
-				path := base.MakeFilename(mem, "", base.FileTypeTable, fn)
+				path := base.MakeFilepath(mem, "", base.FileTypeTable, fn)
 				f, err := mem.Create(path)
 				metaMap[fn] = f
 				require.NoError(t, err)
@@ -1202,6 +1462,226 @@ func TestIngestCleanup(t *testing.T) {
 				require.Equal(t, tc.wantErr, err)
 			} else {
 				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+// fatalCapturingLogger captures a fatal error instead of panicking.
+type fatalCapturingLogger struct {
+	defaultLogger
+	err error
+}
+
+// Fatalf implements the Logger.Fatalf interface.
+func (l *fatalCapturingLogger) Fatalf(_ string, args ...interface{}) {
+	l.err = args[0].(error)
+}
+
+func TestIngestValidation(t *testing.T) {
+	type keyVal struct {
+		key, val []byte
+	}
+	type corruptionLocation int
+	const (
+		corruptionLocationNone corruptionLocation = iota
+		corruptionLocationStart
+		corruptionLocationEnd
+		corruptionLocationInternal
+	)
+	type errLocation int
+	const (
+		errLocationNone errLocation = iota
+		errLocationIngest
+		errLocationValidation
+	)
+	const (
+		nKeys     = 1_000
+		keySize   = 16
+		valSize   = 100
+		blockSize = 100
+
+		ingestTableName = "ext"
+	)
+
+	seed := uint64(time.Now().UnixNano())
+	rng := rand.New(rand.NewSource(seed))
+	t.Logf("rng seed = %d", seed)
+
+	testCases := []struct {
+		description string
+		cLoc        corruptionLocation
+		wantErrType errLocation
+	}{
+		{
+			description: "no corruption",
+			cLoc:        corruptionLocationNone,
+			wantErrType: errLocationNone,
+		},
+		{
+			description: "start block",
+			cLoc:        corruptionLocationStart,
+			wantErrType: errLocationIngest,
+		},
+		{
+			description: "end block",
+			cLoc:        corruptionLocationEnd,
+			wantErrType: errLocationIngest,
+		},
+		{
+			description: "non-end block",
+			cLoc:        corruptionLocationInternal,
+			wantErrType: errLocationValidation,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.description, func(t *testing.T) {
+			var wg sync.WaitGroup
+			wg.Add(1)
+
+			fs := vfs.NewMem()
+			logger := &fatalCapturingLogger{}
+			opts := &Options{
+				FS:     fs,
+				Logger: logger,
+				EventListener: EventListener{
+					TableValidated: func(i TableValidatedInfo) {
+						wg.Done()
+					},
+				},
+			}
+			opts.Experimental.ValidateOnIngest = true
+			d, err := Open("", opts)
+			require.NoError(t, err)
+			defer func() { require.NoError(t, d.Close()) }()
+
+			corrupt := func(f vfs.File) {
+				// Compute the layout of the sstable in order to find the
+				// appropriate block locations to corrupt.
+				r, err := sstable.NewReader(f, sstable.ReaderOptions{})
+				require.NoError(t, err)
+				l, err := r.Layout()
+				require.NoError(t, err)
+				require.NoError(t, r.Close())
+
+				// Select an appropriate data block to corrupt.
+				var blockIdx int
+				switch tc.cLoc {
+				case corruptionLocationStart:
+					blockIdx = 0
+				case corruptionLocationEnd:
+					blockIdx = len(l.Data) - 1
+				case corruptionLocationInternal:
+					blockIdx = 1 + rng.Intn(len(l.Data)-2)
+				default:
+					t.Fatalf("unknown corruptionLocation: %T", tc.cLoc)
+				}
+				bh := l.Data[blockIdx]
+
+				osF, err := os.OpenFile(ingestTableName, os.O_RDWR, 0600)
+				require.NoError(t, err)
+				defer func() { require.NoError(t, osF.Close()) }()
+
+				// Corrupting a key will cause the ingestion to fail due to a
+				// malformed key, rather than a block checksum mismatch.
+				// Instead, we corrupt the last byte in the selected block,
+				// before the trailer, which corresponds to a value.
+				offset := bh.Offset + bh.Length - 1
+				_, err = osF.WriteAt([]byte("\xff"), int64(offset))
+				require.NoError(t, err)
+			}
+
+			type errT struct {
+				errLoc errLocation
+				err    error
+			}
+			runIngest := func(keyVals []keyVal) (et errT) {
+				// The vfs.File does not allow for random reads and writes.
+				// Create a disk-backed file outside of the DB FS that we can
+				// open as a regular os.File, if required.
+				tmpFS := vfs.Default
+				f, err := tmpFS.Create(ingestTableName)
+				require.NoError(t, err)
+				defer func() { _ = tmpFS.Remove(ingestTableName) }()
+
+				w := sstable.NewWriter(f, sstable.WriterOptions{
+					BlockSize:   blockSize,     // Create many smaller blocks.
+					Compression: NoCompression, // For simpler debugging.
+				})
+				for _, kv := range keyVals {
+					require.NoError(t, w.Set(kv.key, kv.val))
+				}
+				require.NoError(t, w.Close())
+
+				// Possibly corrupt the file.
+				if tc.cLoc != corruptionLocationNone {
+					f, err = tmpFS.Open(ingestTableName)
+					require.NoError(t, err)
+					corrupt(f)
+				}
+
+				// Copy the file into the DB's FS.
+				_, err = vfs.Clone(tmpFS, fs, ingestTableName, ingestTableName)
+				require.NoError(t, err)
+
+				// Ingest the external table.
+				err = d.Ingest([]string{ingestTableName})
+				if err != nil {
+					et.errLoc = errLocationIngest
+					et.err = err
+					return
+				}
+
+				// Wait for the validation on the sstable to complete.
+				wg.Wait()
+
+				// Return any error encountered during validation.
+				if logger.err != nil {
+					et.errLoc = errLocationValidation
+					et.err = logger.err
+				}
+
+				return
+			}
+
+			// Construct a set of keys to ingest.
+			var keyVals []keyVal
+			for i := 0; i < nKeys; i++ {
+				key := make([]byte, keySize)
+				_, err = rng.Read(key)
+				require.NoError(t, err)
+
+				val := make([]byte, valSize)
+				_, err = rng.Read(val)
+				require.NoError(t, err)
+
+				keyVals = append(keyVals, keyVal{key, val})
+			}
+
+			// Keys must be sorted.
+			sort.Slice(keyVals, func(i, j int) bool {
+				return d.cmp(keyVals[i].key, keyVals[j].key) <= 0
+			})
+
+			// Run the ingestion.
+			et := runIngest(keyVals)
+
+			// Assert we saw the errors we expect.
+			switch tc.wantErrType {
+			case errLocationNone:
+				require.Equal(t, errLocationNone, et.errLoc)
+				require.NoError(t, et.err)
+			case errLocationIngest:
+				require.Equal(t, errLocationIngest, et.errLoc)
+				require.Error(t, et.err)
+				require.True(t, errors.Is(et.err, base.ErrCorruption))
+			case errLocationValidation:
+				require.Equal(t, errLocationValidation, et.errLoc)
+				require.Error(t, et.err)
+				require.True(t, errors.Is(et.err, base.ErrCorruption))
+			default:
+				t.Fatalf("unknown wantErrType %T", tc.wantErrType)
 			}
 		})
 	}
@@ -1283,6 +1763,6 @@ func runBenchmarkManySSTablesInUseKeyRanges(b *testing.B, d *DB, count int) {
 	smallest := []byte("0")
 	largest := []byte("z")
 	for i := 0; i < b.N; i++ {
-		_ = calculateInuseKeyRanges(v, d.cmp, 0, smallest, largest)
+		_ = calculateInuseKeyRanges(v, d.cmp, 0, numLevels-1, smallest, largest)
 	}
 }

@@ -13,10 +13,12 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/HdrHistogram/hdrhistogram-go"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/arenaskl"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/invariants"
+	"github.com/cockroachdb/pebble/internal/keyspan"
 	"github.com/cockroachdb/pebble/internal/manifest"
 	"github.com/cockroachdb/pebble/internal/manual"
 	"github.com/cockroachdb/pebble/record"
@@ -26,24 +28,28 @@ import (
 )
 
 const (
-	// MinTableCacheSize is the minimum size of the table cache, for a given store.
-	MinTableCacheSize = 64
+	// minTableCacheSize is the minimum size of the table cache, for a single db.
+	minTableCacheSize = 64
 
-	// NumNonTableCacheFiles is an approximation for the number of MaxOpenFiles
-	// that we don't use for table caches, for a given store.
-	NumNonTableCacheFiles = 10
+	// numNonTableCacheFiles is an approximation for the number of files
+	// that we don't use for table caches, for a given db.
+	numNonTableCacheFiles = 10
 )
 
 var (
 	// ErrNotFound is returned when a get operation does not find the requested
 	// key.
 	ErrNotFound = base.ErrNotFound
-	// ErrClosed is returned when an operation is performed on a closed snapshot
-	// or DB. Use errors.Is(err, ErrClosed) to check for this error.
+	// ErrClosed is panicked when an operation is performed on a closed snapshot or
+	// DB. Use errors.Is(err, ErrClosed) to check for this error.
 	ErrClosed = errors.New("pebble: closed")
 	// ErrReadOnly is returned when a write operation is performed on a read-only
 	// database.
 	ErrReadOnly = errors.New("pebble: read-only")
+	// errNoSplit indicates that the user is trying to perform a range key
+	// operation but the configured Comparer does not provide a Split
+	// implementation.
+	errNoSplit = errors.New("pebble: Comparer.Split required for range key operations")
 )
 
 // Reader is a readable key/value store.
@@ -108,10 +114,12 @@ type Writer interface {
 	// It is safe to modify the contents of the arguments after SingleDelete returns.
 	SingleDelete(key []byte, o *WriteOptions) error
 
-	// DeleteRange deletes all of the keys (and values) in the range [start,end)
-	// (inclusive on start, exclusive on end).
+	// DeleteRange deletes all of the point keys (and values) in the range
+	// [start,end) (inclusive on start, exclusive on end). DeleteRange does NOT
+	// delete overlapping range keys (eg, keys set via RangeKeySet).
 	//
-	// It is safe to modify the contents of the arguments after Delete returns.
+	// It is safe to modify the contents of the arguments after DeleteRange
+	// returns.
 	DeleteRange(start, end []byte, o *WriteOptions) error
 
 	// LogData adds the specified to the batch. The data will be written to the
@@ -132,6 +140,45 @@ type Writer interface {
 	//
 	// It is safe to modify the contents of the arguments after Set returns.
 	Set(key, value []byte, o *WriteOptions) error
+
+	// RangeKeySet sets a range key mapping the key range [start, end) at the MVCC
+	// timestamp suffix to value. The suffix is optional. If any portion of the key
+	// range [start, end) is already set by a range key with the same suffix value,
+	// RangeKeySet overrides it.
+	//
+	// It is safe to modify the contents of the arguments after RangeKeySet returns.
+	RangeKeySet(start, end, suffix, value []byte, opts *WriteOptions) error
+
+	// RangeKeyUnset removes a range key mapping the key range [start, end) at the
+	// MVCC timestamp suffix. The suffix may be omitted to remove an unsuffixed
+	// range key. RangeKeyUnset only removes portions of range keys that fall within
+	// the [start, end) key span, and only range keys with suffixes that exactly
+	// match the unset suffix.
+	//
+	// It is safe to modify the contents of the arguments after RangeKeyUnset
+	// returns.
+	RangeKeyUnset(start, end, suffix []byte, opts *WriteOptions) error
+
+	// RangeKeyDelete deletes all of the range keys in the range [start,end)
+	// (inclusive on start, exclusive on end). It does not delete point keys (for
+	// that use DeleteRange). RangeKeyDelete removes all range keys within the
+	// bounds, including those with or without suffixes.
+	//
+	// It is safe to modify the contents of the arguments after RangeKeyDelete
+	// returns.
+	RangeKeyDelete(start, end []byte, opts *WriteOptions) error
+}
+
+// CPUWorkPermissionGranter is used to request permission to opportunistically
+// use additional CPUs to speed up internal background work. Each granted "proc"
+// can be used to spin up a CPU bound goroutine, i.e, if scheduled each such
+// goroutine can consume one P in the goroutine scheduler. The calls to
+// ReturnProcs can be a bit delayed, since Pebble interacts with this interface
+// in a coarse manner. So one should assume that the total number of granted
+// procs is a non tight upper bound on the CPU that will get consumed.
+type CPUWorkPermissionGranter interface {
+	TryGetProcs(count int) int
+	ReturnProcs(count int)
 }
 
 // DB provides a concurrent, persistent ordered key/value store.
@@ -174,16 +221,6 @@ type DB struct {
 		memTableCount    int64
 		memTableReserved int64 // number of bytes reserved in the cache for memtables
 
-		// bytesFlushed is the number of bytes flushed in the current flush. This
-		// must be read/written atomically since it is accessed by both the flush
-		// and compaction routines.
-		bytesFlushed uint64
-
-		// bytesCompacted is the number of bytes compacted in the current compaction.
-		// This is used as a dummy variable to increment during compaction, and the
-		// value is not used anywhere.
-		bytesCompacted uint64
-
 		// The size of the current log file (i.e. db.mu.log.queue[len(queue)-1].
 		logSize uint64
 
@@ -212,8 +249,9 @@ type DB struct {
 	dataDir  vfs.File
 	walDir   vfs.File
 
-	tableCache *tableCacheContainer
-	newIters   tableNewIters
+	tableCache           *tableCacheContainer
+	newIters             tableNewIters
+	tableNewRangeKeyIter keyspan.TableNewSpanIter
 
 	commit *commitPipeline
 
@@ -232,9 +270,7 @@ type DB struct {
 	closed   *atomic.Value
 	closedCh chan struct{}
 
-	compactionLimiter limiter
-	flushLimiter      limiter
-	deletionLimiter   limiter
+	deletionLimiter limiter
 
 	// Async deletion jobs spawned by cleaners increment this WaitGroup, and
 	// call Done when completed. Once `d.mu.cleaning` is false, the db.Close()
@@ -242,6 +278,11 @@ type DB struct {
 	// and deleting goroutines have finished running. As deletion goroutines
 	// could grab db.mu, it must *not* be held while deleters.Wait() is called.
 	deleters sync.WaitGroup
+
+	// During an iterator close, we may asynchronously schedule read compactions.
+	// We want to wait for those goroutines to finish, before closing the DB.
+	// compactionShedulers.Wait() should not be called while the DB.mu is held.
+	compactionSchedulers sync.WaitGroup
 
 	// The main mutex protecting internal DB state. This mutex encompasses many
 	// fields because those fields need to be accessed and updated atomically. In
@@ -267,6 +308,11 @@ type DB struct {
 			// marker is moved in order to atomically record the new
 			// version.
 			marker *atomicfs.Marker
+			// ratcheting when set to true indicates that the database is
+			// currently in the process of ratcheting the format major version
+			// to vers + 1. As a part of ratcheting the format major version,
+			// migrations may drop and re-acquire the mutex.
+			ratcheting bool
 		}
 
 		// The ID of the next job. Job IDs are passed to event listener
@@ -295,6 +341,8 @@ type DB struct {
 			// commitPipeline.mu and DB.mu to be held when rotating the WAL/memtable
 			// (i.e. makeRoomForWrite).
 			*record.LogWriter
+			// Can be nil.
+			metrics record.LogWriterMetrics
 		}
 
 		mem struct {
@@ -308,7 +356,7 @@ type DB struct {
 			// index is set it is never modified making a fixed slice immutable and
 			// safe for concurrent reads.
 			queue flushableList
-			// True when the memtable is actively been switched. Both mem.mutable and
+			// True when the memtable is actively being switched. Both mem.mutable and
 			// log.LogWriter are invalid while switching is true.
 			switching bool
 			// nextSize is the size of the next memtable. The memtable size starts at
@@ -336,9 +384,20 @@ type DB struct {
 			manual []*manualCompaction
 			// inProgress is the set of in-progress flushes and compactions.
 			inProgress map[*compaction]struct{}
-			// readCompactions is a list of read triggered compactions. The next
-			// compaction to perform is as the start. New entries are added to the end.
-			readCompactions []readCompaction
+
+			// rescheduleReadCompaction indicates to an iterator that a read compaction
+			// should be scheduled.
+			rescheduleReadCompaction bool
+
+			// readCompactions is a readCompactionQueue which keeps track of the
+			// compactions which we might have to perform.
+			readCompactions readCompactionQueue
+
+			// Flush throughput metric.
+			flushWriteThroughput ThroughputMetric
+			// The idle start time for the flush "loop", i.e., when the flushing
+			// bool above transitions to false.
+			noOngoingFlushStartTime time.Time
 		}
 
 		cleaner struct {
@@ -355,6 +414,10 @@ type DB struct {
 			// DB.{disable,Enable}FileDeletions().
 			disabled int
 		}
+
+		// Stores the Metrics for the previous call to InternalIntervalMetrics() in
+		// order to compute the current intervals metrics
+		lastMetrics *Metrics
 
 		// The list of active snapshots.
 		snapshots snapshotList
@@ -375,6 +438,17 @@ type DB struct {
 			// active stat collection goroutine clears the list and processes
 			// them.
 			pending []manifest.NewFileEntry
+		}
+
+		tableValidation struct {
+			// cond is a condition variable used to signal the completion of a
+			// job to validate one or more sstables.
+			cond sync.Cond
+			// pending is a slice of metadata for sstables waiting to be
+			// validated.
+			pending []newFileEntry
+			// validating is set to true when validation is running.
+			validating bool
 		}
 	}
 
@@ -454,13 +528,13 @@ func (d *DB) getInternal(key []byte, b *Batch, s *Snapshot) ([]byte, io.Closer, 
 	}
 
 	i := &buf.dbi
+	pointIter := get
 	*i = Iterator{
 		getIterAlloc: buf,
-		cmp:          d.cmp,
-		equal:        d.equal,
-		iter:         get,
+		iter:         pointIter,
+		pointIter:    pointIter,
 		merge:        d.merge,
-		split:        d.split,
+		comparer:     *d.opts.Comparer,
 		readState:    readState,
 		keyBuf:       buf.keyBuf,
 	}
@@ -568,6 +642,60 @@ func (d *DB) LogData(data []byte, opts *WriteOptions) error {
 	return nil
 }
 
+// RangeKeySet sets a range key mapping the key range [start, end) at the MVCC
+// timestamp suffix to value. The suffix is optional. If any portion of the key
+// range [start, end) is already set by a range key with the same suffix value,
+// RangeKeySet overrides it.
+//
+// It is safe to modify the contents of the arguments after RangeKeySet returns.
+func (d *DB) RangeKeySet(start, end, suffix, value []byte, opts *WriteOptions) error {
+	b := newBatch(d)
+	_ = b.RangeKeySet(start, end, suffix, value, opts)
+	if err := d.Apply(b, opts); err != nil {
+		return err
+	}
+	// Only release the batch on success.
+	b.release()
+	return nil
+}
+
+// RangeKeyUnset removes a range key mapping the key range [start, end) at the
+// MVCC timestamp suffix. The suffix may be omitted to remove an unsuffixed
+// range key. RangeKeyUnset only removes portions of range keys that fall within
+// the [start, end) key span, and only range keys with suffixes that exactly
+// match the unset suffix.
+//
+// It is safe to modify the contents of the arguments after RangeKeyUnset
+// returns.
+func (d *DB) RangeKeyUnset(start, end, suffix []byte, opts *WriteOptions) error {
+	b := newBatch(d)
+	_ = b.RangeKeyUnset(start, end, suffix, opts)
+	if err := d.Apply(b, opts); err != nil {
+		return err
+	}
+	// Only release the batch on success.
+	b.release()
+	return nil
+}
+
+// RangeKeyDelete deletes all of the range keys in the range [start,end)
+// (inclusive on start, exclusive on end). It does not delete point keys (for
+// that use DeleteRange). RangeKeyDelete removes all range keys within the
+// bounds, including those with or without suffixes.
+//
+// It is safe to modify the contents of the arguments after RangeKeyDelete
+// returns.
+func (d *DB) RangeKeyDelete(start, end []byte, opts *WriteOptions) error {
+	b := newBatch(d)
+	_ = b.RangeKeyDelete(start, end, opts)
+	if err := d.Apply(b, opts); err != nil {
+		return err
+	}
+	// Only release the batch on success.
+	b.release()
+	return nil
+}
+
 // Apply the operations contained in the batch to the DB. If the batch is large
 // the contents of the batch may be retained by the database. If that occurs
 // the batch contents will be cleared preventing the caller from attempting to
@@ -591,6 +719,20 @@ func (d *DB) Apply(batch *Batch, opts *WriteOptions) error {
 	sync := opts.GetSync()
 	if sync && d.opts.DisableWAL {
 		return errors.New("pebble: WAL disabled")
+	}
+
+	if batch.countRangeKeys > 0 {
+		if d.split == nil {
+			return errNoSplit
+		}
+		if d.FormatMajorVersion() < FormatRangeKeys {
+			panic(fmt.Sprintf(
+				"pebble: range keys require at least format major version %d (current: %d)",
+				FormatRangeKeys, d.FormatMajorVersion(),
+			))
+		}
+
+		// TODO(jackson): Assert that all range key operands are suffixless.
 	}
 
 	if batch.db == nil {
@@ -630,9 +772,18 @@ func (d *DB) commitApply(b *Batch, mem *memTable) error {
 	// If the batch contains range tombstones and the database is configured
 	// to flush range deletions, schedule a delayed flush so that disk space
 	// may be reclaimed without additional writes or an explicit flush.
-	if b.countRangeDels > 0 && d.opts.Experimental.DeleteRangeFlushDelay > 0 {
+	if b.countRangeDels > 0 && d.opts.FlushDelayDeleteRange > 0 {
 		d.mu.Lock()
-		d.maybeScheduleDelayedFlush(mem)
+		d.maybeScheduleDelayedFlush(mem, d.opts.FlushDelayDeleteRange)
+		d.mu.Unlock()
+	}
+
+	// If the batch contains range keys and the database is configured to flush
+	// range keys, schedule a delayed flush so that the range keys are cleared
+	// from the memtable.
+	if b.countRangeKeys > 0 && d.opts.FlushDelayRangeKey > 0 {
+		d.mu.Lock()
+		d.maybeScheduleDelayedFlush(mem, d.opts.FlushDelayRangeKey)
 		d.mu.Unlock()
 	}
 
@@ -706,6 +857,7 @@ func (d *DB) commitWrite(b *Batch, syncWG *sync.WaitGroup, syncErr *error) (*mem
 type iterAlloc struct {
 	dbi                 Iterator
 	keyBuf              []byte
+	boundsBuf           [2][]byte
 	prefixOrFullSeekKey []byte
 	merging             mergingIter
 	mlevels             [3 + numLevels]mergingIterLevel
@@ -724,7 +876,24 @@ func (d *DB) newIterInternal(batch *Batch, s *Snapshot, o *IterOptions) *Iterato
 	if err := d.closed.Load(); err != nil {
 		panic(err)
 	}
-
+	if o.rangeKeys() {
+		if d.FormatMajorVersion() < FormatRangeKeys {
+			panic(fmt.Sprintf(
+				"pebble: range keys require at least format major version %d (current: %d)",
+				FormatRangeKeys, d.FormatMajorVersion(),
+			))
+		}
+	}
+	if o != nil && o.RangeKeyMasking.Suffix != nil && o.KeyTypes != IterKeyTypePointsAndRanges {
+		panic("pebble: range key masking requires IterKeyTypePointsAndRanges")
+	}
+	if (batch != nil || s != nil) && (o != nil && o.OnlyReadGuaranteedDurable) {
+		// We could add support for OnlyReadGuaranteedDurable on snapshots if
+		// there was a need: this would require checking that the sequence number
+		// of the snapshot has been flushed, by comparing with
+		// DB.mem.queue[0].logSeqNum.
+		panic("OnlyReadGuaranteedDurable is not supported for batches or snapshots")
+	}
 	// Grab and reference the current readState. This prevents the underlying
 	// files in the associated version from being deleted if there is a current
 	// compaction. The readState is unref'd by Iterator.Close().
@@ -745,35 +914,142 @@ func (d *DB) newIterInternal(batch *Batch, s *Snapshot, o *IterOptions) *Iterato
 	dbi := &buf.dbi
 	*dbi = Iterator{
 		alloc:               buf,
-		cmp:                 d.cmp,
-		equal:               d.equal,
-		iter:                &buf.merging,
 		merge:               d.merge,
-		split:               d.split,
+		comparer:            *d.opts.Comparer,
 		readState:           readState,
 		keyBuf:              buf.keyBuf,
 		prefixOrFullSeekKey: buf.prefixOrFullSeekKey,
+		boundsBuf:           buf.boundsBuf,
 		batch:               batch,
 		newIters:            d.newIters,
+		newIterRangeKey:     d.tableNewRangeKeyIter,
 		seqNum:              seqNum,
 	}
 	if o != nil {
 		dbi.opts = *o
+		dbi.saveBounds(o.LowerBound, o.UpperBound)
 	}
 	dbi.opts.logger = d.opts.Logger
+	if d.opts.private.disableLazyCombinedIteration {
+		dbi.opts.disableLazyCombinedIteration = true
+	}
+	if batch != nil {
+		dbi.batchSeqNum = dbi.batch.nextSeqNum()
+	}
 	return finishInitializingIter(buf)
 }
 
 // finishInitializingIter is a helper for doing the non-trivial initialization
-// of an Iterator.
+// of an Iterator. It's invoked to perform the initial initialization of an
+// Iterator during NewIter or Clone, and to perform reinitialization due to a
+// change in IterOptions by a call to Iterator.SetOptions.
 func finishInitializingIter(buf *iterAlloc) *Iterator {
 	// Short-hand.
 	dbi := &buf.dbi
-	readState := dbi.readState
-	batch := dbi.batch
-	seqNum := dbi.seqNum
-	memtables := readState.memtables
-	current := readState.current
+	memtables := dbi.readState.memtables
+	if dbi.opts.OnlyReadGuaranteedDurable {
+		memtables = nil
+	} else {
+		// We only need to read from memtables which contain sequence numbers older
+		// than seqNum. Trim off newer memtables.
+		for i := len(memtables) - 1; i >= 0; i-- {
+			if logSeqNum := memtables[i].logSeqNum; logSeqNum < dbi.seqNum {
+				break
+			}
+			memtables = memtables[:i]
+		}
+	}
+
+	if dbi.opts.pointKeys() {
+		// Construct the point iterator, initializing dbi.pointIter to point to
+		// dbi.merging. If this is called during a SetOptions call and this
+		// Iterator has already initialized dbi.merging, constructPointIter is a
+		// noop and an initialized pointIter already exists in dbi.pointIter.
+		dbi.constructPointIter(memtables, buf)
+		dbi.iter = dbi.pointIter
+	} else {
+		dbi.iter = emptyIter
+	}
+
+	if dbi.opts.rangeKeys() {
+		dbi.rangeKeyMasking.init(dbi, dbi.comparer.Compare, dbi.comparer.Split)
+
+		// When iterating over both point and range keys, don't create the
+		// range-key iterator stack immediately if we can avoid it. This
+		// optimization takes advantage of the expected sparseness of range
+		// keys, and configures the point-key iterator to dynamically switch to
+		// combined iteration when it observes a file containing range keys.
+		//
+		// Lazy combined iteration is not possible if a batch or a memtable
+		// contains any range keys.
+		useLazyCombinedIteration := dbi.rangeKey == nil &&
+			dbi.opts.KeyTypes == IterKeyTypePointsAndRanges &&
+			(dbi.batch == nil || dbi.batch.countRangeKeys == 0) &&
+			!dbi.opts.disableLazyCombinedIteration
+		if useLazyCombinedIteration {
+			// The user requested combined iteration, and there's no indexed
+			// batch currently containing range keys that would prevent lazy
+			// combined iteration. Check the memtables to see if they contain
+			// any range keys.
+			for i := range memtables {
+				if memtables[i].containsRangeKeys() {
+					useLazyCombinedIteration = false
+					break
+				}
+			}
+		}
+
+		if useLazyCombinedIteration {
+			dbi.lazyCombinedIter = lazyCombinedIter{
+				parent:    dbi,
+				pointIter: dbi.pointIter,
+				combinedIterState: combinedIterState{
+					initialized: false,
+				},
+			}
+			dbi.iter = &dbi.lazyCombinedIter
+		} else {
+			dbi.lazyCombinedIter.combinedIterState = combinedIterState{
+				initialized: true,
+			}
+			if dbi.rangeKey == nil {
+				dbi.rangeKey = iterRangeKeyStateAllocPool.Get().(*iteratorRangeKeyState)
+				dbi.rangeKey.init(dbi.comparer.Compare, dbi.comparer.Split, &dbi.opts)
+				dbi.constructRangeKeyIter()
+			} else {
+				dbi.rangeKey.iterConfig.SetBounds(dbi.opts.LowerBound, dbi.opts.UpperBound)
+			}
+
+			// Wrap the point iterator (currently dbi.iter) with an interleaving
+			// iterator that interleaves range keys pulled from
+			// dbi.rangeKey.rangeKeyIter.
+			//
+			// NB: The interleaving iterator is always reinitialized, even if
+			// dbi already had an initialized range key iterator, in case the point
+			// iterator changed or the range key masking suffix changed.
+			dbi.rangeKey.iiter.Init(&dbi.comparer, dbi.iter, dbi.rangeKey.rangeKeyIter,
+				&dbi.rangeKeyMasking, dbi.opts.LowerBound, dbi.opts.UpperBound)
+			dbi.iter = &dbi.rangeKey.iiter
+		}
+	} else {
+		// !dbi.opts.rangeKeys()
+		//
+		// Reset the combined iterator state. The initialized=true ensures the
+		// iterator doesn't unnecessarily try to switch to combined iteration.
+		dbi.lazyCombinedIter.combinedIterState = combinedIterState{initialized: true}
+	}
+	return dbi
+}
+
+func (i *Iterator) constructPointIter(memtables flushableList, buf *iterAlloc) {
+	if i.pointIter != nil {
+		// Already have one.
+		return
+	}
+	internalOpts := internalIterOpts{stats: &i.stats.InternalStats}
+	if i.opts.RangeKeyMasking.Filter != nil {
+		internalOpts.boundLimitedFilter = &i.rangeKeyMasking
+	}
 
 	// Merging levels and levels from iterAlloc.
 	mlevels := buf.mlevels[:0]
@@ -784,18 +1060,12 @@ func finishInitializingIter(buf *iterAlloc) *Iterator {
 	// should improve the performance.
 	numMergingLevels := 0
 	numLevelIters := 0
-	if batch != nil {
+	if i.batch != nil {
 		numMergingLevels++
 	}
-	for i := len(memtables) - 1; i >= 0; i-- {
-		mem := memtables[i]
-		// We only need to read from memtables which contain sequence numbers older
-		// than seqNum.
-		if logSeqNum := mem.logSeqNum; logSeqNum >= seqNum {
-			continue
-		}
-		numMergingLevels++
-	}
+	numMergingLevels += len(memtables)
+
+	current := i.readState.current
 	numMergingLevels += len(current.L0SublevelFiles)
 	numLevelIters += len(current.L0SublevelFiles)
 	for level := 1; level < len(current.Levels); level++ {
@@ -805,6 +1075,7 @@ func finishInitializingIter(buf *iterAlloc) *Iterator {
 		numMergingLevels++
 		numLevelIters++
 	}
+
 	if numMergingLevels > cap(mlevels) {
 		mlevels = make([]mergingIterLevel, 0, numMergingLevels)
 	}
@@ -813,24 +1084,39 @@ func finishInitializingIter(buf *iterAlloc) *Iterator {
 	}
 
 	// Top-level is the batch, if any.
-	if batch != nil {
-		mlevels = append(mlevels, mergingIterLevel{
-			iter:         batch.newInternalIter(&dbi.opts),
-			rangeDelIter: batch.newRangeDelIter(&dbi.opts),
-		})
+	if i.batch != nil {
+		if i.batch.index == nil {
+			// This isn't an indexed batch. Include an error iterator so that
+			// the resulting iterator correctly surfaces ErrIndexed.
+			mlevels = append(mlevels, mergingIterLevel{
+				iter:         newErrorIter(ErrNotIndexed),
+				rangeDelIter: newErrorKeyspanIter(ErrNotIndexed),
+			})
+		} else {
+			i.batch.initInternalIter(&i.opts, &i.batchPointIter)
+			i.batch.initRangeDelIter(&i.opts, &i.batchRangeDelIter, i.batchSeqNum)
+			// Only include the batch's rangedel iterator if it's non-empty.
+			// This requires some subtle logic in the case a rangedel is later
+			// written to the batch and the view of the batch is refreshed
+			// during a call to SetOptions—in this case, we need to reconstruct
+			// the point iterator to add the batch rangedel iterator.
+			var rangeDelIter keyspan.FragmentIterator
+			if i.batchRangeDelIter.Count() > 0 {
+				rangeDelIter = &i.batchRangeDelIter
+			}
+			mlevels = append(mlevels, mergingIterLevel{
+				iter:         &i.batchPointIter,
+				rangeDelIter: rangeDelIter,
+			})
+		}
 	}
 
 	// Next are the memtables.
-	for i := len(memtables) - 1; i >= 0; i-- {
-		mem := memtables[i]
-		// We only need to read from memtables which contain sequence numbers older
-		// than seqNum.
-		if logSeqNum := mem.logSeqNum; logSeqNum >= seqNum {
-			continue
-		}
+	for j := len(memtables) - 1; j >= 0; j-- {
+		mem := memtables[j]
 		mlevels = append(mlevels, mergingIterLevel{
-			iter:         mem.newIter(&dbi.opts),
-			rangeDelIter: mem.newRangeDelIter(&dbi.opts),
+			iter:         mem.newIter(&i.opts),
+			rangeDelIter: mem.newRangeDelIter(&i.opts),
 		})
 	}
 
@@ -839,16 +1125,13 @@ func finishInitializingIter(buf *iterAlloc) *Iterator {
 	levelsIndex := len(levels)
 	mlevels = mlevels[:numMergingLevels]
 	levels = levels[:numLevelIters]
-
 	addLevelIterForFiles := func(files manifest.LevelIterator, level manifest.Level) {
 		li := &levels[levelsIndex]
 
-		li.init(dbi.opts, dbi.cmp, dbi.split, dbi.newIters, files, level, nil)
+		li.init(i.opts, i.comparer.Compare, i.comparer.Split, i.newIters, files, level, internalOpts)
 		li.initRangeDel(&mlevels[mlevelsIndex].rangeDelIter)
-		li.initSmallestLargestUserKey(&mlevels[mlevelsIndex].smallestUserKey,
-			&mlevels[mlevelsIndex].largestUserKey,
-			&mlevels[mlevelsIndex].isLargestUserKeyRangeDelSentinel)
-		li.initIsSyntheticIterBoundsKey(&mlevels[mlevelsIndex].isSyntheticIterBoundsKey)
+		li.initBoundaryContext(&mlevels[mlevelsIndex].levelIterBoundaryContext)
+		li.initCombinedIterState(&i.lazyCombinedIter.combinedIterState)
 		mlevels[mlevelsIndex].iter = li
 
 		levelsIndex++
@@ -868,11 +1151,13 @@ func finishInitializingIter(buf *iterAlloc) *Iterator {
 		}
 		addLevelIterForFiles(current.Levels[level].Iter(), manifest.Level(level))
 	}
-
-	buf.merging.init(&dbi.opts, dbi.cmp, dbi.split, mlevels...)
-	buf.merging.snapshot = seqNum
+	buf.merging.init(&i.opts, &i.stats.InternalStats, i.comparer.Compare, i.comparer.Split, mlevels...)
+	buf.merging.snapshot = i.seqNum
+	buf.merging.batchSnapshot = i.batchSeqNum
 	buf.merging.elideRangeTombstones = true
-	return dbi
+	buf.merging.combinedIterState = &i.lazyCombinedIter.combinedIterState
+	i.pointIter = &buf.merging
+	i.merging = &buf.merging
 }
 
 // NewBatch returns a new empty write-only batch. Any reads on the batch will
@@ -931,6 +1216,18 @@ func (d *DB) NewSnapshot() *Snapshot {
 // or to call Close concurrently with any other DB method. It is not valid
 // to call any of a DB's methods after the DB has been closed.
 func (d *DB) Close() error {
+	// Lock the commit pipeline for the duration of Close. This prevents a race
+	// with makeRoomForWrite. Rotating the WAL in makeRoomForWrite requires
+	// dropping d.mu several times for I/O. If Close only holds d.mu, an
+	// in-progress WAL rotation may re-acquire d.mu only once the database is
+	// closed.
+	//
+	// Additionally, locking the commit pipeline makes it more likely that
+	// (illegal) concurrent writes will observe d.closed.Load() != nil, creating
+	// more understable panics if the database is improperly used concurrently
+	// during Close.
+	d.commit.mu.Lock()
+	defer d.commit.mu.Unlock()
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if err := d.closed.Load(); err != nil {
@@ -954,6 +1251,9 @@ func (d *DB) Close() error {
 	}
 	for d.mu.tableStats.loading {
 		d.mu.tableStats.cond.Wait()
+	}
+	for d.mu.tableValidation.validating {
+		d.mu.tableValidation.cond.Wait()
 	}
 
 	var err error
@@ -1014,14 +1314,24 @@ func (d *DB) Close() error {
 	// Wait for all the deletion goroutines spawned by cleaning jobs to finish.
 	d.mu.Unlock()
 	d.deleters.Wait()
+	d.compactionSchedulers.Wait()
 	d.mu.Lock()
+
+	// If the options include a closer to 'close' the filesystem, close it.
+	if d.opts.private.fsCloser != nil {
+		d.opts.private.fsCloser.Close()
+	}
+
+	// Return an error if the user failed to close all open snapshots.
+	if v := d.mu.snapshots.count(); v > 0 {
+		err = firstError(err, errors.Errorf("leaked snapshots: %d open snapshots on DB %p", v, d))
+	}
+
 	return err
 }
 
 // Compact the specified range of keys in the database.
-func (d *DB) Compact(
-	start, end []byte, /* CompactionOptions */
-) error {
+func (d *DB) Compact(start, end []byte, parallelize bool) error {
 	if err := d.closed.Load(); err != nil {
 		panic(err)
 	}
@@ -1034,13 +1344,14 @@ func (d *DB) Compact(
 	}
 	iStart := base.MakeInternalKey(start, InternalKeySeqNumMax, InternalKeyKindMax)
 	iEnd := base.MakeInternalKey(end, 0, 0)
-	meta := []*fileMetadata{{Smallest: iStart, Largest: iEnd}}
+	m := (&fileMetadata{}).ExtendPointKeyBounds(d.cmp, iStart, iEnd)
+	meta := []*fileMetadata{m}
 
 	d.mu.Lock()
 	maxLevelWithFiles := 1
 	cur := d.mu.versions.currentVersion()
 	for level := 0; level < numLevels; level++ {
-		overlaps := cur.Overlaps(level, d.cmp, start, end)
+		overlaps := cur.Overlaps(level, d.cmp, start, end, iEnd.IsExclusiveSentinel())
 		if !overlaps.Empty() {
 			maxLevelWithFiles = level + 1
 		}
@@ -1088,31 +1399,81 @@ func (d *DB) Compact(
 	}
 
 	for level := 0; level < maxLevelWithFiles; {
-		manual := &manualCompaction{
-			done:  make(chan error, 1),
-			level: level,
-			start: iStart,
-			end:   iEnd,
-		}
-		if err := d.manualCompact(manual); err != nil {
+		if err := d.manualCompact(
+			iStart.UserKey, iEnd.UserKey, level, parallelize); err != nil {
 			return err
 		}
-		level = manual.outputLevel
+		level++
 		if level == numLevels-1 {
-			// A manual compaction of the bottommost level occured. There is no next
-			// level to try and compact.
+			// A manual compaction of the bottommost level occurred.
+			// There is no next level to try and compact.
 			break
 		}
 	}
 	return nil
 }
 
-func (d *DB) manualCompact(manual *manualCompaction) error {
+func (d *DB) manualCompact(start, end []byte, level int, parallelize bool) error {
 	d.mu.Lock()
-	d.mu.compact.manual = append(d.mu.compact.manual, manual)
+	curr := d.mu.versions.currentVersion()
+	files := curr.Overlaps(level, d.cmp, start, end, false)
+	if files.Empty() {
+		d.mu.Unlock()
+		return nil
+	}
+
+	var compactions []*manualCompaction
+	if parallelize {
+		compactions = append(compactions, d.splitManualCompaction(start, end, level)...)
+	} else {
+		compactions = append(compactions, &manualCompaction{
+			level: level,
+			done:  make(chan error, 1),
+			start: start,
+			end:   end,
+		})
+	}
+	d.mu.compact.manual = append(d.mu.compact.manual, compactions...)
 	d.maybeScheduleCompaction()
 	d.mu.Unlock()
-	return <-manual.done
+
+	// Each of the channels is guaranteed to be eventually sent to once. After a
+	// compaction is possibly picked in d.maybeScheduleCompaction(), either the
+	// compaction is dropped, executed after being scheduled, or retried later.
+	// Assuming eventual progress when a compaction is retried, all outcomes send
+	// a value to the done channel. Since the channels are buffered, it is not
+	// necessary to read from each channel, and so we can exit early in the event
+	// of an error.
+	for _, compaction := range compactions {
+		if err := <-compaction.done; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// splitManualCompaction splits a manual compaction over [start,end] on level
+// such that the resulting compactions have no key overlap.
+func (d *DB) splitManualCompaction(
+	start, end []byte, level int,
+) (splitCompactions []*manualCompaction) {
+	curr := d.mu.versions.currentVersion()
+	endLevel := level + 1
+	baseLevel := d.mu.versions.picker.getBaseLevel()
+	if level == 0 {
+		endLevel = baseLevel
+	}
+	keyRanges := calculateInuseKeyRanges(curr, d.cmp, level, endLevel, start, end)
+	for _, keyRange := range keyRanges {
+		splitCompactions = append(splitCompactions, &manualCompaction{
+			level: level,
+			done:  make(chan error, 1),
+			start: keyRange.Start,
+			end:   keyRange.End,
+			split: true,
+		})
+	}
+	return splitCompactions
 }
 
 // Flush the memtable to stable storage.
@@ -1149,17 +1510,60 @@ func (d *DB) AsyncFlush() (<-chan struct{}, error) {
 	return flushed, nil
 }
 
+// InternalIntervalMetrics returns the InternalIntervalMetrics and resets for
+// the next interval (which is until the next call to this method).
+// Deprecated: Use Metrics.Flush and Metrics.LogWriter instead
+func (d *DB) InternalIntervalMetrics() *InternalIntervalMetrics {
+	m := d.Metrics()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	// Copy the relevant metrics, ensuring to perform a deep clone of the histogram
+	// to avoid mutating it.
+	logDelta := m.LogWriter
+	if m.LogWriter.SyncLatencyMicros != nil {
+		logDelta.SyncLatencyMicros = hdrhistogram.Import(m.LogWriter.SyncLatencyMicros.Export())
+	}
+	flushDelta := m.Flush.WriteThroughput
+
+	// Subtract the cumulative metrics at the time of the last InternalIntervalMetrics call,
+	// if any, in order to compute the delta.
+	if d.mu.lastMetrics != nil {
+		logDelta.Subtract(&d.mu.lastMetrics.LogWriter)
+		flushDelta.Subtract(d.mu.lastMetrics.Flush.WriteThroughput)
+	}
+
+	// Save the *Metrics we used so that a subsequent call to InternalIntervalMetrics
+	// can compute the delta relative to it.
+	d.mu.lastMetrics = m
+
+	iim := &InternalIntervalMetrics{}
+	iim.LogWriter.PendingBufferUtilization = logDelta.PendingBufferLen.Mean() / record.CapAllocatedBlocks
+	iim.LogWriter.SyncQueueUtilization = logDelta.SyncQueueLen.Mean() / record.SyncConcurrency
+	iim.LogWriter.SyncLatencyMicros = logDelta.SyncLatencyMicros
+	iim.LogWriter.WriteThroughput = logDelta.WriteThroughput
+	iim.Flush.WriteThroughput = flushDelta
+	return iim
+}
+
 // Metrics returns metrics about the database.
 func (d *DB) Metrics() *Metrics {
 	metrics := &Metrics{}
 	recycledLogsCount, recycledLogSize := d.logRecycler.stats()
 
 	d.mu.Lock()
+	vers := d.mu.versions.currentVersion()
 	*metrics = d.mu.versions.metrics
 	metrics.Compact.EstimatedDebt = d.mu.versions.picker.estimatedCompactionDebt(0)
 	metrics.Compact.InProgressBytes = atomic.LoadInt64(&d.mu.versions.atomic.atomicInProgressBytes)
+	metrics.Compact.NumInProgress = int64(d.mu.compact.compactingCount)
+	metrics.Compact.MarkedFiles = vers.Stats.MarkedForCompaction
 	for _, m := range d.mu.mem.queue {
 		metrics.MemTable.Size += m.totalBytes()
+	}
+	metrics.Snapshots.Count = d.mu.snapshots.count()
+	if metrics.Snapshots.Count > 0 {
+		metrics.Snapshots.EarliestSeqNum = d.mu.snapshots.earliest()
 	}
 	metrics.MemTable.Count = int64(len(d.mu.mem.queue))
 	metrics.MemTable.ZombieCount = atomic.LoadInt64(&d.atomic.memTableCount) - metrics.MemTable.Count
@@ -1197,9 +1601,17 @@ func (d *DB) Metrics() *Metrics {
 	}
 	metrics.private.optionsFileSize = d.optionsFileSize
 
+	metrics.Keys.RangeKeySetsCount = countRangeKeySetFragments(vers)
+
 	d.mu.versions.logLock()
 	metrics.private.manifestFileSize = uint64(d.mu.versions.manifest.Size())
 	d.mu.versions.logUnlock()
+
+	if err := metrics.LogWriter.Merge(&d.mu.log.metrics); err != nil {
+		d.opts.Logger.Infof("metrics error: %s", err)
+	}
+	metrics.Flush.WriteThroughput = d.mu.compact.flushWriteThroughput
+
 	d.mu.Unlock()
 
 	metrics.BlockCache = d.opts.Cache.Metrics()
@@ -1313,7 +1725,7 @@ func (d *DB) EstimateDiskUsage(start, end []byte) (uint64, error) {
 			// We can only use `Overlaps` to restrict `files` at L1+ since at L0 it
 			// expands the range iteratively until it has found a set of files that
 			// do not overlap any other L0 files outside that set.
-			overlaps := readState.current.Overlaps(level, d.opts.Comparer.Compare, start, end)
+			overlaps := readState.current.Overlaps(level, d.opts.Comparer.Compare, start, end, false /* exclusiveEnd */)
 			iter = overlaps.Iter()
 		}
 		for file := iter.First(); file != nil; file = iter.Next() {
@@ -1486,9 +1898,15 @@ func (d *DB) makeRoomForWrite(b *Batch) error {
 			// close the previous log before linking the new log file,
 			// otherwise a crash could leave both logs with unclean tails, and
 			// Open will treat the previous log as corrupt.
-			err = d.mu.log.Close()
+			err = d.mu.log.LogWriter.Close()
+			metrics := d.mu.log.LogWriter.Metrics()
+			d.mu.Lock()
+			if err := d.mu.log.metrics.Merge(metrics); err != nil {
+				d.opts.Logger.Infof("metrics error: %s", err)
+			}
+			d.mu.Unlock()
 
-			newLogName := base.MakeFilename(d.opts.FS, d.walDirname, fileTypeLog, newLogNum)
+			newLogName := base.MakeFilepath(d.opts.FS, d.walDirname, fileTypeLog, newLogNum)
 
 			// Try to use a recycled log file. Recycling log files is an important
 			// performance optimization as it is faster to sync a file that has
@@ -1501,7 +1919,7 @@ func (d *DB) makeRoomForWrite(b *Batch) error {
 			if err == nil {
 				recycleLog, recycleOK = d.logRecycler.peek()
 				if recycleOK {
-					recycleLogName := base.MakeFilename(d.opts.FS, d.walDirname, fileTypeLog, recycleLog.fileNum)
+					recycleLogName := base.MakeFilepath(d.opts.FS, d.walDirname, fileTypeLog, recycleLog.fileNum)
 					newLogFile, err = d.opts.FS.ReuseForWrite(recycleLogName, newLogName)
 					base.MustExist(d.opts.FS, newLogName, d.opts.Logger, err)
 				} else {
@@ -1536,6 +1954,7 @@ func (d *DB) makeRoomForWrite(b *Batch) error {
 				newLogFile.Close()
 			} else if err == nil {
 				newLogFile = vfs.NewSyncingFile(newLogFile, vfs.SyncingFileOptions{
+					NoSyncOnClose:   d.opts.NoSyncOnClose,
 					BytesPerSync:    d.opts.WALBytesPerSync,
 					PreallocateSize: d.walPreallocateSize(),
 				})

@@ -1,9 +1,13 @@
 package metamorphic
 
 import (
-	"bytes"
 	"fmt"
 	"sort"
+	"testing"
+
+	"github.com/cockroachdb/pebble/internal/base"
+	"github.com/cockroachdb/pebble/internal/testkeys"
+	"github.com/stretchr/testify/require"
 )
 
 // objKey is a tuple of (objID, key). This struct is used primarily as a map
@@ -28,15 +32,21 @@ func (o objKey) String() string {
 	return fmt.Sprintf("%s:%s", o.id, o.key)
 }
 
+type keyUpdate struct {
+	deleted bool
+	// metaTimestamp at which the write or delete op occurred.
+	metaTimestamp int
+}
+
 // keyMeta is metadata associated with an (objID, key) pair, where objID is
 // a writer containing the key.
 type keyMeta struct {
 	objKey
 
 	// The number of Sets of the key in this writer.
-	sets      int
+	sets int
 	// The number of Merges of the key in this writer.
-	merges    int
+	merges int
 	// singleDel can be true only if sets <= 1 && merges == 0 and the
 	// SingleDelete was added to this writer after the set.
 	singleDel bool
@@ -45,6 +55,12 @@ type keyMeta struct {
 	// del can be true only if a Delete was added to this writer after the
 	// Sets and Merges counted above.
 	del bool
+
+	// updateOps should always be ordered by non-decreasing metaTimestamp.
+	// updateOps will not be updated if the key is range deleted. Therefore, it
+	// is a best effort sequence of updates to the key. updateOps is used to
+	// determine if an iterator created on the DB can read a certain key.
+	updateOps []keyUpdate
 }
 
 func (m *keyMeta) clear() {
@@ -53,10 +69,11 @@ func (m *keyMeta) clear() {
 	m.singleDel = false
 	m.del = false
 	m.dels = 0
+	m.updateOps = nil
 }
 
 // mergeInto merges this metadata this into the metadata for other.
-func (m *keyMeta) mergeInto(other *keyMeta) {
+func (m *keyMeta) mergeInto(keyManager *keyManager, other *keyMeta) {
 	if other.del && !m.del {
 		// m's Sets and Merges are later.
 		if m.sets > 0 || m.merges > 0 {
@@ -74,13 +91,28 @@ func (m *keyMeta) mergeInto(other *keyMeta) {
 	// maintaining a global invariant that SingleDelete will only be added for
 	// a key that has no inflight Sets or Merges (Sets have made their way to
 	// the DB), and no subsequent Sets or Merges will happen until the
-	// SingleDelete makes its way to th DB.
+	// SingleDelete makes its way to the DB.
 	other.singleDel = other.singleDel || m.singleDel
 	if other.singleDel {
 		if other.sets > 1 || other.merges > 0 || other.dels > 0 {
 			panic(fmt.Sprintf("invalid sets %d or merges %d or dels %d",
 				other.sets, other.merges, other.dels))
 		}
+	}
+
+	// Determine if the key is visible or not after the keyMetas are merged.
+	// TODO(bananabrick): We currently only care about key updates which make it
+	// to the DB, since we only use key updates to determine if an iterator
+	// can read a key in the DB. We could extend the timestamp system to add
+	// support for iterators created on batches.
+	if other.del || other.singleDel {
+		other.updateOps = append(
+			other.updateOps, keyUpdate{true, keyManager.nextMetaTimestamp()},
+		)
+	} else {
+		other.updateOps = append(
+			other.updateOps, keyUpdate{false, keyManager.nextMetaTimestamp()},
+		)
 	}
 }
 
@@ -96,22 +128,36 @@ func (m *keyMeta) mergeInto(other *keyMeta) {
 // are what we cannot tolerate (doing SingleDelete on a key that has not been
 // written to because the Set was lost is harmless).
 type keyManager struct {
+	comparer *base.Comparer
+
+	// metaTimestamp is used to provide a ordering over certain operations like
+	// iter creation, updates to keys. Keeping track of the timestamp allows us
+	// to make determinations such as whether a key will be visible to an
+	// iterator.
+	metaTimestamp int
+
 	// byObjKey tracks the state for each (writer, key) pair. It refers to the
 	// same *keyMeta as in the byObj slices. Using a map allows for fast state
 	// lookups when changing the state based on a writer operation on the key.
 	byObjKey map[string]*keyMeta
 	// List of keys per writer, and what has happened to it in that writer.
 	// Will be transferred when needed.
-	byObj    map[objID][]*keyMeta
+	byObj map[objID][]*keyMeta
 
 	// globalKeys represents all the keys that have been generated so far. Not
 	// all these keys have been written to.
-	globalKeys     [][]byte
+	globalKeys [][]byte
 	// globalKeysMap contains the same keys as globalKeys. It ensures no
 	// duplication, and contains the aggregate state of the key across all
 	// writers, including inflight state that has not made its way to the DB
 	// yet.The keyMeta.objKey is uninitialized.
 	globalKeysMap map[string]*keyMeta
+	// globalKeyPrefixes contains all the key prefixes (as defined by the
+	// comparer's Split) generated so far.
+	globalKeyPrefixes [][]byte
+	// globalKeyPrefixesMap contains the same keys as globalKeyPrefixes. It
+	// ensures no duplication.
+	globalKeyPrefixesMap map[string]struct{}
 
 	// Using SingleDeletes imposes some constraints on the above state, and
 	// causes some state transitions that help with generating complex but
@@ -154,6 +200,12 @@ type keyManager struct {
 	//   others.
 }
 
+func (k *keyManager) nextMetaTimestamp() int {
+	ret := k.metaTimestamp
+	k.metaTimestamp++
+	return ret
+}
+
 var dbObjID objID = makeObjID(dbTag, 0)
 
 // newKeyManager returns a pointer to a new keyManager. Callers should
@@ -161,23 +213,32 @@ var dbObjID objID = makeObjID(dbTag, 0)
 // canTolerateApplyFailure methods only.
 func newKeyManager() *keyManager {
 	m := &keyManager{
-		byObjKey:       make(map[string]*keyMeta),
-		byObj:          make(map[objID][]*keyMeta),
-		globalKeysMap: make(map[string]*keyMeta),
+		comparer:             testkeys.Comparer,
+		byObjKey:             make(map[string]*keyMeta),
+		byObj:                make(map[objID][]*keyMeta),
+		globalKeysMap:        make(map[string]*keyMeta),
+		globalKeyPrefixesMap: make(map[string]struct{}),
 	}
 	m.byObj[dbObjID] = []*keyMeta{}
 	return m
 }
 
-// addKey adds the given key to the key manager for global key tracking.
+// addNewKey adds the given key to the key manager for global key tracking.
 // Returns false iff this is not a new key.
 func (k *keyManager) addNewKey(key []byte) bool {
 	_, ok := k.globalKeysMap[string(key)]
 	if ok {
 		return false
 	}
+	keyString := string(key)
 	k.globalKeys = append(k.globalKeys, key)
-	k.globalKeysMap[string(key)] = &keyMeta{objKey: objKey{key: key}}
+	k.globalKeysMap[keyString] = &keyMeta{objKey: objKey{key: key}}
+
+	prefixLen := k.comparer.Split(key)
+	if _, ok := k.globalKeyPrefixesMap[keyString[:prefixLen]]; !ok {
+		k.globalKeyPrefixes = append(k.globalKeyPrefixes, key[:prefixLen])
+		k.globalKeyPrefixesMap[keyString[:prefixLen]] = struct{}{}
+	}
 	return true
 }
 
@@ -244,7 +305,7 @@ func (k *keyManager) mergeKeysInto(from, to objID) {
 			k.byObjKey[mTo.String()] = mTo
 		}
 
-		m.mergeInto(mTo)
+		m.mergeInto(k, mTo)
 		msNew = append(msNew, mTo)
 
 		delete(k.byObjKey, m.String()) // Unlink "from".
@@ -298,9 +359,10 @@ func (k *keyManager) update(o op) {
 	case *setOp:
 		meta := k.getOrInit(s.writerID, s.key)
 		globalMeta := k.globalKeysMap[string(s.key)]
-		meta.sets++           // Update the set count on this specific (id, key) pair.
+		meta.sets++ // Update the set count on this specific (id, key) pair.
 		meta.del = false
 		globalMeta.sets++
+		meta.updateOps = append(meta.updateOps, keyUpdate{false, k.nextMetaTimestamp()})
 		if meta.singleDel || globalMeta.singleDel {
 			panic("setting a key that has in-flight SingleDelete")
 		}
@@ -310,6 +372,7 @@ func (k *keyManager) update(o op) {
 		meta.merges++
 		meta.del = false
 		globalMeta.merges++
+		meta.updateOps = append(meta.updateOps, keyUpdate{false, k.nextMetaTimestamp()})
 		if meta.singleDel || globalMeta.singleDel {
 			panic("merging a key that has in-flight SingleDelete")
 		}
@@ -320,6 +383,7 @@ func (k *keyManager) update(o op) {
 		globalMeta.del = true
 		meta.dels++
 		globalMeta.dels++
+		meta.updateOps = append(meta.updateOps, keyUpdate{true, k.nextMetaTimestamp()})
 		if s.writerID == dbObjID {
 			k.checkForDelOrSingleDelTransition(meta, globalMeta)
 		}
@@ -331,6 +395,7 @@ func (k *keyManager) update(o op) {
 		globalMeta := k.globalKeysMap[string(s.key)]
 		meta.singleDel = true
 		globalMeta.singleDel = true
+		meta.updateOps = append(meta.updateOps, keyUpdate{true, k.nextMetaTimestamp()})
 		if s.writerID == dbObjID {
 			k.checkForDelOrSingleDelTransition(meta, globalMeta)
 		}
@@ -357,6 +422,17 @@ func (k *keyManager) eligibleReadKeys() (keys [][]byte) {
 	return k.globalKeys
 }
 
+func (k *keyManager) prefixes() (prefixes [][]byte) {
+	return k.globalKeyPrefixes
+}
+
+// prefixExists returns true if a key has been generated with the provided
+// prefix before.
+func (k *keyManager) prefixExists(prefix []byte) bool {
+	_, exists := k.globalKeyPrefixesMap[string(prefix)]
+	return exists
+}
+
 func (k *keyManager) eligibleWriteKeys() (keys [][]byte) {
 	// Creating and sorting this slice of keys is wasteful given that the
 	// caller will pick one, but makes it simpler for unit testing.
@@ -367,7 +443,7 @@ func (k *keyManager) eligibleWriteKeys() (keys [][]byte) {
 		keys = append(keys, v.key)
 	}
 	sort.Slice(keys, func(i, j int) bool {
-		return bytes.Compare(keys[i], keys[j]) < 0
+		return k.comparer.Compare(keys[i], keys[j]) < 0
 	})
 	return keys
 }
@@ -389,14 +465,14 @@ func (k *keyManager) eligibleSingleDeleteKeys(id objID) (keys [][]byte) {
 		addForObjID(dbObjID)
 	}
 	sort.Slice(keys, func(i, j int) bool {
-		return bytes.Compare(keys[i], keys[j]) < 0
+		return k.comparer.Compare(keys[i], keys[j]) < 0
 	})
 	return keys
 }
 
 func (k *keyManager) globalStateIndicatesEligibleForSingleDelete(key []byte) bool {
 	m := k.globalKeysMap[string(key)]
-	return m.merges==0 && m.sets==1 && m.dels==0 && !m.singleDel
+	return m.merges == 0 && m.sets == 1 && m.dels == 0 && !m.singleDel
 }
 
 // canTolerateApplyFailure is called with a batch ID and returns true iff a
@@ -415,4 +491,71 @@ func (k *keyManager) canTolerateApplyFailure(id objID) bool {
 		}
 	}
 	return true
+}
+
+func opWrittenKeys(untypedOp op) [][]byte {
+	switch t := untypedOp.(type) {
+	case *applyOp:
+	case *batchCommitOp:
+	case *checkpointOp:
+	case *closeOp:
+	case *compactOp:
+	case *dbRestartOp:
+	case *deleteOp:
+		return [][]byte{t.key}
+	case *deleteRangeOp:
+		return [][]byte{t.start, t.end}
+	case *flushOp:
+	case *getOp:
+	case *ingestOp:
+	case *initOp:
+	case *iterFirstOp:
+	case *iterLastOp:
+	case *iterNextOp:
+	case *iterPrevOp:
+	case *iterSeekGEOp:
+	case *iterSeekLTOp:
+	case *iterSeekPrefixGEOp:
+	case *iterSetBoundsOp:
+	case *iterSetOptionsOp:
+	case *mergeOp:
+		return [][]byte{t.key}
+	case *newBatchOp:
+	case *newIndexedBatchOp:
+	case *newIterOp:
+	case *newIterUsingCloneOp:
+	case *newSnapshotOp:
+	case *rangeKeyDeleteOp:
+	case *rangeKeySetOp:
+	case *rangeKeyUnsetOp:
+	case *setOp:
+		return [][]byte{t.key}
+	case *singleDeleteOp:
+		return [][]byte{t.key}
+	}
+	return nil
+}
+
+func loadPrecedingKeys(t testing.TB, ops []op, cfg *config, m *keyManager) {
+	for _, op := range ops {
+		// Pretend we're generating all the operation's keys as potential new
+		// key, so that we update the key manager's keys and prefix sets.
+		for _, k := range opWrittenKeys(op) {
+			m.addNewKey(k)
+
+			// If the key has a suffix, ratchet up the suffix distribution if
+			// necessary.
+			if s := m.comparer.Split(k); s < len(k) {
+				suffix, err := testkeys.ParseSuffix(k[s:])
+				require.NoError(t, err)
+				if uint64(suffix) > cfg.writeSuffixDist.Max() {
+					diff := int(uint64(suffix) - cfg.writeSuffixDist.Max())
+					cfg.writeSuffixDist.IncMax(diff)
+				}
+			}
+		}
+
+		// Update key tracking state.
+		m.update(op)
+	}
 }

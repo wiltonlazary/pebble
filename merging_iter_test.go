@@ -13,6 +13,7 @@ import (
 	"github.com/cockroachdb/pebble/bloom"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/datadriven"
+	"github.com/cockroachdb/pebble/internal/keyspan"
 	"github.com/cockroachdb/pebble/internal/manifest"
 	"github.com/cockroachdb/pebble/internal/rangedel"
 	"github.com/cockroachdb/pebble/sstable"
@@ -22,8 +23,9 @@ import (
 )
 
 func TestMergingIter(t *testing.T) {
+	var stats base.InternalIteratorStats
 	newFunc := func(iters ...internalIterator) internalIterator {
-		return newMergingIter(nil /* logger */, DefaultComparer.Compare,
+		return newMergingIter(nil /* logger */, &stats, DefaultComparer.Compare,
 			func(a []byte) int { return len(a) }, iters...)
 	}
 	testIterator(t, newFunc, func(r *rand.Rand) [][]string {
@@ -59,7 +61,8 @@ func TestMergingIterSeek(t *testing.T) {
 				iters = append(iters, f)
 			}
 
-			iter := newMergingIter(nil /* logger */, DefaultComparer.Compare,
+			var stats base.InternalIteratorStats
+			iter := newMergingIter(nil /* logger */, &stats, DefaultComparer.Compare,
 				func(a []byte) int { return len(a) }, iters...)
 			defer iter.Close()
 			return runInternalIterCmd(d, iter)
@@ -117,7 +120,8 @@ func TestMergingIterNextPrev(t *testing.T) {
 						}
 					}
 
-					iter := newMergingIter(nil /* logger */, DefaultComparer.Compare,
+					var stats base.InternalIteratorStats
+					iter := newMergingIter(nil /* logger */, &stats, DefaultComparer.Compare,
 						func(a []byte) int { return len(a) }, iters...)
 					defer iter.Close()
 					return runInternalIterCmd(d, iter)
@@ -147,13 +151,13 @@ func TestMergingIterCornerCases(t *testing.T) {
 
 	var fileNum base.FileNum
 	newIters :=
-		func(file *manifest.FileMetadata, opts *IterOptions, bytesIterated *uint64) (internalIterator, internalIterator, error) {
+		func(file *manifest.FileMetadata, opts *IterOptions, iio internalIterOpts) (internalIterator, keyspan.FragmentIterator, error) {
 			r := readers[file.FileNum]
 			rangeDelIter, err := r.NewRawRangeDelIter()
 			if err != nil {
 				return nil, nil, err
 			}
-			iter, err := r.NewIter(opts.GetLowerBound(), opts.GetUpperBound())
+			iter, err := r.NewIterWithBlockPropertyFilters(opts.GetLowerBound(), opts.GetUpperBound(), nil, true /* useFilterBlock */, iio.stats)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -178,11 +182,10 @@ func TestMergingIterCornerCases(t *testing.T) {
 				keys := strings.Fields(line)
 				smallestKey := base.ParseInternalKey(keys[0])
 				largestKey := base.ParseInternalKey(keys[1])
-				files[level] = append(files[level], &fileMetadata{
-					FileNum:  fileNum,
-					Smallest: smallestKey,
-					Largest:  largestKey,
-				})
+				m := (&fileMetadata{
+					FileNum: fileNum,
+				}).ExtendPointKeyBounds(cmp, smallestKey, largestKey)
+				files[level] = append(files[level], m)
 
 				i++
 				line = lines[i]
@@ -194,12 +197,12 @@ func TestMergingIterCornerCases(t *testing.T) {
 					return err.Error()
 				}
 				w := sstable.NewWriter(f, sstable.WriterOptions{})
-				var tombstones []rangedel.Tombstone
-				frag := rangedel.Fragmenter{
+				var tombstones []keyspan.Span
+				frag := keyspan.Fragmenter{
 					Cmp:    cmp,
 					Format: fmtKey,
-					Emit: func(fragmented []rangedel.Tombstone) {
-						tombstones = append(tombstones, fragmented...)
+					Emit: func(fragmented keyspan.Span) {
+						tombstones = append(tombstones, fragmented)
 					},
 				}
 				keyvalues := strings.Fields(line)
@@ -209,7 +212,7 @@ func TestMergingIterCornerCases(t *testing.T) {
 					value := []byte(kv[j+1:])
 					switch ikey.Kind() {
 					case InternalKeyKindRangeDelete:
-						frag.Add(ikey, value)
+						frag.Add(keyspan.Span{Start: ikey.UserKey, End: value, Keys: []keyspan.Key{{Trailer: ikey.Trailer}}})
 					default:
 						if err := w.Add(ikey, value); err != nil {
 							return err.Error()
@@ -218,7 +221,7 @@ func TestMergingIterCornerCases(t *testing.T) {
 				}
 				frag.Finish()
 				for _, v := range tombstones {
-					if err := w.Add(v.Start, v.End); err != nil {
+					if err := rangedel.Encode(&v, w.Add); err != nil {
 						return err.Error()
 					}
 				}
@@ -237,9 +240,10 @@ func TestMergingIterCornerCases(t *testing.T) {
 			}
 
 			v = newVersion(opts, files)
-			return v.DebugString(DefaultComparer.FormatKey)
+			return v.String()
 		case "iter":
 			levelIters := make([]mergingIterLevel, 0, len(v.Levels))
+			var stats base.InternalIteratorStats
 			for i, l := range v.Levels {
 				slice := l.Slice()
 				if slice.Empty() {
@@ -247,18 +251,16 @@ func TestMergingIterCornerCases(t *testing.T) {
 				}
 				li := &levelIter{}
 				li.init(IterOptions{}, cmp, func(a []byte) int { return len(a) }, newIters,
-					slice.Iter(), manifest.Level(i), nil)
+					slice.Iter(), manifest.Level(i), internalIterOpts{stats: &stats})
 				i := len(levelIters)
 				levelIters = append(levelIters, mergingIterLevel{iter: li})
 				li.initRangeDel(&levelIters[i].rangeDelIter)
-				li.initSmallestLargestUserKey(
-					&levelIters[i].smallestUserKey, &levelIters[i].largestUserKey, &levelIters[i].isLargestUserKeyRangeDelSentinel)
-				li.initIsSyntheticIterBoundsKey(&levelIters[i].isSyntheticIterBoundsKey)
+				li.initBoundaryContext(&levelIters[i].levelIterBoundaryContext)
 			}
 			miter := &mergingIter{}
-			miter.init(nil /* opts */, cmp, func(a []byte) int { return len(a) }, levelIters...)
+			miter.init(nil /* opts */, &stats, cmp, func(a []byte) int { return len(a) }, levelIters...)
 			defer miter.Close()
-			return runInternalIterCmd(d, miter, iterCmdVerboseKey)
+			return runInternalIterCmd(d, miter, iterCmdVerboseKey, iterCmdStats(&stats))
 		default:
 			return fmt.Sprintf("unknown command: %s", d.Cmd)
 		}
@@ -351,13 +353,14 @@ func BenchmarkMergingIterSeekGE(b *testing.B) {
 								iters[i], err = readers[i].NewIter(nil /* lower */, nil /* upper */)
 								require.NoError(b, err)
 							}
-							m := newMergingIter(nil /* logger */, DefaultComparer.Compare,
+							var stats base.InternalIteratorStats
+							m := newMergingIter(nil /* logger */, &stats, DefaultComparer.Compare,
 								func(a []byte) int { return len(a) }, iters...)
 							rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
 
 							b.ResetTimer()
 							for i := 0; i < b.N; i++ {
-								m.SeekGE(keys[rng.Intn(len(keys))])
+								m.SeekGE(keys[rng.Intn(len(keys))], base.SeekGEFlagsNone)
 							}
 							m.Close()
 						})
@@ -383,7 +386,8 @@ func BenchmarkMergingIterNext(b *testing.B) {
 								iters[i], err = readers[i].NewIter(nil /* lower */, nil /* upper */)
 								require.NoError(b, err)
 							}
-							m := newMergingIter(nil /* logger */, DefaultComparer.Compare,
+							var stats base.InternalIteratorStats
+							m := newMergingIter(nil /* logger */, &stats, DefaultComparer.Compare,
 								func(a []byte) int { return len(a) }, iters...)
 
 							b.ResetTimer()
@@ -418,7 +422,8 @@ func BenchmarkMergingIterPrev(b *testing.B) {
 								iters[i], err = readers[i].NewIter(nil /* lower */, nil /* upper */)
 								require.NoError(b, err)
 							}
-							m := newMergingIter(nil /* logger */, DefaultComparer.Compare,
+							var stats base.InternalIteratorStats
+							m := newMergingIter(nil /* logger */, &stats, DefaultComparer.Compare,
 								func(a []byte) int { return len(a) }, iters...)
 
 							b.ResetTimer()
@@ -547,15 +552,14 @@ func buildLevelsForMergingIterSeqSeek(
 		for j := range readers[i] {
 			iter, err := readers[i][j].NewIter(nil /* lower */, nil /* upper */)
 			require.NoError(b, err)
-			key, _ := iter.First()
+			smallest, _ := iter.First()
 			meta[j] = &fileMetadata{}
 			// The same FileNum is being reused across different levels, which
 			// is harmless for the benchmark since each level has its own iterator
 			// creation func.
 			meta[j].FileNum = FileNum(j)
-			meta[j].Smallest = key.Clone()
-			key, _ = iter.Last()
-			meta[j].Largest = key.Clone()
+			largest, _ := iter.Last()
+			meta[j].ExtendPointKeyBounds(opts.Comparer.Compare, smallest.Clone(), largest.Clone())
 		}
 		levelSlices[i] = manifest.NewLevelSliceSpecificOrder(meta)
 	}
@@ -568,8 +572,8 @@ func buildMergingIter(readers [][]*sstable.Reader, levelSlices []manifest.LevelS
 		levelIndex := i
 		level := len(readers) - 1 - i
 		newIters := func(
-			file *manifest.FileMetadata, opts *IterOptions, _ *uint64,
-		) (internalIterator, internalIterator, error) {
+			file *manifest.FileMetadata, opts *IterOptions, _ internalIterOpts,
+		) (internalIterator, keyspan.FragmentIterator, error) {
 			iter, err := readers[levelIndex][file.FileNum].NewIter(
 				opts.LowerBound, opts.UpperBound)
 			if err != nil {
@@ -586,14 +590,12 @@ func buildMergingIter(readers [][]*sstable.Reader, levelSlices []manifest.LevelS
 			func(a []byte) int { return len(a) }, newIters, levelSlices[i].Iter(),
 			manifest.Level(level), nil)
 		l.initRangeDel(&mils[level].rangeDelIter)
-		l.initSmallestLargestUserKey(
-			&mils[level].smallestUserKey, &mils[level].largestUserKey,
-			&mils[level].isLargestUserKeyRangeDelSentinel)
-		l.initIsSyntheticIterBoundsKey(&mils[level].isSyntheticIterBoundsKey)
+		l.initBoundaryContext(&mils[level].levelIterBoundaryContext)
 		mils[level].iter = l
 	}
+	var stats base.InternalIteratorStats
 	m := &mergingIter{}
-	m.init(nil /* logger */, DefaultComparer.Compare,
+	m.init(nil /* logger */, &stats, DefaultComparer.Compare,
 		func(a []byte) int { return len(a) }, mils...)
 	return m
 }
@@ -621,7 +623,7 @@ func BenchmarkMergingIterSeqSeekGEWithBounds(b *testing.B) {
 					pos := i % (keyCount - 1)
 					m.SetBounds(keys[pos], keys[pos+1])
 					// SeekGE will return keys[pos].
-					k, _ := m.SeekGE(keys[pos])
+					k, _ := m.SeekGE(keys[pos], base.SeekGEFlagsNone)
 					for k != nil {
 						k, _ = m.Next()
 					}
@@ -651,17 +653,20 @@ func BenchmarkMergingIterSeqSeekPrefixGE(b *testing.B) {
 					keyCount := len(keys)
 					pos := 0
 
-					m.SeekPrefixGE(keys[pos], keys[pos], false)
+					m.SeekPrefixGE(keys[pos], keys[pos], base.SeekGEFlagsNone)
 					b.ResetTimer()
 					for i := 0; i < b.N; i++ {
 						pos += skip
-						trySeekUsingNext := useNext
+						var flags base.SeekGEFlags
+						if useNext {
+							flags = flags.EnableTrySeekUsingNext()
+						}
 						if pos >= keyCount {
 							pos = 0
-							trySeekUsingNext = false
+							flags = flags.DisableTrySeekUsingNext()
 						}
 						// SeekPrefixGE will return keys[pos].
-						m.SeekPrefixGE(keys[pos], keys[pos], trySeekUsingNext)
+						m.SeekPrefixGE(keys[pos], keys[pos], flags)
 					}
 					b.StopTimer()
 					m.Close()

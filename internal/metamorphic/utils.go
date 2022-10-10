@@ -83,7 +83,7 @@ func (s *objIDSlice) rand(rng *rand.Rand) objID {
 // objIDSet is an unordered set of object IDs.
 type objIDSet map[objID]struct{}
 
-// sortedKeys returns a sorted slice of the set's keys for deterministc
+// sortedKeys returns a sorted slice of the set's keys for deterministic
 // iteration.
 func (s objIDSet) sorted() []objID {
 	keys := make(objIDSlice, 0, len(s))
@@ -92,36 +92,6 @@ func (s objIDSet) sorted() []objID {
 	}
 	sort.Sort(keys)
 	return keys
-}
-
-// singleSetKeysForBatch tracks keys that have been set once, and hence can be
-// single deleted.
-type singleSetKeysForBatch struct {
-	keys *[][]byte
-}
-
-func makeSingleSetKeysForBatch() singleSetKeysForBatch {
-	var keys [][]byte
-	return singleSetKeysForBatch{keys: &keys}
-}
-
-// addKey is called with a key that is set once in this batch.
-func (s singleSetKeysForBatch) addKey(key []byte) {
-	*s.keys = append(*s.keys, key)
-}
-
-// transferTo transfers all the single-set keys to a different batch/db.
-func (s singleSetKeysForBatch) transferTo(to singleSetKeysForBatch) {
-	*to.keys = append(*to.keys, *s.keys...)
-}
-
-// removeKey removes a key that will be single deleted.
-func (s singleSetKeysForBatch) removeKey(index int) []byte {
-	key := (*s.keys)[index]
-	length := len(*s.keys)
-	(*s.keys)[length-1], (*s.keys)[index] = (*s.keys)[index], (*s.keys)[length-1]
-	*s.keys = (*s.keys)[:length-1]
-	return key
 }
 
 // firstError returns the first non-nil error of err0 and err1, or nil if both

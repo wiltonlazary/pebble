@@ -7,6 +7,7 @@ package tool
 import (
 	"bytes"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"text/tabwriter"
@@ -14,6 +15,7 @@ import (
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/humanize"
+	"github.com/cockroachdb/pebble/internal/keyspan"
 	"github.com/cockroachdb/pebble/internal/private"
 	"github.com/cockroachdb/pebble/internal/rangedel"
 	"github.com/cockroachdb/pebble/sstable"
@@ -203,7 +205,7 @@ func (s *sstableT) runCheck(cmd *cobra.Command, args []string) {
 			if prefixIter != nil {
 				n := r.Split(key.UserKey)
 				prefix := key.UserKey[:n]
-				key2, _ := prefixIter.SeekPrefixGE(prefix, key.UserKey, false)
+				key2, _ := prefixIter.SeekPrefixGE(prefix, key.UserKey, base.SeekGEFlagsNone)
 				if key2 == nil {
 					fmt.Fprintf(stdout, "WARNING: PREFIX ITERATION FAILURE!\n")
 					if s.fmtKey.spec != "null" {
@@ -313,6 +315,9 @@ func (s *sstableT) runProperties(cmd *cobra.Command, args []string) {
 			(r.Properties.NumDeletions+r.Properties.NumMergeOperands))
 		fmt.Fprintf(tw, "  delete\t%d\n", r.Properties.NumPointDeletions())
 		fmt.Fprintf(tw, "  range-delete\t%d\n", r.Properties.NumRangeDeletions)
+		fmt.Fprintf(tw, "  range-key-set\t%d\n", r.Properties.NumRangeKeySets)
+		fmt.Fprintf(tw, "  range-key-unset\t%d\n", r.Properties.NumRangeKeyUnsets)
+		fmt.Fprintf(tw, "  range-key-delete\t%d\n", r.Properties.NumRangeKeyDels)
 		fmt.Fprintf(tw, "  merge\t%d\n", r.Properties.NumMergeOperands)
 		fmt.Fprintf(tw, "  global-seq-num\t%d\n", r.Properties.GlobalSeqNum)
 		fmt.Fprintf(tw, "index\t\n")
@@ -383,28 +388,24 @@ func (s *sstableT) runScan(cmd *cobra.Command, args []string) {
 			return
 		}
 		defer iter.Close()
-		key, value := iter.SeekGE(s.start)
+		key, value := iter.SeekGE(s.start, base.SeekGEFlagsNone)
 
 		// We configured sstable.Reader to return raw tombstones which requires a
 		// bit more work here to put them in a form that can be iterated in
 		// parallel with the point records.
-		rangeDelIter, err := func() (base.InternalIterator, error) {
+		rangeDelIter, err := func() (keyspan.FragmentIterator, error) {
 			iter, err := r.NewRawRangeDelIter()
 			if err != nil {
 				return nil, err
 			}
 			if iter == nil {
-				return rangedel.NewIter(r.Compare, nil), nil
+				return keyspan.NewIter(r.Compare, nil), nil
 			}
 			defer iter.Close()
 
-			var tombstones []rangedel.Tombstone
-			for key, value := iter.First(); key != nil; key, value = iter.Next() {
-				t := rangedel.Tombstone{
-					Start: *key,
-					End:   value,
-				}
-				if s.end != nil && r.Compare(s.end, t.Start.UserKey) <= 0 {
+			var tombstones []keyspan.Span
+			for t := iter.First(); t != nil; t = iter.Next() {
+				if s.end != nil && r.Compare(s.end, t.Start) <= 0 {
 					// The range tombstone lies after the scan range.
 					continue
 				}
@@ -412,13 +413,13 @@ func (s *sstableT) runScan(cmd *cobra.Command, args []string) {
 					// The range tombstone lies before the scan range.
 					continue
 				}
-				tombstones = append(tombstones, t)
+				tombstones = append(tombstones, t.ShallowClone())
 			}
 
 			sort.Slice(tombstones, func(i, j int) bool {
-				return r.Compare(tombstones[i].Start.UserKey, tombstones[j].Start.UserKey) < 0
+				return r.Compare(tombstones[i].Start, tombstones[j].Start) < 0
 			})
-			return rangedel.NewIter(r.Compare, tombstones), nil
+			return keyspan.NewIter(r.Compare, tombstones), nil
 		}()
 		if err != nil {
 			fmt.Fprintf(stdout, "%s%s\n", prefix, err)
@@ -426,14 +427,12 @@ func (s *sstableT) runScan(cmd *cobra.Command, args []string) {
 		}
 
 		defer rangeDelIter.Close()
-		rangeDelKey, rangeDelValue := rangeDelIter.First()
+		rangeDel := rangeDelIter.First()
 		count := s.count
 
 		var lastKey base.InternalKey
-		for key != nil || rangeDelKey != nil {
-			if key != nil &&
-				(rangeDelKey == nil ||
-					base.InternalCompare(r.Compare, *key, *rangeDelKey) < 0) {
+		for key != nil || rangeDel != nil {
+			if key != nil && (rangeDel == nil || r.Compare(key.UserKey, rangeDel.Start) < 0) {
 				// The filter specifies a prefix of the key.
 				//
 				// TODO(peter): Is using prefix comparison like this kosher for all
@@ -455,19 +454,53 @@ func (s *sstableT) runScan(cmd *cobra.Command, args []string) {
 				// somewhat complex. Consider the tombstone [aaa,ccc). We want to
 				// output this tombstone if filter is "aa", and if it "bbb".
 				if s.filter == nil ||
-					((r.Compare(s.filter, rangeDelKey.UserKey) >= 0 ||
-						bytes.HasPrefix(rangeDelKey.UserKey, s.filter)) &&
-						r.Compare(s.filter, rangeDelValue) < 0) {
+					((r.Compare(s.filter, rangeDel.Start) >= 0 ||
+						bytes.HasPrefix(rangeDel.Start, s.filter)) &&
+						r.Compare(s.filter, rangeDel.End) < 0) {
 					fmt.Fprint(stdout, prefix)
-					formatKeyValue(stdout, s.fmtKey, s.fmtValue, rangeDelKey, rangeDelValue)
+					if err := rangedel.Encode(rangeDel, func(k base.InternalKey, v []byte) error {
+						formatKeyValue(stdout, s.fmtKey, s.fmtValue, &k, v)
+						return nil
+					}); err != nil {
+						fmt.Fprintf(stdout, "%s\n", err)
+						os.Exit(1)
+					}
 				}
-				rangeDelKey, rangeDelValue = rangeDelIter.Next()
+				rangeDel = rangeDelIter.Next()
 			}
 
 			if count > 0 {
 				count--
 				if count == 0 {
 					break
+				}
+			}
+		}
+
+		// Handle range keys.
+		rkIter, err := r.NewRawRangeKeyIter()
+		if err != nil {
+			fmt.Fprintf(stdout, "%s\n", err)
+			os.Exit(1)
+		}
+		if rkIter != nil {
+			defer rkIter.Close()
+			for span := rkIter.SeekGE(s.start); span != nil; span = rkIter.Next() {
+				// By default, emit the key, unless there is a filter.
+				emit := s.filter == nil
+				// Skip spans that start after the end key (if provided). End keys are
+				// exclusive, e.g. [a, b), so we consider the interval [b, +inf).
+				if s.end != nil && r.Compare(span.Start, s.end) >= 0 {
+					emit = false
+				}
+				// Filters override the provided start / end bounds, if provided.
+				if s.filter != nil && bytes.HasPrefix(span.Start, s.filter) {
+					// In filter mode, each line is prefixed with the filename.
+					fmt.Fprint(stdout, prefix)
+					emit = true
+				}
+				if emit {
+					formatSpan(stdout, s.fmtKey, s.fmtValue, span)
 				}
 			}
 		}

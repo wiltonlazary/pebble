@@ -19,10 +19,10 @@ import (
 )
 
 func newItem(k InternalKey) *FileMetadata {
-	return &FileMetadata{
-		Smallest: k,
-		Largest:  k,
-	}
+	m := (&FileMetadata{}).ExtendPointKeyBounds(
+		base.DefaultComparer.Compare, k, k,
+	)
+	return m
 }
 
 func cmp(a, b *FileMetadata) int {
@@ -835,7 +835,6 @@ func BenchmarkBTreeIterNext(b *testing.B) {
 	tr.cmp = cmp
 
 	const count = 8 << 10
-	const size = 2 * maxItems
 	for i := 0; i < count; i++ {
 		item := newItem(key(i))
 		if err := tr.insert(item); err != nil {
@@ -860,7 +859,6 @@ func BenchmarkBTreeIterPrev(b *testing.B) {
 	tr.cmp = cmp
 
 	const count = 8 << 10
-	const size = 2 * maxItems
 	for i := 0; i < count; i++ {
 		item := newItem(key(i))
 		if err := tr.insert(item); err != nil {

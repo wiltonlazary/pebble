@@ -5,10 +5,11 @@
 package metamorphic
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"math"
 	"os"
 	"os/exec"
 	"path"
@@ -21,10 +22,12 @@ import (
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/errorfs"
 	"github.com/cockroachdb/pebble/internal/randvar"
+	"github.com/cockroachdb/pebble/internal/testkeys"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/pmezard/go-difflib/difflib"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/exp/rand"
+	"golang.org/x/sync/errgroup"
 )
 
 // TODO(peter):
@@ -60,18 +63,75 @@ var (
 		"keep the DB directory even on successful runs")
 	seed = flag.Uint64("seed", 0,
 		"a pseudorandom number generator seed")
-	ops    = randvar.NewFlag("uniform:5000-10000")
+	ops        = randvar.NewFlag("uniform:5000-10000")
+	maxThreads = flag.Int("max-threads", math.MaxInt,
+		"limit execution to the provided number of threads; must be ≥ 1")
 	runDir = flag.String("run-dir", "",
 		"the specific configuration to (re-)run (used for post-mortem debugging)")
+	compare = flag.String("compare", "",
+		`comma separated list of options files to compare. The result of each run is compared with
+the result of the run from the first options file in the list. Example, -compare
+random-003,standard-000. The dir flag should have the directory containing these directories.
+Example, -dir _meta/200610-203012.077`)
+
+	// The following options may be used for split-version metamorphic testing.
+	// To perform split-version testing, the client runs the metamorphic tests
+	// on an earlier Pebble SHA passing the `--keep` flag. The client then
+	// switches to the later Pebble SHA, setting the below options to point to
+	// the `ops` file and one of the previous run's data directories.
+	previousOps = flag.String("previous-ops", "",
+		"path to an ops file, used to prepopulate the set of keys operations draw from")
+	initialStatePath = flag.String("initial-state", "",
+		"path to a database's data directory, used to prepopulate the test run's databases")
+	initialStateDesc = flag.String("initial-state-desc", "",
+		`a human-readable description of the initial database state.
+		If set this parameter is written to the OPTIONS to aid in
+		debugging. It's intended to describe the lineage of a
+		database's state, including sufficient information for
+		reproduction (eg, SHA, prng seed, etc).`)
 )
 
 func init() {
 	flag.Var(ops, "ops", "")
 }
 
-func testMetaRun(t *testing.T, runDir string, seed uint64) {
+func testCompareRun(t *testing.T, compare string) {
+	runDirs := strings.Split(compare, ",")
+	historyPaths := make([]string, len(runDirs))
+	for i := 0; i < len(runDirs); i++ {
+		historyPath := filepath.Join(*dir, runDirs[i]+"-"+time.Now().Format("060102-150405.000"))
+		runDirs[i] = filepath.Join(*dir, runDirs[i])
+		_ = os.Remove(historyPath)
+		historyPaths[i] = historyPath
+	}
+	defer func() {
+		for _, path := range historyPaths {
+			_ = os.Remove(path)
+		}
+	}()
+
+	for i, runDir := range runDirs {
+		testMetaRun(t, runDir, *seed, historyPaths[i])
+	}
+
+	if t.Failed() {
+		return
+	}
+
+	i, diff := CompareHistories(t, historyPaths)
+	if i != 0 {
+		fmt.Printf(`
+===== DIFF =====
+%s/{%s,%s}
+%s
+`, *dir, runDirs[0], runDirs[i], diff)
+		os.Exit(1)
+	}
+}
+
+func testMetaRun(t *testing.T, runDir string, seed uint64, historyPath string) {
 	opsPath := filepath.Join(filepath.Dir(filepath.Clean(runDir)), "ops")
-	opsData, err := ioutil.ReadFile(opsPath)
+	opsData, err := os.ReadFile(opsPath)
 	require.NoError(t, err)
 
 	ops, err := parse(opsData)
@@ -79,15 +139,16 @@ func testMetaRun(t *testing.T, runDir string, seed uint64) {
 	_ = ops
 
 	optionsPath := filepath.Join(runDir, "OPTIONS")
-	optionsData, err := ioutil.ReadFile(optionsPath)
+	optionsData, err := os.ReadFile(optionsPath)
 	require.NoError(t, err)
 
 	opts := &pebble.Options{}
 	testOpts := &testOptions{opts: opts}
 	require.NoError(t, parseOptions(testOpts, string(optionsData)))
 
-	// Always use our custom comparer which provides a Split method.
-	opts.Comparer = &comparer
+	// Always use our custom comparer which provides a Split method, splitting
+	// keys at the trailing '@'.
+	opts.Comparer = testkeys.Comparer
 	// Use an archive cleaner to ease post-mortem debugging.
 	opts.Cleaner = base.ArchiveCleaner{}
 
@@ -104,6 +165,20 @@ func testMetaRun(t *testing.T, runDir string, seed uint64) {
 			opts.FS = vfs.NewMem()
 		}
 	}
+	threads := testOpts.threads
+	if *maxThreads < threads {
+		threads = *maxThreads
+	}
+
+	dir := opts.FS.PathJoin(runDir, "data")
+	// Set up the initial database state if configured to start from a non-empty
+	// database. By default tests start from an empty database, but split
+	// version testing may configure a previous metamorphic tests's database
+	// state as the initial state.
+	if testOpts.initialStatePath != "" {
+		require.NoError(t, setupInitialState(dir, testOpts))
+	}
+
 	// Wrap the filesystem with one that will inject errors into read
 	// operations with *errorRate probability.
 	opts.FS = errorfs.Wrap(opts.FS, errorfs.WithProbability(errorfs.OpKindRead, *errorRate))
@@ -112,21 +187,72 @@ func testMetaRun(t *testing.T, runDir string, seed uint64) {
 		opts.WALDir = opts.FS.PathJoin(runDir, opts.WALDir)
 	}
 
-	historyPath := filepath.Join(runDir, "history")
 	historyFile, err := os.Create(historyPath)
 	require.NoError(t, err)
 	defer historyFile.Close()
-
 	writers := []io.Writer{historyFile}
+
 	if testing.Verbose() {
 		writers = append(writers, os.Stdout)
 	}
 	h := newHistory(*failRE, writers...)
 
 	m := newTest(ops)
-	require.NoError(t, m.init(h, opts.FS.PathJoin(runDir, "data"), testOpts))
-	for m.step(h) {
-		if err := h.Error(); err != nil {
+	require.NoError(t, m.init(h, dir, testOpts))
+
+	if threads <= 1 {
+		for m.step(h) {
+			if err := h.Error(); err != nil {
+				fmt.Fprintf(os.Stderr, "Seed: %d\n", seed)
+				fmt.Fprintln(os.Stderr, err)
+				m.maybeSaveData()
+				os.Exit(1)
+			}
+		}
+	} else {
+		eg, ctx := errgroup.WithContext(context.Background())
+		for t := 0; t < threads; t++ {
+			t := t // bind loop var to scope
+			eg.Go(func() error {
+				for idx := 0; idx < len(m.ops); idx++ {
+					// Skip any operations whose receiver object hashes to a
+					// different thread. All operations with the same receiver
+					// are performed from the same thread. This goroutine is
+					// only responsible for executing operations that hash to
+					// `t`.
+					if hashThread(m.ops[idx].receiver(), threads) != t {
+						continue
+					}
+
+					// Some operations have additional synchronization
+					// dependencies. If this operation has any, wait for its
+					// dependencies to complete before executing.
+					for _, waitOnIdx := range m.opsWaitOn[idx] {
+						select {
+						case <-ctx.Done():
+							// Exit if some other thread already errored out.
+							return ctx.Err()
+						case <-m.opsDone[waitOnIdx]:
+						}
+					}
+
+					m.ops[idx].run(m, h.recorder(t, idx))
+
+					// If this operation has a done channel, close it so that
+					// other operations that synchronize on this operation know
+					// that it's been completed.
+					if ch := m.opsDone[idx]; ch != nil {
+						close(ch)
+					}
+
+					if err := h.Error(); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+		}
+		if err := eg.Wait(); err != nil {
 			fmt.Fprintf(os.Stderr, "Seed: %d\n", seed)
 			fmt.Fprintln(os.Stderr, err)
 			m.maybeSaveData()
@@ -137,6 +263,11 @@ func testMetaRun(t *testing.T, runDir string, seed uint64) {
 	if *keep && !testOpts.useDisk {
 		m.maybeSaveData()
 	}
+}
+
+func hashThread(objID objID, numThreads int) int {
+	// Fibonacci hash https://probablydance.com/2018/06/16/fibonacci-hashing-the-optimization-that-the-world-forgot-or-a-better-alternative-to-integer-modulo/
+	return int((11400714819323198485 * uint64(objID)) % uint64(numThreads))
 }
 
 // TestMeta generates a random set of operations to run, then runs the test
@@ -163,11 +294,16 @@ func testMetaRun(t *testing.T, runDir string, seed uint64) {
 // failure, otherwise changes to the metamorphic tests may cause the generated
 // operations and options to differ.
 func TestMeta(t *testing.T) {
+	if *compare != "" {
+		testCompareRun(t, *compare)
+		return
+	}
+
 	if *runDir != "" {
 		// The --run-dir flag is specified either in the child process (see
 		// runOptions() below) or the user specified it manually in order to re-run
 		// a test.
-		testMetaRun(t, *runDir, *seed)
+		testMetaRun(t, *runDir, *seed, filepath.Join(*runDir, "history"))
 		return
 	}
 
@@ -195,10 +331,24 @@ func TestMeta(t *testing.T) {
 
 	// Generate a new set of random ops, writing them to <dir>/ops. These will be
 	// read by the child processes when performing a test run.
-	ops := generate(rng, opCount, defaultConfig)
+	km := newKeyManager()
+	cfg := defaultConfig()
+	if *previousOps != "" {
+		// During split-version testing, we load keys from an `ops` file
+		// produced by a metamorphic test run of an earlier Pebble version.
+		// Seeding the keys ensure we generate interesting operations, including
+		// ones with key shadowing, merging, etc.
+		opsPath := filepath.Join(filepath.Dir(filepath.Clean(*previousOps)), "ops")
+		opsData, err := os.ReadFile(opsPath)
+		require.NoError(t, err)
+		ops, err := parse(opsData)
+		require.NoError(t, err)
+		loadPrecedingKeys(t, ops, &cfg, km)
+	}
+	ops := generate(rng, opCount, cfg, km)
 	opsPath := filepath.Join(metaDir, "ops")
 	formattedOps := formatOps(ops)
-	require.NoError(t, ioutil.WriteFile(opsPath, []byte(formattedOps), 0644))
+	require.NoError(t, os.WriteFile(opsPath, []byte(formattedOps), 0644))
 
 	// Perform a particular test run with the specified options. The options are
 	// written to <run-dir>/OPTIONS and a child process is created to actually
@@ -225,7 +375,7 @@ func TestMeta(t *testing.T) {
 
 		optionsPath := filepath.Join(runDir, "OPTIONS")
 		optionsStr := optionsToString(opts)
-		require.NoError(t, ioutil.WriteFile(optionsPath, []byte(optionsStr), 0644))
+		require.NoError(t, os.WriteFile(optionsPath, []byte(optionsStr), 0644))
 
 		args := []string{
 			"-keep=" + fmt.Sprint(*keep),
@@ -251,32 +401,44 @@ func TestMeta(t *testing.T) {
 ===== OPS =====
 %s
 ===== HISTORY =====
-%s`, seed, err, out, optionsStr, formattedOps, readHistory(filepath.Join(runDir, "history")))
+%s`, seed, err, out, optionsStr, formattedOps, readFile(filepath.Join(runDir, "history")))
 		}
 	}
 
-	// Perform runs with the standard options.
+	// Create the standard options.
 	var names []string
 	options := map[string]*testOptions{}
 	for i, opts := range standardOptions() {
 		name := fmt.Sprintf("standard-%03d", i)
 		names = append(names, name)
 		options[name] = opts
-		t.Run(name, func(t *testing.T) {
-			runOptions(t, opts)
-		})
 	}
 
-	// Perform runs with random options. We make an arbitrary choice to run with
-	// as many random options as we have standard options.
+	// Create random options. We make an arbitrary choice to run with as many
+	// random options as we have standard options.
 	nOpts := len(options)
 	for i := 0; i < nOpts; i++ {
 		name := fmt.Sprintf("random-%03d", i)
 		names = append(names, name)
 		opts := randomOptions(rng)
 		options[name] = opts
+	}
+
+	// If the user provided the path to an initial database state to use, update
+	// all the options to pull from it.
+	if *initialStatePath != "" {
+		for _, o := range options {
+			var err error
+			o.initialStatePath, err = filepath.Abs(*initialStatePath)
+			require.NoError(t, err)
+			o.initialStateDesc = *initialStateDesc
+		}
+	}
+
+	// Run the options.
+	for _, name := range names {
 		t.Run(name, func(t *testing.T) {
-			runOptions(t, opts)
+			runOptions(t, options[name])
 		})
 	}
 
@@ -285,25 +447,16 @@ func TestMeta(t *testing.T) {
 		return
 	}
 
-	// Read a history file, stripping out lines that begin with a comment.
-	readHistory := func(name string) []string {
-		historyPath := filepath.Join(metaDir, name, "history")
-		data, err := ioutil.ReadFile(historyPath)
-		require.NoError(t, err)
-		lines := difflib.SplitLines(string(data))
-		newLines := make([]string, 0, len(lines))
-		for _, line := range lines {
-			if strings.HasPrefix(line, "// ") {
-				continue
-			}
-			newLines = append(newLines, line)
-		}
-		return newLines
+	getHistoryPath := func(name string) string {
+		return filepath.Join(metaDir, name, "history")
+
 	}
 
-	base := readHistory(names[0])
+	base := readHistory(t, getHistoryPath(names[0]))
+	base = reorderHistory(base)
 	for i := 1; i < len(names); i++ {
-		lines := readHistory(names[i])
+		lines := readHistory(t, getHistoryPath(names[i]))
+		lines = reorderHistory(lines)
 		diff := difflib.UnifiedDiff{
 			A:       base,
 			B:       lines,
@@ -330,14 +483,14 @@ func TestMeta(t *testing.T) {
 %s
 ===== OPS =====
 %s
-`, seed, metaDir, names[0], names[i], text, names[0], optionsStrA, names[1], optionsStrB, formattedOps)
+`, seed, metaDir, names[0], names[i], text, names[0], optionsStrA, names[i], optionsStrB, formattedOps)
 			os.Exit(1)
 		}
 	}
 }
 
-func readHistory(path string) string {
-	history, err := ioutil.ReadFile(path)
+func readFile(path string) string {
+	history, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Sprintf("err: %v", err)
 	}

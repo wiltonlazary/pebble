@@ -6,6 +6,7 @@ package lint
 
 import (
 	"bytes"
+	"fmt"
 	"go/build"
 	"os/exec"
 	"regexp"
@@ -16,6 +17,13 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/ghemawat/stream"
 	"github.com/stretchr/testify/require"
+)
+
+const (
+	cmdGo       = "go"
+	golint      = "golang.org/x/lint/golint@6edffad5e6160f5949cdefc81710b2706fbcd4f6"
+	staticcheck = "honnef.co/go/tools/cmd/staticcheck@2022.1.2"
+	crlfmt      = "github.com/cockroachdb/crlfmt@b3eff0b"
 )
 
 func dirCmd(t *testing.T, dir string, name string, args ...string) stream.Filter {
@@ -60,11 +68,32 @@ func TestLint(t *testing.T) {
 	t.Run("TestGolint", func(t *testing.T) {
 		t.Parallel()
 
+		args := []string{"run", golint}
+		args = append(args, pkgs...)
+
 		// This is overkill right now, but provides a structure for filtering out
 		// lint errors we don't care about.
 		if err := stream.ForEach(
 			stream.Sequence(
-				dirCmd(t, pkg.Dir, "golint", pkgs...),
+				dirCmd(t, pkg.Dir, cmdGo, args...),
+				stream.GrepNot("go: downloading"),
+			), func(s string) {
+				t.Errorf("\n%s", s)
+			}); err != nil {
+			t.Error(err)
+		}
+	})
+
+	t.Run("TestStaticcheck", func(t *testing.T) {
+		t.Parallel()
+
+		args := []string{"run", staticcheck}
+		args = append(args, pkgs...)
+
+		if err := stream.ForEach(
+			stream.Sequence(
+				dirCmd(t, pkg.Dir, cmdGo, args...),
+				stream.GrepNot("go: downloading"),
 			), func(s string) {
 				t.Errorf("\n%s", s)
 			}); err != nil {
@@ -91,10 +120,8 @@ func TestLint(t *testing.T) {
 		t.Parallel()
 
 		if err := stream.ForEach(
-			stream.Sequence(
-				dirCmd(t, pkg.Dir, "git", "grep", "fmt\\.Errorf("),
-				stream.GrepNot(`^vendor/`), // ignore vendor
-			), func(s string) {
+			dirCmd(t, pkg.Dir, "git", "grep", "fmt\\.Errorf("),
+			func(s string) {
 				t.Errorf("\n%s <- please use \"errors.Errorf\" instead", s)
 			}); err != nil {
 			t.Error(err)
@@ -105,10 +132,8 @@ func TestLint(t *testing.T) {
 		t.Parallel()
 
 		if err := stream.ForEach(
-			stream.Sequence(
-				dirCmd(t, pkg.Dir, "git", "grep", "os\\.Is"),
-				stream.GrepNot(`^vendor/`), // ignore vendor
-			), func(s string) {
+			dirCmd(t, pkg.Dir, "git", "grep", "os\\.Is"),
+			func(s string) {
 				t.Errorf("\n%s <- please use the \"oserror\" equivalent instead", s)
 			}); err != nil {
 			t.Error(err)
@@ -120,8 +145,8 @@ func TestLint(t *testing.T) {
 
 		if err := stream.ForEach(
 			stream.Sequence(
-				dirCmd(t, pkg.Dir, "git", "grep", "runtime\\.SetFinalizer("),
-				stream.GrepNot(`^vendor/`), // ignore vendor
+				dirCmd(t, pkg.Dir, "git", "grep", "-B1", "runtime\\.SetFinalizer("),
+				lintIgnore("lint:ignore SetFinalizer"),
 				stream.GrepNot(`^internal/invariants/finalizer_on.go`),
 			), func(s string) {
 				t.Errorf("\n%s <- please use the \"invariants.SetFinalizer\" equivalent instead", s)
@@ -193,4 +218,64 @@ func TestLint(t *testing.T) {
 			t.Error(err)
 		}
 	})
+
+	t.Run("TestCrlfmt", func(t *testing.T) {
+		t.Parallel()
+
+		args := []string{"run", crlfmt, "-fast", "-tab", "2", "."}
+		var buf bytes.Buffer
+		if err := stream.ForEach(
+			stream.Sequence(
+				dirCmd(t, pkg.Dir, cmdGo, args...),
+				stream.GrepNot("go: downloading"),
+			),
+			func(s string) {
+				fmt.Fprintln(&buf, s)
+			}); err != nil {
+			t.Error(err)
+		}
+		errs := buf.String()
+		if len(errs) > 0 {
+			t.Errorf("\n%s", errs)
+		}
+
+		if t.Failed() {
+			reWriteCmd := []string{crlfmt, "-w"}
+			reWriteCmd = append(reWriteCmd, args...)
+			t.Logf("run the following to fix your formatting:\n"+
+				"\n%s\n\n"+
+				"Don't forget to add amend the result to the correct commits.",
+				strings.Join(reWriteCmd, " "),
+			)
+		}
+	})
+}
+
+// lintIgnore is a stream.FilterFunc that filters out lines that are preceded by
+// the given ignore directive. The function assumes the input stream receives a
+// sequence of strings that are to be considered as pairs. If the first string
+// in the sequence matches the ignore directive, the following string is
+// dropped, else it is emitted.
+//
+// For example, given the sequence "foo", "bar", "baz", "bam", and an ignore
+// directive "foo", the sequence "baz", "bam" would be emitted. If the directive
+// was "baz", the sequence "foo", "bar" would be emitted.
+func lintIgnore(ignore string) stream.FilterFunc {
+	return func(arg stream.Arg) error {
+		var prev string
+		var i int
+		for s := range arg.In {
+			if i%2 == 0 {
+				// Fist string in the pair is used as the filter. Store it.
+				prev = s
+			} else {
+				// Second string is emitted only if it _does not_ match the directive.
+				if !strings.Contains(prev, ignore) {
+					arg.Out <- s
+				}
+			}
+			i++
+		}
+		return nil
+	}
 }

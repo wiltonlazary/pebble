@@ -2,13 +2,13 @@
 // of this source code is governed by a BSD-style license that can be found in
 // the LICENSE file.
 
+//go:build linux && !arm
 // +build linux,!arm
 
 package vfs
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"syscall"
 	"testing"
@@ -53,7 +53,7 @@ func BenchmarkDirectIOWrite(b *testing.B) {
 
 	for _, wsize := range wsizes {
 		b.Run(fmt.Sprintf("wsize=%d", wsize), func(b *testing.B) {
-			tmpf, err := ioutil.TempFile("", "pebble-db-syncing-file-")
+			tmpf, err := os.CreateTemp("", "pebble-db-syncing-file-")
 			if err != nil {
 				b.Fatal(err)
 			}

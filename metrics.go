@@ -7,8 +7,11 @@ package pebble
 import (
 	"fmt"
 
+	"github.com/HdrHistogram/hdrhistogram-go"
+	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/cache"
 	"github.com/cockroachdb/pebble/internal/humanize"
+	"github.com/cockroachdb/pebble/record"
 	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/redact"
 )
@@ -18,6 +21,10 @@ type CacheMetrics = cache.Metrics
 
 // FilterMetrics holds metrics for the filter policy
 type FilterMetrics = sstable.FilterMetrics
+
+// ThroughputMetric is a cumulative throughput metric. See the detailed
+// comment in base.
+type ThroughputMetric = base.ThroughputMetric
 
 func formatCacheMetrics(w redact.SafePrinter, m *CacheMetrics, name redact.SafeString) {
 	w.Printf("%7s %9s %7s %6.1f%%  (score == hit-rate)\n",
@@ -133,6 +140,8 @@ type Metrics struct {
 		ElisionOnlyCount int64
 		MoveCount        int64
 		ReadCount        int64
+		RewriteCount     int64
+		MultiLevelCount  int64
 		// An estimate of the number of bytes that need to be compacted for the LSM
 		// to reach a stable state.
 		EstimatedDebt uint64
@@ -140,11 +149,18 @@ type Metrics struct {
 		// compactions. This value will be zero if there are no in-progress
 		// compactions.
 		InProgressBytes int64
+		// Number of compactions that are in-progress.
+		NumInProgress int64
+		// MarkedFiles is a count of files that are marked for
+		// compaction. Such files are compacted in a rewrite compaction
+		// when no other compactions are picked.
+		MarkedFiles int
 	}
 
 	Flush struct {
 		// The total number of flushes.
-		Count int64
+		Count           int64
+		WriteThroughput ThroughputMetric
 	}
 
 	Filter FilterMetrics
@@ -162,6 +178,18 @@ type Metrics struct {
 		ZombieSize uint64
 		// The count of zombie memtables.
 		ZombieCount int64
+	}
+
+	Keys struct {
+		// The approximate count of internal range key set keys in the database.
+		RangeKeySetsCount uint64
+	}
+
+	Snapshots struct {
+		// The number of currently open snapshots.
+		Count int
+		// The sequence number of the earliest, currently open snapshot.
+		EarliestSeqNum uint64
 	}
 
 	Table struct {
@@ -200,6 +228,8 @@ type Metrics struct {
 		// Number of bytes written to the WAL.
 		BytesWritten uint64
 	}
+
+	LogWriter record.LogWriterMetrics
 
 	private struct {
 		optionsFileSize  uint64
@@ -297,13 +327,14 @@ func (m *Metrics) formatWAL(w redact.SafePrinter) {
 //         6         1   825 B    0.00   1.6 K     0 B       0     0 B       0   825 B       1   1.6 K     0.5
 //     total         3   2.4 K       -   933 B   825 B       1     0 B       0   4.1 K       4   1.6 K     4.5
 //     flush         3
-//   compact         1   1.6 K             0 B          (size == estimated-debt, in = in-progress-bytes)
+//   compact         1   1.6 K     0 B       1          (size == estimated-debt, score = in-progress-bytes, in = num-in-progress)
 //     ctype         0       0       0       0       0  (default, delete, elision, move, read)
 //    memtbl         1   4.0 M
 //   zmemtbl         0     0 B
 //      ztbl         0     0 B
 //    bcache         4   752 B    7.7%  (score == hit-rate)
 //    tcache         0     0 B    0.0%  (score == hit-rate)
+// snapshots         0               0  (score == earliest seq num)
 //    titers         0
 //    filter         -       -    0.0%  (score == utility)
 //
@@ -359,18 +390,20 @@ func (m *Metrics) SafeFormat(w redact.SafePrinter, _ rune) {
 	total.format(w, notApplicable)
 
 	w.Printf("  flush %9d\n", redact.Safe(m.Flush.Count))
-	w.Printf("compact %9d %7s %7s %7s %7s  (size == estimated-debt, in = in-progress-bytes)\n",
+	w.Printf("compact %9d %7s %7s %7d %7s  (size == estimated-debt, score = in-progress-bytes, in = num-in-progress)\n",
 		redact.Safe(m.Compact.Count),
 		humanize.IEC.Uint64(m.Compact.EstimatedDebt),
-		redact.SafeString(""),
 		humanize.IEC.Int64(m.Compact.InProgressBytes),
+		redact.Safe(m.Compact.NumInProgress),
 		redact.SafeString(""))
-	w.Printf("  ctype %9d %7d %7d %7d %7d  (default, delete, elision, move, read)\n",
+	w.Printf("  ctype %9d %7d %7d %7d %7d %7d %7d  (default, delete, elision, move, read, rewrite, multi-level)\n",
 		redact.Safe(m.Compact.DefaultCount),
 		redact.Safe(m.Compact.DeleteOnlyCount),
 		redact.Safe(m.Compact.ElisionOnlyCount),
 		redact.Safe(m.Compact.MoveCount),
-		redact.Safe(m.Compact.ReadCount))
+		redact.Safe(m.Compact.ReadCount),
+		redact.Safe(m.Compact.RewriteCount),
+		redact.Safe(m.Compact.MultiLevelCount))
 	w.Printf(" memtbl %9d %7s\n",
 		redact.Safe(m.MemTable.Count),
 		humanize.IEC.Uint64(m.MemTable.Size))
@@ -382,6 +415,10 @@ func (m *Metrics) SafeFormat(w redact.SafePrinter, _ rune) {
 		humanize.IEC.Uint64(m.Table.ZombieSize))
 	formatCacheMetrics(w, &m.BlockCache, "bcache")
 	formatCacheMetrics(w, &m.TableCache, "tcache")
+	w.Printf("  snaps %9d %7s %7d  (score == earliest seq num)\n",
+		redact.Safe(m.Snapshots.Count),
+		notApplicable,
+		redact.Safe(m.Snapshots.EarliestSeqNum))
 	w.Printf(" titers %9d\n", redact.Safe(m.TableIters))
 	w.Printf(" filter %9s %7s %6.1f%%  (score == utility)\n",
 		notApplicable,
@@ -395,4 +432,42 @@ func hitRate(hits, misses int64) float64 {
 		return 0
 	}
 	return 100 * float64(hits) / float64(sum)
+}
+
+// InternalIntervalMetrics exposes metrics about internal subsystems, that can
+// be useful for deep observability purposes, and for higher-level admission
+// control systems that are trying to estimate the capacity of the DB. These
+// are experimental and subject to change, since they expose internal
+// implementation details, so do not rely on these without discussion with the
+// Pebble team.
+// These represent the metrics over the interval of time from the last call to
+// retrieve these metrics. These are not cumulative, unlike Metrics. The main
+// challenge in making these cumulative is the hdrhistogram.Histogram, which
+// does not have the ability to subtract a histogram from a preceding metric
+// retrieval.
+type InternalIntervalMetrics struct {
+	// LogWriter metrics.
+	LogWriter struct {
+		// WriteThroughput is the WAL throughput.
+		WriteThroughput ThroughputMetric
+		// PendingBufferUtilization is the utilization of the WAL writer's
+		// finite-sized pending blocks buffer. It provides an additional signal
+		// regarding how close to "full" the WAL writer is. The value is in the
+		// interval [0,1].
+		PendingBufferUtilization float64
+		// SyncQueueUtilization is the utilization of the WAL writer's
+		// finite-sized queue of work that is waiting to sync. The value is in the
+		// interval [0,1].
+		SyncQueueUtilization float64
+		// SyncLatencyMicros is a distribution of the fsync latency observed by
+		// the WAL writer. It can be nil if there were no fsyncs.
+		SyncLatencyMicros *hdrhistogram.Histogram
+	}
+	// Flush loop metrics.
+	Flush struct {
+		// WriteThroughput is the flushing throughput.
+		WriteThroughput ThroughputMetric
+	}
+	// NB: the LogWriter throughput and the Flush throughput are not directly
+	// comparable because the former does not compress, unlike the latter.
 }

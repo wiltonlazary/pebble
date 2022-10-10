@@ -177,7 +177,7 @@ func (vs *versionSet) create(
 
 	vs.opts.EventListener.ManifestCreated(ManifestCreateInfo{
 		JobID:   jobID,
-		Path:    base.MakeFilename(vs.fs, vs.dirname, fileTypeManifest, vs.manifestFileNum),
+		Path:    base.MakeFilepath(vs.fs, vs.dirname, fileTypeManifest, vs.manifestFileNum),
 		FileNum: vs.manifestFileNum,
 		Err:     err,
 	})
@@ -199,7 +199,7 @@ func (vs *versionSet) load(
 	vs.init(dirname, opts, marker, setCurrent, mu)
 
 	vs.manifestFileNum = manifestFileNum
-	manifestPath := base.MakeFilename(opts.FS, dirname, fileTypeManifest, vs.manifestFileNum)
+	manifestPath := base.MakeFilepath(opts.FS, dirname, fileTypeManifest, vs.manifestFileNum)
 	manifestFilename := opts.FS.PathBase(manifestPath)
 
 	// Read the versionEdits in the manifest file.
@@ -346,6 +346,7 @@ func (vs *versionSet) logAndApply(
 	jobID int,
 	ve *versionEdit,
 	metrics map[int]*LevelMetrics,
+	forceRotation bool,
 	inProgressCompactions func() []compactionInfo,
 ) error {
 	if !vs.writing {
@@ -373,7 +374,7 @@ func (vs *versionSet) logAndApply(
 	// used to initialize versionSet.logSeqNum and versionSet.visibleSeqNum on
 	// replay. It must be higher than or equal to any than any sequence number
 	// written to an sstable, including sequence numbers in ingested files.
-	// Note that LastSeqNum is not (and cannot be) the minumum unflushed sequence
+	// Note that LastSeqNum is not (and cannot be) the minimum unflushed sequence
 	// number. This is fallout from ingestion which allows a sequence number X to
 	// be assigned to an ingested sstable even though sequence number X-1 resides
 	// in an unflushed memtable. logSeqNum is the _next_ sequence number that
@@ -394,7 +395,7 @@ func (vs *versionSet) logAndApply(
 	// is too large.
 	var newManifestFileNum FileNum
 	var prevManifestFileSize uint64
-	if vs.manifest == nil || vs.manifest.Size() >= vs.opts.MaxManifestFileSize {
+	if forceRotation || vs.manifest == nil || vs.manifest.Size() >= vs.opts.MaxManifestFileSize {
 		newManifestFileNum = vs.getNextFileNum()
 		prevManifestFileSize = uint64(vs.manifest.Size())
 	}
@@ -417,24 +418,24 @@ func (vs *versionSet) logAndApply(
 		var err error
 		newVersion, zombies, err = bve.Apply(currentVersion, vs.cmp, vs.opts.Comparer.FormatKey, vs.opts.FlushSplitBytes, vs.opts.Experimental.ReadCompactionRate)
 		if err != nil {
-			return err
+			return errors.Wrap(err, "MANIFEST apply failed")
 		}
 
 		if newManifestFileNum != 0 {
 			if err := vs.createManifest(vs.dirname, newManifestFileNum, minUnflushedLogNum, nextFileNum); err != nil {
 				vs.opts.EventListener.ManifestCreated(ManifestCreateInfo{
 					JobID:   jobID,
-					Path:    base.MakeFilename(vs.fs, vs.dirname, fileTypeManifest, newManifestFileNum),
+					Path:    base.MakeFilepath(vs.fs, vs.dirname, fileTypeManifest, newManifestFileNum),
 					FileNum: newManifestFileNum,
 					Err:     err,
 				})
-				return err
+				return errors.Wrap(err, "MANIFEST create failed")
 			}
 		}
 
 		w, err := vs.manifest.Next()
 		if err != nil {
-			return err
+			return errors.Wrap(err, "MANIFEST next record write failed")
 		}
 		// NB: Any error from this point on is considered fatal as we don't now if
 		// the MANIFEST write occurred or not. Trying to determine that is
@@ -442,31 +443,34 @@ func (vs *versionSet) logAndApply(
 		// database is open. In particular, that mechanism generates a new MANIFEST
 		// and ensures it is synced.
 		if err := ve.Encode(w); err != nil {
-			vs.opts.Logger.Fatalf("MANIFEST write failed: %v", err)
-			return err
+			return errors.Wrap(err, "MANIFEST write failed")
 		}
 		if err := vs.manifest.Flush(); err != nil {
-			vs.opts.Logger.Fatalf("MANIFEST flush failed: %v", err)
-			return err
+			return errors.Wrap(err, "MANIFEST flush failed")
 		}
 		if err := vs.manifestFile.Sync(); err != nil {
-			vs.opts.Logger.Fatalf("MANIFEST sync failed: %v", err)
-			return err
+			return errors.Wrap(err, "MANIFEST sync failed")
 		}
 		if newManifestFileNum != 0 {
 			// NB: setCurrent is responsible for syncing the data directory.
 			if err := vs.setCurrent(newManifestFileNum); err != nil {
-				vs.opts.Logger.Fatalf("MANIFEST set current failed: %v", err)
-				return err
+				return errors.Wrap(err, "MANIFEST set current failed")
 			}
 			vs.opts.EventListener.ManifestCreated(ManifestCreateInfo{
 				JobID:   jobID,
-				Path:    base.MakeFilename(vs.fs, vs.dirname, fileTypeManifest, newManifestFileNum),
+				Path:    base.MakeFilepath(vs.fs, vs.dirname, fileTypeManifest, newManifestFileNum),
 				FileNum: newManifestFileNum,
 			})
 		}
 		return nil
 	}(); err != nil {
+		// Any error encountered during any of the operations in the previous
+		// closure are considered fatal. Treating such errors as fatal is preferred
+		// to attempting to unwind various file and b-tree reference counts, and
+		// re-generating L0 sublevel metadata. This may change in the future, if
+		// certain manifest / WAL operations become retryable. For more context, see
+		// #1159 and #1792.
+		vs.opts.Logger.Fatalf("%s", err)
 		return err
 	}
 
@@ -526,7 +530,7 @@ func (vs *versionSet) logAndApply(
 	return nil
 }
 
-func (vs *versionSet) incrementCompactions(kind compactionKind) {
+func (vs *versionSet) incrementCompactions(kind compactionKind, extraLevels []*compactionLevel) {
 	switch kind {
 	case compactionKindDefault:
 		vs.metrics.Compact.Count++
@@ -550,11 +554,14 @@ func (vs *versionSet) incrementCompactions(kind compactionKind) {
 	case compactionKindRead:
 		vs.metrics.Compact.Count++
 		vs.metrics.Compact.ReadCount++
-	}
-}
 
-func (vs *versionSet) incrementFlushes() {
-	vs.metrics.Flush.Count++
+	case compactionKindRewrite:
+		vs.metrics.Compact.Count++
+		vs.metrics.Compact.RewriteCount++
+	}
+	if len(extraLevels) > 0 {
+		vs.metrics.Compact.MultiLevelCount++
+	}
 }
 
 func (vs *versionSet) incrementCompactionBytes(numBytes int64) {
@@ -566,7 +573,7 @@ func (vs *versionSet) createManifest(
 	dirname string, fileNum, minUnflushedLogNum, nextFileNum FileNum,
 ) (err error) {
 	var (
-		filename     = base.MakeFilename(vs.fs, dirname, fileTypeManifest, fileNum)
+		filename     = base.MakeFilepath(vs.fs, dirname, fileTypeManifest, fileNum)
 		manifestFile vfs.File
 		manifest     *record.Writer
 	)
@@ -722,11 +729,7 @@ func setCurrentFunc(
 
 func setCurrentFuncMarker(marker *atomicfs.Marker, fs vfs.FS, dirname string) func(FileNum) error {
 	return func(manifestFileNum FileNum) error {
-		path := base.MakeFilename(fs, dirname, fileTypeManifest, manifestFileNum)
-		// TODO(jackson): Refactor MakeFilename to return just the base
-		// and add MakePath for constructing the dirname-prefixed path.
-		filename := fs.PathBase(path)
-		return marker.Move(filename)
+		return marker.Move(base.MakeFilename(fileTypeManifest, manifestFileNum))
 	}
 }
 
@@ -776,7 +779,7 @@ func findCurrentManifest(
 
 func readCurrentFile(fs vfs.FS, dirname string) (FileNum, error) {
 	// Read the CURRENT file to find the current manifest file.
-	current, err := fs.Open(base.MakeFilename(fs, dirname, fileTypeCurrent, 0))
+	current, err := fs.Open(base.MakeFilepath(fs, dirname, fileTypeCurrent, 0))
 	if err != nil {
 		return 0, errors.Wrapf(err, "pebble: could not open CURRENT file for DB %q", dirname)
 	}

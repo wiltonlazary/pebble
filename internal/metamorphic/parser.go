@@ -49,7 +49,7 @@ func opArgs(op op) (receiverID *objID, targetID *objID, args []interface{}) {
 	case *closeOp:
 		return &t.objID, nil, nil
 	case *compactOp:
-		return nil, nil, []interface{}{&t.start, &t.end}
+		return nil, nil, []interface{}{&t.start, &t.end, &t.parallelize}
 	case *batchCommitOp:
 		return &t.batchID, nil, nil
 	case *dbRestartOp:
@@ -77,9 +77,9 @@ func opArgs(op op) (receiverID *objID, targetID *objID, args []interface{}) {
 	case *newIndexedBatchOp:
 		return nil, &t.batchID, nil
 	case *newIterOp:
-		return &t.readerID, &t.iterID, []interface{}{&t.lower, &t.upper}
+		return &t.readerID, &t.iterID, []interface{}{&t.lower, &t.upper, &t.keyTypes, &t.filterMin, &t.filterMax, &t.maskSuffix}
 	case *newIterUsingCloneOp:
-		return &t.existingIterID, &t.iterID, nil
+		return &t.existingIterID, &t.iterID, []interface{}{&t.refreshBatch, &t.lower, &t.upper, &t.keyTypes, &t.filterMin, &t.filterMax, &t.maskSuffix}
 	case *newSnapshotOp:
 		return nil, &t.snapID, nil
 	case *iterNextOp:
@@ -96,8 +96,16 @@ func opArgs(op op) (receiverID *objID, targetID *objID, args []interface{}) {
 		return &t.writerID, nil, []interface{}{&t.key, &t.value}
 	case *iterSetBoundsOp:
 		return &t.iterID, nil, []interface{}{&t.lower, &t.upper}
+	case *iterSetOptionsOp:
+		return &t.iterID, nil, []interface{}{&t.lower, &t.upper, &t.keyTypes, &t.filterMin, &t.filterMax, &t.maskSuffix}
 	case *singleDeleteOp:
 		return &t.writerID, nil, []interface{}{&t.key, &t.maybeReplaceDelete}
+	case *rangeKeyDeleteOp:
+		return &t.writerID, nil, []interface{}{&t.start, &t.end}
+	case *rangeKeySetOp:
+		return &t.writerID, nil, []interface{}{&t.start, &t.end, &t.suffix, &t.value}
+	case *rangeKeyUnsetOp:
+		return &t.writerID, nil, []interface{}{&t.start, &t.end, &t.suffix}
 	}
 	panic(fmt.Sprintf("unsupported op type: %T", op))
 }
@@ -124,12 +132,16 @@ var methods = map[string]*methodInfo{
 	"NewSnapshot":     makeMethod(newSnapshotOp{}, dbTag),
 	"Next":            makeMethod(iterNextOp{}, iterTag),
 	"Prev":            makeMethod(iterPrevOp{}, iterTag),
+	"RangeKeyDelete":  makeMethod(rangeKeyDeleteOp{}, dbTag, batchTag),
+	"RangeKeySet":     makeMethod(rangeKeySetOp{}, dbTag, batchTag),
+	"RangeKeyUnset":   makeMethod(rangeKeyUnsetOp{}, dbTag, batchTag),
 	"Restart":         makeMethod(dbRestartOp{}, dbTag),
 	"SeekGE":          makeMethod(iterSeekGEOp{}, iterTag),
 	"SeekLT":          makeMethod(iterSeekLTOp{}, iterTag),
 	"SeekPrefixGE":    makeMethod(iterSeekPrefixGEOp{}, iterTag),
 	"Set":             makeMethod(setOp{}, dbTag, batchTag),
 	"SetBounds":       makeMethod(iterSetBoundsOp{}, iterTag),
+	"SetOptions":      makeMethod(iterSetOptionsOp{}, iterTag),
 	"SingleDelete":    makeMethod(singleDeleteOp{}, dbTag, batchTag),
 }
 
@@ -167,6 +179,7 @@ func (p *parser) parse() (_ []op, err error) {
 	for {
 		op := p.parseOp()
 		if op == nil {
+			computeDerivedFields(ops)
 			return ops, nil
 		}
 		ops = append(ops, op)
@@ -249,6 +262,14 @@ func (p *parser) parseArgs(op op, methodName string, args []interface{}) {
 				panic(err)
 			}
 			*t = uint32(val)
+
+		case *uint64:
+			_, lit := p.scanToken(token.INT)
+			val, err := strconv.ParseUint(lit, 0, 64)
+			if err != nil {
+				panic(err)
+			}
+			*t = uint64(val)
 
 		case *[]byte:
 			_, lit := p.scanToken(token.STRING)
@@ -369,4 +390,36 @@ func (p *parser) tokenf(tok token.Token, lit string) string {
 
 func (p *parser) errorf(pos token.Pos, format string, args ...interface{}) error {
 	return errors.New(p.fset.Position(pos).String() + ": " + fmt.Sprintf(format, args...))
+}
+
+// computeDerivedFields makes one pass through the provided operations, filling
+// any derived fields. This pass must happen before execution because concurrent
+// execution depends on these fields.
+func computeDerivedFields(ops []op) {
+	iterToReader := make(map[objID]objID)
+	for i := range ops {
+		switch v := ops[i].(type) {
+		case *newIterOp:
+			iterToReader[v.iterID] = v.readerID
+		case *newIterUsingCloneOp:
+			v.derivedReaderID = iterToReader[v.existingIterID]
+			iterToReader[v.iterID] = v.derivedReaderID
+		case *iterSetOptionsOp:
+			v.derivedReaderID = iterToReader[v.iterID]
+		case *iterFirstOp:
+			v.derivedReaderID = iterToReader[v.iterID]
+		case *iterLastOp:
+			v.derivedReaderID = iterToReader[v.iterID]
+		case *iterSeekGEOp:
+			v.derivedReaderID = iterToReader[v.iterID]
+		case *iterSeekPrefixGEOp:
+			v.derivedReaderID = iterToReader[v.iterID]
+		case *iterSeekLTOp:
+			v.derivedReaderID = iterToReader[v.iterID]
+		case *iterNextOp:
+			v.derivedReaderID = iterToReader[v.iterID]
+		case *iterPrevOp:
+			v.derivedReaderID = iterToReader[v.iterID]
+		}
+	}
 }

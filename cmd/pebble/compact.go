@@ -6,7 +6,6 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
@@ -14,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/HdrHistogram/hdrhistogram-go"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/internal/base"
@@ -21,7 +21,6 @@ import (
 	"github.com/cockroachdb/pebble/internal/manifest"
 	"github.com/cockroachdb/pebble/internal/replay"
 	"github.com/cockroachdb/pebble/vfs"
-	"github.com/codahale/hdrhistogram"
 	"github.com/spf13/cobra"
 )
 
@@ -48,8 +47,6 @@ func init() {
 	compactRunCmd.Flags().BoolVar(&compactRunConfig.profile,
 		"profile", false, "collect pprof profiles throughout the benchmark run")
 }
-
-const numLevels = 7
 
 type compactionTracker struct {
 	mu         sync.Mutex
@@ -101,7 +98,6 @@ func open(dir string, listener pebble.EventListener) (*replay.DB, error) {
 		Comparer:                    mvccComparer,
 		MemTableSize:                64 << 20,
 		MemTableStopWritesThreshold: 4,
-		MaxConcurrentCompactions:    2,
 		L0CompactionThreshold:       2,
 		L0StopWritesThreshold:       400,
 		LBaseMaxBytes:               64 << 20, // 64 MB
@@ -109,6 +105,9 @@ func open(dir string, listener pebble.EventListener) (*replay.DB, error) {
 			BlockSize: 32 << 10,
 		}},
 		Merger: fauxMVCCMerger,
+		MaxConcurrentCompactions: func() int {
+			return 2
+		},
 	}
 	opts.EnsureDefaults()
 
@@ -128,7 +127,7 @@ func open(dir string, listener pebble.EventListener) (*replay.DB, error) {
 // path.  Making a hardlink of all the sstables ensures that we can run the
 // same workload multiple times.
 func hardLinkWorkload(src, dst string) error {
-	ls, err := ioutil.ReadDir(src)
+	ls, err := os.ReadDir(src)
 	if err != nil {
 		return err
 	}
@@ -177,7 +176,7 @@ func startSamplingRAmp(d *replay.DB) func() *hdrhistogram.Histogram {
 func runReplay(cmd *cobra.Command, args []string) error {
 	// Make hard links of all the files in the workload so ingestion doesn't
 	// delete our original copy of a workload.
-	workloadDir, err := ioutil.TempDir(args[0], "pebble-bench-workload")
+	workloadDir, err := os.MkdirTemp(args[0], "pebble-bench-workload")
 	if err != nil {
 		return err
 	}
@@ -206,7 +205,7 @@ func runReplay(cmd *cobra.Command, args []string) error {
 		return errors.New("empty workload")
 	}
 
-	dir, err := ioutil.TempDir(args[0], "pebble-bench-data")
+	dir, err := os.MkdirTemp(args[0], "pebble-bench-data")
 	if err != nil {
 		return err
 	}
@@ -369,7 +368,7 @@ func runReplay(cmd *cobra.Command, args []string) error {
 	if err := iter.Close(); err != nil {
 		return err
 	}
-	if err := d.Compact(first, last); err != nil {
+	if err := d.Compact(first, last, false); err != nil {
 		return err
 	}
 	afterSize := totalSize(d.Metrics())

@@ -7,9 +7,7 @@ package tool
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 	"text/tabwriter"
-	"time"
 
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/oserror"
@@ -19,6 +17,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/manifest"
 	"github.com/cockroachdb/pebble/record"
 	"github.com/cockroachdb/pebble/sstable"
+	"github.com/cockroachdb/pebble/tool/logs"
 	"github.com/spf13/cobra"
 )
 
@@ -29,6 +28,7 @@ type dbT struct {
 	Check      *cobra.Command
 	Checkpoint *cobra.Command
 	Get        *cobra.Command
+	Logs       *cobra.Command
 	LSM        *cobra.Command
 	Properties *cobra.Command
 	Scan       *cobra.Command
@@ -96,6 +96,7 @@ process.
 		Args: cobra.ExactArgs(2),
 		Run:  d.runGet,
 	}
+	d.Logs = logs.NewCmd()
 	d.LSM = &cobra.Command{
 		Use:   "lsm <dir>",
 		Short: "print LSM structure",
@@ -147,7 +148,7 @@ use by another process.
 		Run:  d.runSpace,
 	}
 
-	d.Root.AddCommand(d.Check, d.Checkpoint, d.Get, d.LSM, d.Properties, d.Scan, d.Set, d.Space)
+	d.Root.AddCommand(d.Check, d.Checkpoint, d.Get, d.Logs, d.LSM, d.Properties, d.Scan, d.Set, d.Space)
 	d.Root.PersistentFlags().BoolVarP(&d.verbose, "verbose", "v", false, "verbose output")
 
 	for _, cmd := range []*cobra.Command{d.Check, d.Checkpoint, d.Get, d.LSM, d.Properties, d.Scan, d.Set, d.Space} {
@@ -198,7 +199,7 @@ func (d *dbT) loadOptions(dir string) error {
 			}
 			return nil, errors.Errorf("unknown merger %q", errors.Safe(name))
 		},
-		SkipUnknown: func(name string) bool {
+		SkipUnknown: func(name, value string) bool {
 			return true
 		},
 	}
@@ -222,7 +223,7 @@ func (d *dbT) loadOptions(dir string) error {
 				}
 				defer f.Close()
 
-				data, err := ioutil.ReadAll(f)
+				data, err := io.ReadAll(f)
 				if err != nil {
 					return err
 				}
@@ -535,6 +536,12 @@ func (d *dbT) runProperties(cmd *cobra.Command, args []string) {
 			propArgs(all, func(p *props) interface{} { return humanize.SI.Uint64(p.NumDeletions) })...)
 		fmt.Fprintf(tw, "  range-delete\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			propArgs(all, func(p *props) interface{} { return humanize.SI.Uint64(p.NumRangeDeletions) })...)
+		fmt.Fprintf(tw, "  range-key-sets\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			propArgs(all, func(p *props) interface{} { return humanize.SI.Uint64(p.NumRangeKeySets) })...)
+		fmt.Fprintf(tw, "  range-key-unsets\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			propArgs(all, func(p *props) interface{} { return humanize.SI.Uint64(p.NumRangeKeyUnSets) })...)
+		fmt.Fprintf(tw, "  range-key-deletes\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			propArgs(all, func(p *props) interface{} { return humanize.SI.Uint64(p.NumRangeKeyDeletes) })...)
 		fmt.Fprintf(tw, "  merge\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 			propArgs(all, func(p *props) interface{} { return humanize.SI.Uint64(p.NumMergeOperands) })...)
 
@@ -579,28 +586,24 @@ func propArgs(props []props, getProp func(*props) interface{}) []interface{} {
 }
 
 type props struct {
-	Count             uint64
-	SmallestSeqNum    uint64
-	LargestSeqNum     uint64
-	DataSize          uint64
-	FilterSize        uint64
-	IndexSize         uint64
-	NumDataBlocks     uint64
-	NumIndexBlocks    uint64
-	NumDeletions      uint64
-	NumEntries        uint64
-	NumMergeOperands  uint64
-	NumRangeDeletions uint64
-	RawKeySize        uint64
-	RawValueSize      uint64
-	TopLevelIndexSize uint64
-}
-
-func formatTime(unixSec int64) string {
-	if unixSec == 0 {
-		return "n/a"
-	}
-	return time.Unix(unixSec, 0).Format(time.RFC3339)
+	Count              uint64
+	SmallestSeqNum     uint64
+	LargestSeqNum      uint64
+	DataSize           uint64
+	FilterSize         uint64
+	IndexSize          uint64
+	NumDataBlocks      uint64
+	NumIndexBlocks     uint64
+	NumDeletions       uint64
+	NumEntries         uint64
+	NumMergeOperands   uint64
+	NumRangeDeletions  uint64
+	NumRangeKeySets    uint64
+	NumRangeKeyUnSets  uint64
+	NumRangeKeyDeletes uint64
+	RawKeySize         uint64
+	RawValueSize       uint64
+	TopLevelIndexSize  uint64
 }
 
 func (p *props) update(o props) {
@@ -620,13 +623,16 @@ func (p *props) update(o props) {
 	p.NumEntries += o.NumEntries
 	p.NumMergeOperands += o.NumMergeOperands
 	p.NumRangeDeletions += o.NumRangeDeletions
+	p.NumRangeKeySets += o.NumRangeKeySets
+	p.NumRangeKeyUnSets += o.NumRangeKeyUnSets
+	p.NumRangeKeyDeletes += o.NumRangeKeyDeletes
 	p.RawKeySize += o.RawKeySize
 	p.RawValueSize += o.RawValueSize
 	p.TopLevelIndexSize += o.TopLevelIndexSize
 }
 
 func (d *dbT) addProps(dir string, m *manifest.FileMetadata, p *props) error {
-	path := base.MakeFilename(d.opts.FS, dir, base.FileTypeTable, m.FileNum)
+	path := base.MakeFilepath(d.opts.FS, dir, base.FileTypeTable, m.FileNum)
 	f, err := d.opts.FS.Open(path)
 	if err != nil {
 		return err
@@ -637,21 +643,24 @@ func (d *dbT) addProps(dir string, m *manifest.FileMetadata, p *props) error {
 		return err
 	}
 	p.update(props{
-		Count:             1,
-		SmallestSeqNum:    m.SmallestSeqNum,
-		LargestSeqNum:     m.LargestSeqNum,
-		DataSize:          r.Properties.DataSize,
-		FilterSize:        r.Properties.FilterSize,
-		IndexSize:         r.Properties.IndexSize,
-		NumDataBlocks:     r.Properties.NumDataBlocks,
-		NumIndexBlocks:    1 + r.Properties.IndexPartitions,
-		NumDeletions:      r.Properties.NumDeletions,
-		NumEntries:        r.Properties.NumEntries,
-		NumMergeOperands:  r.Properties.NumMergeOperands,
-		NumRangeDeletions: r.Properties.NumRangeDeletions,
-		RawKeySize:        r.Properties.RawKeySize,
-		RawValueSize:      r.Properties.RawValueSize,
-		TopLevelIndexSize: r.Properties.TopLevelIndexSize,
+		Count:              1,
+		SmallestSeqNum:     m.SmallestSeqNum,
+		LargestSeqNum:      m.LargestSeqNum,
+		DataSize:           r.Properties.DataSize,
+		FilterSize:         r.Properties.FilterSize,
+		IndexSize:          r.Properties.IndexSize,
+		NumDataBlocks:      r.Properties.NumDataBlocks,
+		NumIndexBlocks:     1 + r.Properties.IndexPartitions,
+		NumDeletions:       r.Properties.NumDeletions,
+		NumEntries:         r.Properties.NumEntries,
+		NumMergeOperands:   r.Properties.NumMergeOperands,
+		NumRangeDeletions:  r.Properties.NumRangeDeletions,
+		NumRangeKeySets:    r.Properties.NumRangeKeySets,
+		NumRangeKeyUnSets:  r.Properties.NumRangeKeyUnsets,
+		NumRangeKeyDeletes: r.Properties.NumRangeKeyDels,
+		RawKeySize:         r.Properties.RawKeySize,
+		RawValueSize:       r.Properties.RawValueSize,
+		TopLevelIndexSize:  r.Properties.TopLevelIndexSize,
 	})
 	return r.Close()
 }

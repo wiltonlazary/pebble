@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"testing"
 
+	"github.com/cockroachdb/pebble/internal/randvar"
 	"github.com/stretchr/testify/require"
 )
 
@@ -67,14 +68,14 @@ func TestGlobalStateIndicatesEligibleForSingleDelete(t *testing.T) {
 			meta: keyMeta{
 				objKey: key,
 				sets:   1,
-				dels: 1,
+				dels:   1,
 			},
 			want: false,
 		},
 		{
 			meta: keyMeta{
-				objKey: key,
-				sets:   1,
+				objKey:    key,
+				sets:      1,
 				singleDel: true,
 			},
 			want: false,
@@ -93,7 +94,7 @@ func TestGlobalStateIndicatesEligibleForSingleDelete(t *testing.T) {
 func TestKeyMeta_MergeInto(t *testing.T) {
 	testCases := []struct {
 		existing keyMeta
-		toMerge keyMeta
+		toMerge  keyMeta
 		expected keyMeta
 	}{
 		{
@@ -107,56 +108,66 @@ func TestKeyMeta_MergeInto(t *testing.T) {
 				merges:    0,
 				singleDel: true,
 			},
-			expected: keyMeta {
+			expected: keyMeta{
 				sets:      1,
 				merges:    0,
 				singleDel: true,
+				updateOps: []keyUpdate{
+					{deleted: true, metaTimestamp: 0},
+				},
 			},
 		},
 		{
 			existing: keyMeta{
-				sets:      3,
-				merges:    1,
-				dels: 7,
+				sets:   3,
+				merges: 1,
+				dels:   7,
 			},
 			toMerge: keyMeta{
-				sets:      4,
-				merges:    2,
-				dels: 8,
-				del: true,
+				sets:   4,
+				merges: 2,
+				dels:   8,
+				del:    true,
 			},
-			expected: keyMeta {
-				sets:      7,
-				merges:    3,
-				dels: 15,
-				del: true,
+			expected: keyMeta{
+				sets:   7,
+				merges: 3,
+				dels:   15,
+				del:    true,
+				updateOps: []keyUpdate{
+					{deleted: true, metaTimestamp: 1},
+				},
 			},
 		},
 		{
 			existing: keyMeta{
-				sets:      3,
-				merges:    1,
-				dels: 7,
-				del: true,
+				sets:   3,
+				merges: 1,
+				dels:   7,
+				del:    true,
 			},
 			toMerge: keyMeta{
-				sets:      1,
-				merges:    0,
-				dels: 8,
-				del: false,
+				sets:   1,
+				merges: 0,
+				dels:   8,
+				del:    false,
 			},
-			expected: keyMeta {
-				sets:      4,
-				merges:    1,
-				dels: 15,
-				del: false,
+			expected: keyMeta{
+				sets:   4,
+				merges: 1,
+				dels:   15,
+				del:    false,
+				updateOps: []keyUpdate{
+					{deleted: false, metaTimestamp: 2},
+				},
 			},
 		},
 	}
 
+	keyManager := newKeyManager()
 	for _, tc := range testCases {
 		t.Run("", func(t *testing.T) {
-			tc.toMerge.mergeInto(&tc.existing)
+			tc.toMerge.mergeInto(keyManager, &tc.existing)
 			require.Equal(t, tc.expected, tc.existing)
 		})
 	}
@@ -169,12 +180,37 @@ func TestKeyManager_AddKey(t *testing.T) {
 	k1 := []byte("foo")
 	require.True(t, m.addNewKey(k1))
 	require.Len(t, m.globalKeys, 1)
+	require.Len(t, m.globalKeyPrefixes, 1)
 	require.Contains(t, m.globalKeys, k1)
+	require.Contains(t, m.globalKeyPrefixes, k1)
 	require.False(t, m.addNewKey(k1))
+	require.True(t, m.prefixExists([]byte("foo")))
+	require.False(t, m.prefixExists([]byte("bar")))
+
 	k2 := []byte("bar")
 	require.True(t, m.addNewKey(k2))
 	require.Len(t, m.globalKeys, 2)
+	require.Len(t, m.globalKeyPrefixes, 2)
 	require.Contains(t, m.globalKeys, k2)
+	require.Contains(t, m.globalKeyPrefixes, k2)
+	require.True(t, m.prefixExists([]byte("bar")))
+	k3 := []byte("bax@4")
+	require.True(t, m.addNewKey(k3))
+	require.Len(t, m.globalKeys, 3)
+	require.Len(t, m.globalKeyPrefixes, 3)
+	require.Contains(t, m.globalKeys, k3)
+	require.Contains(t, m.globalKeyPrefixes, []byte("bax"))
+	require.True(t, m.prefixExists([]byte("bax")))
+	k4 := []byte("foo@6")
+	require.True(t, m.addNewKey(k4))
+	require.Len(t, m.globalKeys, 4)
+	require.Len(t, m.globalKeyPrefixes, 3)
+	require.Contains(t, m.globalKeys, k4)
+	require.True(t, m.prefixExists([]byte("foo")))
+
+	require.Equal(t, [][]byte{
+		[]byte("foo"), []byte("bar"), []byte("bax"),
+	}, m.prefixes())
 }
 
 func TestKeyManager_GetOrInit(t *testing.T) {
@@ -459,4 +495,34 @@ func TestKeyManager(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestOpWrittenKeys(t *testing.T) {
+	for name, info := range methods {
+		t.Run(name, func(t *testing.T) {
+			// Any operations that exist in methods but are not handled in
+			// opWrittenKeys will result in a panic, failing the subtest.
+			opWrittenKeys(info.constructor())
+		})
+	}
+}
+
+func TestLoadPrecedingKeys(t *testing.T) {
+	rng := randvar.NewRand()
+	cfg := defaultConfig()
+	km := newKeyManager()
+	ops := generate(rng, 1000, cfg, km)
+
+	cfg2 := defaultConfig()
+	km2 := newKeyManager()
+	loadPrecedingKeys(t, ops, &cfg2, km2)
+
+	// NB: We can't assert equality, because the original run may not have
+	// ever used the max of the distribution.
+	require.Greater(t, cfg2.writeSuffixDist.Max(), uint64(1))
+
+	// NB: We can't assert equality, because the original run may have generated
+	// keys that it didn't end up using in operations.
+	require.Subset(t, km.globalKeys, km2.globalKeys)
+	require.Subset(t, km.globalKeyPrefixes, km2.globalKeyPrefixes)
 }

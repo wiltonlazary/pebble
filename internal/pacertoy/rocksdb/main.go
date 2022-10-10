@@ -304,15 +304,6 @@ func (db *DB) fillMemtable(size int64) {
 	db.mu.Unlock()
 }
 
-// printLevels prints the levels.
-func (db *DB) printLevels() {
-	db.mu.Lock()
-	for i := range db.sstables {
-		fmt.Printf("Level %d: %d/%d\n", i+1, db.sstables[i]/(1024*1024), db.maxSSTableSizes[i]/(1024*1024))
-	}
-	db.mu.Unlock()
-}
-
 // simulateWrite simulates user writes.
 func simulateWrite(db *DB) {
 	limiter := rate.NewLimiter(10<<20, 10<<20) // 10 MB/s
@@ -357,10 +348,6 @@ func main() {
 		<-tick.C
 		if (i % 20) == 0 {
 			fmt.Printf("_elapsed___memtbs____dirty_____fill____drain____cdebt__l0count___max-w-rate\n")
-		}
-
-		if (i % 7) == 0 {
-			//db.printLevels()
 		}
 
 		db.mu.Lock()

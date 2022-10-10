@@ -1,0 +1,375 @@
+# Test repeated seeks into the same range key, while TrySeekUsingNext=true.
+# Test for regression fixed in #1849.
+
+reset
+----
+
+batch commit
+range-key-set a c @5 boop
+range-key-set c e @5 beep
+----
+committed 2 keys
+
+combined-iter
+seek-ge a
+seek-ge b
+----
+a: (., [a-c) @5=boop UPDATED)
+b: (., [a-c) @5=boop)
+
+# Ensure that no-op optimizations do not reuse range key iterator state across
+# SetOptions calls. No-op optimizations have the potential to fail to update
+# RangeKeyChanged().
+
+reset
+----
+
+batch commit
+range-key-set p s @1 foo
+----
+committed 1 keys
+
+combined-iter lower=n@9 upper=x@5
+seek-lt y@3
+set-options lower=n@9 upper=x@5
+seek-lt-limit t o
+----
+p: (., [p-s) @1=foo UPDATED)
+.
+p: valid (., [p-s) @1=foo UPDATED)
+
+combined-iter lower=n@9 upper=x@5
+seek-ge o
+set-options lower=n@9 upper=x@5
+seek-ge oat
+----
+p: (., [p-s) @1=foo UPDATED)
+.
+p: (., [p-s) @1=foo UPDATED)
+
+combined-iter lower=n@9 upper=x@5
+seek-prefix-ge p@5
+set-options lower=n@9 upper=x@5
+seek-prefix-ge p
+----
+p@5: (., [p-"p\x00") @1=foo UPDATED)
+.
+p: (., [p-"p\x00") @1=foo UPDATED)
+
+# Regression test for #1963 / cockroachdb/cockroach#88296.
+#
+# The iterators in this test move their bounds monotonically forward
+# [a,b)→[b,e). This enables the sstable iterator optimization for monotonically
+# moving bounds (see boundsCmp in sstable/reader.go). With this optimization,
+# the first seek after the SetBounds may use the fact that the bounds moved
+# forward monotonically to avoid re-seeking within the index.
+#
+# The test cases below exercise a seek to a key, followed by a seek to a smaller
+# key. The second seek should not make use of the bounds optimization because
+# doing so may incorrectly skip all keys between the lower bound and the first
+# seek key. Previously, the code paths that handled block-property filtering on
+# a two-level iterator could leave the iterator in a state such that the second
+# seek would improperly also exercise the monotonic bounds optimization. In the
+# test cases below, this would result in the key 'b' not being found. Each test
+# case exercises a different combination of seek-ge and seek-prefix-ge.
+
+reset block-size=1 index-block-size=1
+----
+
+batch commit
+set a a
+set b b
+set b@4 b@4
+set z@6 z@6
+----
+committed 4 keys
+
+flush
+----
+
+combined-iter lower=a upper=b point-key-filter=(1,4)
+seek-ge a
+set-bounds lower=b upper=e
+seek-prefix-ge d@5
+seek-prefix-ge b
+----
+a: (a, .)
+.
+.
+b: (b, .)
+
+combined-iter lower=a upper=b point-key-filter=(1,4)
+seek-ge a
+set-bounds lower=b upper=e
+seek-ge d@5
+seek-prefix-ge b
+----
+a: (a, .)
+.
+.
+b: (b, .)
+
+combined-iter lower=a upper=b point-key-filter=(1,4)
+seek-ge a
+set-bounds lower=b upper=e
+seek-ge d@5
+seek-ge b
+----
+a: (a, .)
+.
+.
+b: (b, .)
+
+combined-iter lower=a upper=b point-key-filter=(1,4)
+seek-ge a
+set-bounds lower=b upper=e
+seek-prefix-ge d@5
+seek-ge b
+----
+a: (a, .)
+.
+.
+b: (b, .)
+
+# Test a similar case with range key masking. The previous bug did not apply to
+# this case, because range-key masking never skips blocks on a seek.
+
+reset block-size=1 index-block-size=1
+----
+
+batch commit
+set a a
+set b b
+set b@4 b@4
+set z@6 z@6
+range-key-set a z @9 v
+----
+committed 5 keys
+
+flush
+----
+
+combined-iter lower=a upper=b mask-suffix=@10 mask-filter
+seek-ge a
+set-bounds lower=b upper=e
+seek-prefix-ge d@5
+seek-ge b
+----
+a: (a, [a-b) @9=v UPDATED)
+.
+d@5: (., [d-"d\x00") @9=v UPDATED)
+b: (b, [b-e) @9=v UPDATED)
+
+# Test TrySeekUsingNext across no-op SetOptions when reading through an indexed
+# batch with modifications. The seek-prefix-ges after the first should make use
+# of the TrySeekUsingNext optimization.
+#
+# TODO(jackson): The iterator stats don't signal the use of try-seek-using-next,
+# so we inspect lastPositioningOp as a proxy since that's the
+# try-seek-using-next prerequisite that previously regressed. Is there a way to
+# adapt to this test so that the absence of the try-seek-using-next optimization
+# is visible in the iterator statistics?
+#
+# Regression test for cockroachdb/cockroach#88819.
+
+reset
+----
+
+batch commit
+set b@5 b@5
+set c@3 c@3
+set d@9 d@9
+set e@8 e@8
+set f@8 f@8
+----
+committed 5 keys
+
+flush
+----
+
+batch name=foo
+set g@4 g@4
+----
+wrote 1 keys to batch "foo"
+
+combined-iter reader=foo name=fooiter
+inspect lastPositioningOp
+seek-prefix-ge b@10
+stats
+----
+lastPositioningOp="unknown"
+b@5: (b@5, .)
+stats: (interface (dir, seek, step): (fwd, 1, 0), (rev, 0, 0)), (internal (dir, seek, step): (fwd, 1, 0), (rev, 0, 0)),
+(internal-stats: (block-bytes: (total 120 B, cached 0 B)), (points: (count 1, key-bytes 3, value-bytes 3, tombstoned: 0))
+
+mutate batch=foo
+set h@2 h@2
+----
+
+iter iter=fooiter
+set-options
+inspect lastPositioningOp
+seek-prefix-ge c@10
+stats
+----
+.
+lastPositioningOp="seekprefixge"
+c@3: (c@3, .)
+stats: (interface (dir, seek, step): (fwd, 2, 0), (rev, 0, 0)), (internal (dir, seek, step): (fwd, 2, 0), (rev, 0, 0)),
+(internal-stats: (block-bytes: (total 120 B, cached 0 B)), (points: (count 2, key-bytes 6, value-bytes 6, tombstoned: 0))
+
+mutate batch=foo
+set i@1 i@1
+----
+
+iter iter=fooiter
+set-options
+inspect lastPositioningOp
+seek-prefix-ge d@10
+stats
+----
+.
+lastPositioningOp="seekprefixge"
+d@9: (d@9, .)
+stats: (interface (dir, seek, step): (fwd, 3, 0), (rev, 0, 0)), (internal (dir, seek, step): (fwd, 3, 0), (rev, 0, 0)),
+(internal-stats: (block-bytes: (total 120 B, cached 0 B)), (points: (count 3, key-bytes 9, value-bytes 9, tombstoned: 0))
+
+mutate batch=foo
+set j@6 j@6
+----
+
+iter iter=fooiter
+set-options
+inspect lastPositioningOp
+seek-prefix-ge e@10
+stats
+----
+.
+lastPositioningOp="seekprefixge"
+e@8: (e@8, .)
+stats: (interface (dir, seek, step): (fwd, 4, 0), (rev, 0, 0)), (internal (dir, seek, step): (fwd, 4, 0), (rev, 0, 0)),
+(internal-stats: (block-bytes: (total 120 B, cached 0 B)), (points: (count 4, key-bytes 12, value-bytes 12, tombstoned: 0))
+
+# Ensure that a case eligible for TrySeekUsingNext across a SetOptions correctly
+# sees new batch mutations. The batch iterator should ignore the
+# TrySeekUsingNext designation.
+
+reset
+----
+
+batch commit
+set b@3 b@3
+set c@3 c@3
+----
+committed 2 keys
+
+batch name=b1
+----
+wrote 0 keys to batch "b1"
+
+combined-iter name=i1 reader=b1
+seek-prefix-ge b@6
+----
+b@3: (b@3, .)
+
+mutate batch=b1
+set b@4 b@4
+----
+
+iter iter=i1
+set-options
+inspect lastPositioningOp
+seek-prefix-ge b@5
+----
+.
+lastPositioningOp="seekprefixge"
+b@4: (b@4, .)
+
+# Similar case with SeekGE.
+
+iter iter=i1
+seek-ge b@2
+----
+c@3: (c@3, .)
+
+mutate batch=b1
+set c@9 c@9
+----
+
+iter iter=i1
+set-options
+inspect lastPositioningOp
+seek-ge b@1
+----
+.
+lastPositioningOp="seekge"
+c@9: (c@9, .)
+
+# Test a case similar to the above, but with an intermediate switch to
+# range-key-only iteration, so that the batchIter is not re-seeked.
+
+reset
+----
+
+batch commit
+set b@5 b@5
+set c@3 c@3
+----
+committed 2 keys
+
+batch name=b1
+----
+wrote 0 keys to batch "b1"
+
+combined-iter name=i1 reader=b1
+seek-ge b@9
+----
+b@5: (b@5, .)
+
+mutate batch=b1
+set b@6 b@6
+----
+
+iter iter=i1
+set-options key-types=range
+seek-ge b@8
+set-options key-types=both
+inspect lastPositioningOp
+seek-ge b@7
+----
+.
+.
+.
+lastPositioningOp="unknown"
+b@6: (b@6, .)
+
+reset
+----
+
+batch commit
+set b@2 b@2
+set c@3 c@3
+----
+committed 2 keys
+
+batch name=b1
+----
+wrote 0 keys to batch "b1"
+
+combined-iter name=i1 reader=b1
+seek-prefix-ge b@1
+----
+.
+
+mutate batch=b1
+set c@4 c@4
+----
+
+iter iter=i1
+set-options
+inspect lastPositioningOp
+seek-prefix-ge c@8
+----
+.
+lastPositioningOp="seekprefixge"
+c@4: (c@4, .)

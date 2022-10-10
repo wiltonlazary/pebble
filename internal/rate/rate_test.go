@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build go1.7
 // +build go1.7
 
 package rate
@@ -382,8 +383,9 @@ func runWait(t *testing.T, lim *Limiter, w wait) {
 }
 
 func TestWaitSimple(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("flaky on Windows")
+	switch runtime.GOOS {
+	case "windows", "darwin":
+		t.Skip("flaky; see #1256")
 	}
 
 	lim := NewLimiter(10, 3)
@@ -399,8 +401,9 @@ func TestWaitSimple(t *testing.T) {
 }
 
 func TestWaitCancel(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("flaky on Windows")
+	switch runtime.GOOS {
+	case "windows", "darwin":
+		t.Skip("flaky; see #1187")
 	}
 
 	lim := NewLimiter(10, 3)

@@ -8,7 +8,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"reflect"
 	"sort"
@@ -40,6 +39,56 @@ func checkRoundTrip(e0 VersionEdit) error {
 }
 
 func TestVersionEditRoundTrip(t *testing.T) {
+	cmp := base.DefaultComparer.Compare
+	m1 := (&FileMetadata{
+		FileNum:      805,
+		Size:         8050,
+		CreationTime: 805030,
+	}).ExtendPointKeyBounds(
+		cmp,
+		base.DecodeInternalKey([]byte("abc\x00\x01\x02\x03\x04\x05\x06\x07")),
+		base.DecodeInternalKey([]byte("xyz\x01\xff\xfe\xfd\xfc\xfb\xfa\xf9")),
+	)
+
+	m2 := (&FileMetadata{
+		FileNum:             806,
+		Size:                8060,
+		CreationTime:        806040,
+		SmallestSeqNum:      3,
+		LargestSeqNum:       5,
+		MarkedForCompaction: true,
+	}).ExtendPointKeyBounds(
+		cmp,
+		base.DecodeInternalKey([]byte("A\x00\x01\x02\x03\x04\x05\x06\x07")),
+		base.DecodeInternalKey([]byte("Z\x01\xff\xfe\xfd\xfc\xfb\xfa\xf9")),
+	)
+
+	m3 := (&FileMetadata{
+		FileNum:      807,
+		Size:         8070,
+		CreationTime: 807050,
+	}).ExtendRangeKeyBounds(
+		cmp,
+		base.MakeInternalKey([]byte("aaa"), 0, base.InternalKeyKindRangeKeySet),
+		base.MakeExclusiveSentinelKey(base.InternalKeyKindRangeKeySet, []byte("zzz")),
+	)
+
+	m4 := (&FileMetadata{
+		FileNum:        809,
+		Size:           8090,
+		CreationTime:   809060,
+		SmallestSeqNum: 9,
+		LargestSeqNum:  11,
+	}).ExtendPointKeyBounds(
+		cmp,
+		base.MakeInternalKey([]byte("a"), 0, base.InternalKeyKindSet),
+		base.MakeInternalKey([]byte("m"), 0, base.InternalKeyKindSet),
+	).ExtendRangeKeyBounds(
+		cmp,
+		base.MakeInternalKey([]byte("l"), 0, base.InternalKeyKindRangeKeySet),
+		base.MakeExclusiveSentinelKey(base.InternalKeyKindRangeKeySet, []byte("z")),
+	)
+
 	testCases := []VersionEdit{
 		// An empty version edit.
 		{},
@@ -62,27 +111,20 @@ func TestVersionEditRoundTrip(t *testing.T) {
 			},
 			NewFiles: []NewFileEntry{
 				{
+					Level: 4,
+					Meta:  m1,
+				},
+				{
 					Level: 5,
-					Meta: &FileMetadata{
-						FileNum:      805,
-						Size:         8050,
-						CreationTime: 805030,
-						Smallest:     base.DecodeInternalKey([]byte("abc\x00\x01\x02\x03\x04\x05\x06\x07")),
-						Largest:      base.DecodeInternalKey([]byte("xyz\x01\xff\xfe\xfd\xfc\xfb\xfa\xf9")),
-					},
+					Meta:  m2,
 				},
 				{
 					Level: 6,
-					Meta: &FileMetadata{
-						FileNum:             806,
-						Size:                8060,
-						CreationTime:        806040,
-						Smallest:            base.DecodeInternalKey([]byte("A\x00\x01\x02\x03\x04\x05\x06\x07")),
-						Largest:             base.DecodeInternalKey([]byte("Z\x01\xff\xfe\xfd\xfc\xfb\xfa\xf9")),
-						SmallestSeqNum:      3,
-						LargestSeqNum:       5,
-						markedForCompaction: true,
-					},
+					Meta:  m3,
+				},
+				{
+					Level: 6,
+					Meta:  m4,
 				},
 			},
 		},
@@ -95,6 +137,18 @@ func TestVersionEditRoundTrip(t *testing.T) {
 }
 
 func TestVersionEditDecode(t *testing.T) {
+	cmp := base.DefaultComparer.Compare
+	m := (&FileMetadata{
+		FileNum:        4,
+		Size:           986,
+		SmallestSeqNum: 3,
+		LargestSeqNum:  5,
+	}).ExtendPointKeyBounds(
+		cmp,
+		base.MakeInternalKey([]byte("bar"), 5, base.InternalKeyKindDelete),
+		base.MakeInternalKey([]byte("foo"), 4, base.InternalKeyKindSet),
+	)
+
 	testCases := []struct {
 		filename     string
 		encodedEdits []string
@@ -135,14 +189,7 @@ func TestVersionEditDecode(t *testing.T) {
 					NewFiles: []NewFileEntry{
 						{
 							Level: 0,
-							Meta: &FileMetadata{
-								FileNum:        4,
-								Size:           986,
-								Smallest:       base.MakeInternalKey([]byte("bar"), 5, base.InternalKeyKindDelete),
-								Largest:        base.MakeInternalKey([]byte("foo"), 4, base.InternalKeyKindSet),
-								SmallestSeqNum: 3,
-								LargestSeqNum:  5,
-							},
+							Meta:  m,
 						},
 					},
 				},
@@ -170,7 +217,7 @@ func TestVersionEditDecode(t *testing.T) {
 					t.Fatalf("filename=%q i=%d: too many version edits", tc.filename, i+1)
 				}
 
-				encodedEdit, err := ioutil.ReadAll(rr)
+				encodedEdit, err := io.ReadAll(rr)
 				if err != nil {
 					t.Fatalf("filename=%q i=%d: read error: %v", tc.filename, i, err)
 				}
@@ -255,27 +302,17 @@ func TestVersionEditEncodeLastSeqNum(t *testing.T) {
 }
 
 func TestVersionEditApply(t *testing.T) {
-	parseMeta := func(s string) (*FileMetadata, error) {
-		parts := strings.Split(s, ":")
-		if len(parts) != 2 {
-			t.Fatalf("malformed table spec: %s", s)
-		}
-		fileNum, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+	parseMeta := func(s string) (FileMetadata, error) {
+		m, err := ParseFileMetadataDebug(s)
 		if err != nil {
-			return nil, err
-		}
-		parts = strings.Split(strings.TrimSpace(parts[1]), "-")
-		m := FileMetadata{
-			Smallest: base.ParseInternalKey(strings.TrimSpace(parts[0])),
-			Largest:  base.ParseInternalKey(strings.TrimSpace(parts[1])),
+			return FileMetadata{}, err
 		}
 		m.SmallestSeqNum = m.Smallest.SeqNum()
 		m.LargestSeqNum = m.Largest.SeqNum()
 		if m.SmallestSeqNum > m.LargestSeqNum {
 			m.SmallestSeqNum, m.LargestSeqNum = m.LargestSeqNum, m.SmallestSeqNum
 		}
-		m.FileNum = base.FileNum(fileNum)
-		return &m, nil
+		return m, nil
 	}
 
 	datadriven.RunTest(t, "testdata/version_edit_apply",
@@ -321,11 +358,11 @@ func TestVersionEditApply(t *testing.T) {
 										v.Levels[l] = makeLevelMetadata(base.DefaultComparer.Compare, l, nil /* files */)
 									}
 								}
-								versionFiles[meta.FileNum] = meta
-								v.Levels[level].tree.insert(meta)
+								versionFiles[meta.FileNum] = &meta
+								v.Levels[level].tree.insert(&meta)
 							} else {
 								ve.NewFiles =
-									append(ve.NewFiles, NewFileEntry{Level: level, Meta: meta})
+									append(ve.NewFiles, NewFileEntry{Level: level, Meta: &meta})
 							}
 						} else {
 							fileNum, err := strconv.Atoi(data)
@@ -365,8 +402,7 @@ func TestVersionEditApply(t *testing.T) {
 					return zombieFileNums[i] < zombieFileNums[j]
 				})
 
-				return newv.DebugString(base.DefaultFormatter) +
-					fmt.Sprintf("zombies %d\n", zombieFileNums)
+				return fmt.Sprintf("%szombies %d\n", newv, zombieFileNums)
 
 			default:
 				return fmt.Sprintf("unknown command: %s", d.Cmd)

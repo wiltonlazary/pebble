@@ -31,7 +31,7 @@ func TestParser(t *testing.T) {
 }
 
 func TestParserRandom(t *testing.T) {
-	ops := generate(randvar.NewRand(), 10000, defaultConfig)
+	ops := generate(randvar.NewRand(), 10000, defaultConfig(), newKeyManager())
 	src := formatOps(ops)
 
 	parsedOps, err := parse([]byte(src))
@@ -49,8 +49,7 @@ func TestParserNilBounds(t *testing.T) {
 		&newIterOp{
 			readerID: makeObjID(dbTag, 0),
 			iterID:   makeObjID(iterTag, 1),
-			lower:    nil,
-			upper:    nil,
+			iterOpts: iterOpts{},
 		},
 	})
 	parsedOps, err := parse([]byte(formatted))

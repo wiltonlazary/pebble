@@ -42,13 +42,14 @@ __level_____count____size___score______in__ingest(sz_cnt)____move(sz_cnt)___writ
       6         1   833 B       -     0 B   833 B       1     0 B       0     0 B       0     0 B       1     0.0
   total         1   833 B       -   833 B   833 B       1     0 B       0   833 B       0     0 B       1     1.0
   flush         0
-compact         0     0 B             0 B          (size == estimated-debt, in = in-progress-bytes)
-  ctype         0       0       0       0       0  (default, delete, elision, move, read)
+compact         0     0 B     0 B       0          (size == estimated-debt, score = in-progress-bytes, in = num-in-progress)
+  ctype         0       0       0       0       0       0       0  (default, delete, elision, move, read, rewrite, multi-level)
  memtbl         1   256 K
 zmemtbl         0     0 B
    ztbl         0     0 B
- bcache         8   1.5 K   46.7%  (score == hit-rate)
- tcache         1   616 B   50.0%  (score == hit-rate)
+ bcache         8   1.5 K   42.9%  (score == hit-rate)
+ tcache         1   680 B   50.0%  (score == hit-rate)
+  snaps         0       -       0  (score == earliest seq num)
  titers         0
  filter         -       -    0.0%  (score == utility)
 
@@ -57,8 +58,8 @@ seek-ge a
 next
 next
 ----
-a:1
-b:2
+a: (1, .)
+b: (2, .)
 .
 
 get
@@ -73,6 +74,7 @@ wait-pending-table-stats
 ----
 num-entries: 2
 num-deletions: 0
+num-range-key-sets: 0
 point-deletions-bytes-estimate: 0
 range-deletions-bytes-estimate: 0
 
@@ -95,7 +97,7 @@ iter
 seek-ge a
 next
 ----
-a:3
+a: (3, .)
 .
 
 get
@@ -128,9 +130,9 @@ seek-ge a
 next
 next
 ----
-a:4
-b:5
-c:6
+a: (4, .)
+b: (5, .)
+c: (6, .)
 
 get
 a
@@ -165,8 +167,8 @@ seek-ge a
 next
 next
 ----
-a:4
-b:55
+a: (4, .)
+b: (55, .)
 .
 
 get
@@ -203,9 +205,9 @@ seek-lt y
 prev
 prev
 ----
-x:7
-b:55
-a:4
+x: (7, .)
+b: (55, .)
+a: (4, .)
 
 get
 x
@@ -227,6 +229,7 @@ set k 11
 
 ingest ext5
 ----
+memtable flushed
 
 lsm
 ----
@@ -246,8 +249,8 @@ iter
 seek-ge j
 next
 ----
-j:9
-k:11
+j: (9, .)
+k: (11, .)
 
 get
 j
@@ -298,6 +301,7 @@ del-range x z
 
 ingest ext7
 ----
+memtable flushed
 
 lsm
 ----
@@ -343,6 +347,7 @@ wait-pending-table-stats
 ----
 num-entries: 2
 num-deletions: 2
+num-range-key-sets: 0
 point-deletions-bytes-estimate: 0
 range-deletions-bytes-estimate: 1666
 
@@ -499,6 +504,7 @@ set b 1
 
 ingest ext14
 ----
+memtable flushed
 
 lsm
 ----

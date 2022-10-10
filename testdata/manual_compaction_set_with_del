@@ -86,15 +86,15 @@ wait-pending-table-stats
 ----
 num-entries: 1
 num-deletions: 1
+num-range-key-sets: 0
 point-deletions-bytes-estimate: 0
 range-deletions-bytes-estimate: 1552
 
 compact a-e L1
 ----
 2:
-  000008:[a#3,SETWITHDEL-b#72057594037927935,RANGEDEL]
-  000009:[b#2,RANGEDEL-d#72057594037927935,RANGEDEL]
-  000010:[d#2,RANGEDEL-e#72057594037927935,RANGEDEL]
+  000008:[a#3,SETWITHDEL-c#72057594037927935,RANGEDEL]
+  000009:[c#2,RANGEDEL-e#72057594037927935,RANGEDEL]
 3:
   000006:[a#0,SET-b#0,SET]
   000007:[c#0,SET-d#0,SET]
@@ -104,6 +104,7 @@ wait-pending-table-stats
 ----
 num-entries: 2
 num-deletions: 1
+num-range-key-sets: 0
 point-deletions-bytes-estimate: 0
 range-deletions-bytes-estimate: 776
 
@@ -140,9 +141,9 @@ L3
 compact a-e L1
 ----
 2:
-  000010:[a#3,SETWITHDEL-b#72057594037927935,RANGEDEL]
-  000011:[b#2,RANGEDEL-d#72057594037927935,RANGEDEL]
-  000012:[d#2,RANGEDEL-f#72057594037927935,RANGEDEL]
+  000010:[a#3,SETWITHDEL-c#72057594037927935,RANGEDEL]
+  000011:[c#2,RANGEDEL-e#72057594037927935,RANGEDEL]
+  000012:[e#2,RANGEDEL-f#72057594037927935,RANGEDEL]
   000013:[f#2,RANGEDEL-g#72057594037927935,RANGEDEL]
 3:
   000006:[a#0,SET-b#0,SET]
@@ -181,8 +182,8 @@ L3
 compact a-e L1
 ----
 2:
-  000009:[a#3,SETWITHDEL-g#72057594037927935,RANGEDEL]
-  000010:[h#3,SET-h#3,SET]
+  000009:[a#3,SETWITHDEL-c#72057594037927935,RANGEDEL]
+  000010:[c#2,RANGEDEL-h#3,SET]
 3:
   000006:[a#0,SET-b#0,SET]
   000007:[c#0,SET-d#0,SET]
@@ -215,9 +216,8 @@ L3
 compact a-e L1
 ----
 2:
-  000008:[a#3,RANGEDEL-b#72057594037927935,RANGEDEL]
-  000009:[b#3,RANGEDEL-d#72057594037927935,RANGEDEL]
-  000010:[d#3,RANGEDEL-e#72057594037927935,RANGEDEL]
+  000008:[a#3,RANGEDEL-c#72057594037927935,RANGEDEL]
+  000009:[c#3,RANGEDEL-e#72057594037927935,RANGEDEL]
 3:
   000006:[a#0,SET-b#0,SET]
   000007:[c#0,SET-d#0,SET]
@@ -286,8 +286,8 @@ L3
 compact a-c L1
 ----
 2:
-  000009:[a#3,RANGEDEL-c#72057594037927935,RANGEDEL]
-  000010:[c#2,SET-c#2,SET]
+  000009:[a#3,RANGEDEL-b#72057594037927935,RANGEDEL]
+  000010:[b#3,RANGEDEL-c#2,SET]
 3:
   000006:[b#2,SET-b#2,SET]
   000007:[b#1,SET-b#1,SET]
@@ -338,9 +338,9 @@ next
 next
 next
 ----
-a:2
-b:2
-z:1
+a: (2, .)
+b: (2, .)
+z: (1, .)
 .
 
 compact a-z
@@ -354,9 +354,9 @@ next
 next
 next
 ----
-a:2
-b:2
-z:1
+a: (2, .)
+b: (2, .)
+z: (1, .)
 .
 
 # Regresion test for a bug in sstable smallest boundary generation
@@ -402,8 +402,8 @@ first
 next
 next
 ----
-a:3
-c:4
+a: (3, .)
+c: (4, .)
 .
 
 # The bug allowed seeing b:1 during reverse iteration.
@@ -413,17 +413,14 @@ last
 prev
 prev
 ----
-c:4
-a:3
+c: (4, .)
+a: (3, .)
 .
 
-# This is a similar scenario to the one above, but we've arranged for
-# the compaction to produce an sstable (9) for which the smallest
-# range tombstone overlaps in key space with the largest key in the
-# previous sstable (8). This necessitates adjusting the seqnum of the
-# range tombstone. There was no actual iteration bug from earlier
-# behavior of setting the seqnum to 0, but now we set the seqnum to
-# prev.LargestKey.SeqNum-1.
+# This is a similar scenario to the one above. In older versions of Pebble this
+# case necessitated adjusting the seqnum of the range tombstone to
+# prev.LargestKey.SeqNum-1. We no longer allow user keys to be split across
+# sstables, and the seqnum adjustment is no longer necessary.
 #
 # Note the target-file-size of 26 is specially tailored to get the
 # desired compaction output.
@@ -446,8 +443,8 @@ L3
 compact a-e L1
 ----
 2:
-  000007:[a#4,SET-b#2,SET]
-  000008:[b#1,RANGEDEL-e#72057594037927935,RANGEDEL]
+  000007:[a#4,SET-a#4,SET]
+  000008:[b#3,RANGEDEL-e#72057594037927935,RANGEDEL]
 3:
   000006:[b#1,SET-b#1,SET]
 
@@ -457,9 +454,9 @@ next
 last
 prev
 ----
-a:4
+a: (4, .)
 .
-a:4
+a: (4, .)
 .
 
 # Similar to the preceding scenario, except the range tombstone has
@@ -483,8 +480,8 @@ L3
 compact a-e L1
 ----
 2:
-  000007:[a#4,SET-b#3,SET]
-  000008:[b#2,RANGEDEL-e#72057594037927935,RANGEDEL]
+  000007:[a#4,SET-a#4,SET]
+  000008:[b#3,RANGEDEL-e#72057594037927935,RANGEDEL]
 3:
   000006:[b#1,SET-b#1,SET]
 
@@ -496,11 +493,11 @@ last
 prev
 prev
 ----
-a:4
-b:3
+a: (4, .)
+b: (3, .)
 .
-b:3
-a:4
+b: (3, .)
+a: (4, .)
 .
 
 # Similar to the preceding scenario, except the range tombstone has
@@ -524,8 +521,8 @@ L3
 compact a-e L1
 ----
 2:
-  000007:[a#4,SET-b#4,SET]
-  000008:[b#2,RANGEDEL-e#72057594037927935,RANGEDEL]
+  000007:[a#4,SET-a#4,SET]
+  000008:[b#4,SET-e#72057594037927935,RANGEDEL]
 3:
   000006:[b#1,SET-b#1,SET]
 
@@ -537,18 +534,15 @@ last
 prev
 prev
 ----
-a:4
-b:4
+a: (4, .)
+b: (4, .)
 .
-b:4
-a:4
+b: (4, .)
+a: (4, .)
 .
 
 # Test a scenario where the last point key in an sstable has a seqnum
-# of 0, and the smallest range tombstone in the next sstable starts
-# with the same key. We have to tweak the kind of the boundary key in
-# sstable 8 to be a DEL rather than a RANGEDEL so that the two tables
-# are disjoint in the key space.
+# of 0.
 
 define target-file-sizes=(1, 1, 26) snapshots=(2)
 L1
@@ -571,13 +565,14 @@ iter
 last
 prev
 ----
-a:3
+a: (3, .)
 .
 
 compact a-e L1
 ----
 2:
-  000007:[a#3,SET-e#72057594037927935,RANGEDEL]
+  000007:[a#3,SET-c#72057594037927935,RANGEDEL]
+  000008:[c#3,RANGEDEL-e#72057594037927935,RANGEDEL]
 3:
   000005:[a#2,RANGEDEL-b#72057594037927935,RANGEDEL]
   000006:[c#0,SET-d#0,SET]
@@ -586,7 +581,7 @@ iter
 last
 prev
 ----
-a:3
+a: (3, .)
 .
 
 # Test a scenario where the last point key in an sstable before the
@@ -602,12 +597,12 @@ L1
   c.SET.1:1
   d.SET.1:1
 L3
-  a.RANGEDEL.2:b
+  c.RANGEDEL.2:d
 ----
 1:
   000004:[a#3,SET-e#72057594037927935,RANGEDEL]
 3:
-  000005:[a#2,RANGEDEL-b#72057594037927935,RANGEDEL]
+  000005:[c#2,RANGEDEL-d#72057594037927935,RANGEDEL]
 
 compact a-f L1
 ----
@@ -615,7 +610,8 @@ compact a-f L1
   000006:[a#3,SET-c#72057594037927935,RANGEDEL]
   000007:[c#3,RANGEDEL-e#72057594037927935,RANGEDEL]
 3:
-  000005:[a#2,RANGEDEL-b#72057594037927935,RANGEDEL]
+  000005:[c#2,RANGEDEL-d#72057594037927935,RANGEDEL]
+
 
 # Test a scenario where we the last point key in an sstable has a
 # seqnum of 0, but there is another range tombstone later in the
@@ -651,7 +647,7 @@ L0
   000005:[a#2,SET-a#2,SET]
   000004:[b#1,SET-b#1,SET]
 
-add-ongoing-compaction startLevel=0 outputLevel=1
+add-ongoing-compaction startLevel=0 outputLevel=1 start=a end=z
 ----
 
 async-compact a-b L0
@@ -667,7 +663,7 @@ compact a-b L1
   000008:[a#0,SET-a#0,SET]
   000009:[b#0,SET-b#0,SET]
 
-add-ongoing-compaction startLevel=0 outputLevel=1
+add-ongoing-compaction startLevel=0 outputLevel=1 start=a end=z
 ----
 
 async-compact a-b L2
@@ -677,7 +673,7 @@ manual compaction blocked until ongoing finished
   000010:[a#0,SET-a#0,SET]
   000011:[b#0,SET-b#0,SET]
 
-add-ongoing-compaction startLevel=0 outputLevel=1
+add-ongoing-compaction startLevel=0 outputLevel=1 start=a end=z
 ----
 
 set-concurrent-compactions num=2
@@ -693,7 +689,7 @@ manual compaction did not block for ongoing
 remove-ongoing-compaction
 ----
 
-add-ongoing-compaction startLevel=5 outputLevel=6
+add-ongoing-compaction startLevel=4 outputLevel=5 start=a end=b
 ----
 
 async-compact a-b L4

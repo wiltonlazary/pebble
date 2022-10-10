@@ -18,10 +18,30 @@ import (
 	"github.com/cockroachdb/pebble/internal/arenaskl"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/datadriven"
+	"github.com/cockroachdb/pebble/internal/rangekey"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/exp/rand"
 	"golang.org/x/sync/errgroup"
 )
+
+// get gets the value for the given key. It returns ErrNotFound if the DB does
+// not contain the key.
+func (m *memTable) get(key []byte) (value []byte, err error) {
+	it := m.skl.NewIter(nil, nil)
+	ikey, val := it.SeekGE(key, base.SeekGEFlagsNone)
+	if ikey == nil {
+		return nil, ErrNotFound
+	}
+	if !m.equal(key, ikey.UserKey) {
+		return nil, ErrNotFound
+	}
+	switch ikey.Kind() {
+	case InternalKeyKindDelete, InternalKeyKindSingleDelete:
+		return nil, ErrNotFound
+	default:
+		return val, nil
+	}
+}
 
 // Set sets the value for the given key. It overwrites any previous value for
 // that key; a DB is not a multi-map. NB: this might have unexpected
@@ -32,6 +52,13 @@ func (m *memTable) set(key InternalKey, value []byte) error {
 			return err
 		}
 		m.tombstones.invalidate(1)
+		return nil
+	}
+	if rangekey.IsRangeKey(key.Kind()) {
+		if err := m.rangeKeySkl.Add(key, value); err != nil {
+			return err
+		}
+		m.rangeKeys.invalidate(1)
 		return nil
 	}
 	return m.skl.Add(key, value)
@@ -99,7 +126,7 @@ func TestMemTableBasic(t *testing.T) {
 	}
 	// Check an iterator.
 	s, x := "", newInternalIterAdapter(m.newIter(nil))
-	for valid := x.SeekGE([]byte("mango")); valid; valid = x.Next() {
+	for valid := x.SeekGE([]byte("mango"), base.SeekGEFlagsNone); valid; valid = x.Next() {
 		s += fmt.Sprintf("%s/%s.", x.Key().UserKey, x.Value())
 	}
 	if want := "peach/yellow.plum/purple."; s != want {
@@ -115,10 +142,6 @@ func TestMemTableBasic(t *testing.T) {
 	if got, want := m.count(), 5; got != want {
 		t.Fatalf("13.count: got %v, want %v", got, want)
 	}
-	// Clean up.
-	if err := m.close(); err != nil {
-		t.Fatalf("14.close: %v", err)
-	}
 }
 
 func TestMemTableCount(t *testing.T) {
@@ -129,7 +152,6 @@ func TestMemTableCount(t *testing.T) {
 		}
 		m.set(InternalKey{UserKey: []byte{byte(i)}}, nil)
 	}
-	require.NoError(t, m.close())
 }
 
 func TestMemTableBytesIterated(t *testing.T) {
@@ -142,7 +164,6 @@ func TestMemTableBytesIterated(t *testing.T) {
 		}
 		m.set(InternalKey{UserKey: []byte{byte(i)}}, nil)
 	}
-	require.NoError(t, m.close())
 }
 
 func TestMemTableEmpty(t *testing.T) {
@@ -207,7 +228,7 @@ func TestMemTable1000Entries(t *testing.T) {
 		"507",
 	}
 	x := newInternalIterAdapter(m0.newIter(nil))
-	x.SeekGE([]byte(wants[0]))
+	x.SeekGE([]byte(wants[0]), base.SeekGEFlagsNone)
 	for _, want := range wants {
 		if !x.Valid() {
 			t.Fatalf("iter: next failed, want=%q", want)
@@ -224,10 +245,6 @@ func TestMemTable1000Entries(t *testing.T) {
 		x.Next()
 	}
 	if err := x.Close(); err != nil {
-		t.Fatalf("close: %v", err)
-	}
-	// Clean up.
-	if err := m0.close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
 }
@@ -305,23 +322,21 @@ func TestMemTableDeleteRange(t *testing.T) {
 			return ""
 
 		case "scan":
-			var iter internalIterAdapter
 			if len(td.CmdArgs) > 1 {
 				return fmt.Sprintf("%s expects at most 1 argument", td.Cmd)
 			}
+			var buf bytes.Buffer
 			if len(td.CmdArgs) == 1 {
 				if td.CmdArgs[0].String() != "range-del" {
 					return fmt.Sprintf("%s unknown argument %s", td.Cmd, td.CmdArgs[0])
 				}
-				iter.internalIterator = mem.newRangeDelIter(nil)
+				iter := mem.newRangeDelIter(nil)
+				defer iter.Close()
+				scanKeyspanIterator(&buf, iter)
 			} else {
-				iter.internalIterator = mem.newIter(nil)
-			}
-			defer iter.Close()
-
-			var buf bytes.Buffer
-			for valid := iter.First(); valid; valid = iter.Next() {
-				fmt.Fprintf(&buf, "%s:%s\n", iter.Key(), iter.Value())
+				iter := mem.newIter(nil)
+				defer iter.Close()
+				scanInternalIterator(&buf, iter)
 			}
 			return buf.String()
 
@@ -354,12 +369,12 @@ func TestMemTableConcurrentDeleteRange(t *testing.T) {
 				b.release()
 
 				var count int
-				it := newInternalIterAdapter(m.newRangeDelIter(nil))
-				for valid := it.SeekGE(start); valid; valid = it.Next() {
-					if m.cmp(it.Key().UserKey, end) >= 0 {
+				it := m.newRangeDelIter(nil)
+				for s := it.SeekGE(start); s != nil; s = it.Next() {
+					if m.cmp(s.Start, end) >= 0 {
 						break
 					}
-					count++
+					count += len(s.Keys)
 				}
 				if j+1 != count {
 					return errors.Errorf("%d: expected %d tombstones, but found %d", i, j+1, count)
@@ -396,7 +411,7 @@ func BenchmarkMemTableIterSeekGE(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		iter.SeekGE(keys[rng.Intn(len(keys))])
+		iter.SeekGE(keys[rng.Intn(len(keys))], base.SeekGEFlagsNone)
 	}
 }
 

@@ -147,7 +147,7 @@ func check(f vfs.File, comparer *Comparer, fp FilterPolicy) error {
 			return err
 		}
 		i := newIterAdapter(iter)
-		if !i.SeekGE([]byte(k)) || string(i.Key().UserKey) != k {
+		if !i.SeekGE([]byte(k), base.SeekGEFlagsNone) || string(i.Key().UserKey) != k {
 			return errors.Errorf("Find %q: key was not in the table", k)
 		}
 		if k1 := i.Key().UserKey; len(k1) != cap(k1) {
@@ -161,7 +161,7 @@ func check(f vfs.File, comparer *Comparer, fp FilterPolicy) error {
 		}
 
 		// Check using SeekLT.
-		if !i.SeekLT([]byte(k)) {
+		if !i.SeekLT([]byte(k), base.SeekLTFlagsNone) {
 			i.First()
 		} else {
 			i.Next()
@@ -197,7 +197,7 @@ func check(f vfs.File, comparer *Comparer, fp FilterPolicy) error {
 			return err
 		}
 		i := newIterAdapter(iter)
-		if i.SeekGE([]byte(s)) && s == string(i.Key().UserKey) {
+		if i.SeekGE([]byte(s), base.SeekGEFlagsNone) && s == string(i.Key().UserKey) {
 			return errors.Errorf("Find %q: unexpectedly found key in the table", s)
 		}
 		if err := i.Close(); err != nil {
@@ -227,7 +227,7 @@ func check(f vfs.File, comparer *Comparer, fp FilterPolicy) error {
 			return err
 		}
 		n, i := 0, newIterAdapter(iter)
-		for valid := i.SeekGE([]byte(ct.start)); valid; valid = i.Next() {
+		for valid := i.SeekGE([]byte(ct.start), base.SeekGEFlagsNone); valid; valid = i.Next() {
 			n++
 		}
 		if n != ct.count {
@@ -303,7 +303,7 @@ func check(f vfs.File, comparer *Comparer, fp FilterPolicy) error {
 
 		if lower != nil {
 			n := 0
-			for valid := i.SeekGE(lower); valid; valid = i.Next() {
+			for valid := i.SeekGE(lower, base.SeekGEFlagsNone); valid; valid = i.Next() {
 				n++
 			}
 			if expected := upperIdx - lowerIdx; expected != n {
@@ -313,7 +313,7 @@ func check(f vfs.File, comparer *Comparer, fp FilterPolicy) error {
 
 		if upper != nil {
 			n := 0
-			for valid := i.SeekLT(upper); valid; valid = i.Prev() {
+			for valid := i.SeekLT(upper, base.SeekLTFlagsNone); valid; valid = i.Prev() {
 				n++
 			}
 			if expected := upperIdx - lowerIdx; expected != n {
@@ -692,7 +692,7 @@ func TestMetaIndexEntriesSorted(t *testing.T) {
 	r, err := NewReader(f, ReaderOptions{})
 	require.NoError(t, err)
 
-	b, err := r.readBlock(r.metaIndexBH, nil /* transform */, nil /* attrs */)
+	b, err := r.readBlock(r.metaIndexBH, nil /* transform */, nil /* attrs */, nil /* stats */)
 	require.NoError(t, err)
 	defer b.Release()
 
@@ -713,11 +713,8 @@ func TestMetaIndexEntriesSorted(t *testing.T) {
 
 func TestFooterRoundTrip(t *testing.T) {
 	buf := make([]byte, 100+maxFooterLen)
-	for _, format := range []TableFormat{
-		TableFormatRocksDBv2,
-		TableFormatLevelDB,
-	} {
-		t.Run(fmt.Sprintf("format=%d", format), func(t *testing.T) {
+	for format := TableFormatLevelDB; format < TableFormatMax; format++ {
+		t.Run(fmt.Sprintf("format=%s", format), func(t *testing.T) {
 			checksums := []ChecksumType{ChecksumTypeCRC32c}
 			if format != TableFormatLevelDB {
 				checksums = []ChecksumType{ChecksumTypeCRC32c, ChecksumTypeXXHash64}
@@ -824,20 +821,38 @@ func (errorPropCollector) Name() string {
 }
 
 func TestTablePropertyCollectorErrors(t *testing.T) {
-	mem := vfs.NewMem()
-	f, err := mem.Create("foo")
-	require.NoError(t, err)
 
-	var opts WriterOptions
-	opts.TablePropertyCollectors = append(opts.TablePropertyCollectors,
-		func() TablePropertyCollector {
-			return errorPropCollector{}
-		})
+	var testcases map[string]func(w *Writer) error = map[string]func(w *Writer) error{
+		"add a#0,1 failed": func(w *Writer) error {
+			return w.Set([]byte("a"), []byte("b"))
+		},
+		"add c#0,0 failed": func(w *Writer) error {
+			return w.Delete([]byte("c"))
+		},
+		"add d#0,15 failed": func(w *Writer) error {
+			return w.DeleteRange([]byte("d"), []byte("e"))
+		},
+		"add f#0,2 failed": func(w *Writer) error {
+			return w.Merge([]byte("f"), []byte("g"))
+		},
+		"finish failed": func(w *Writer) error {
+			return w.Close()
+		},
+	}
 
-	w := NewWriter(f, opts)
-	require.Regexp(t, `add a#0,1 failed`, w.Set([]byte("a"), []byte("b")))
-	require.Regexp(t, `add c#0,0 failed`, w.Delete([]byte("c")))
-	require.Regexp(t, `add d#0,15 failed`, w.DeleteRange([]byte("d"), []byte("e")))
-	require.Regexp(t, `add f#0,2 failed`, w.Merge([]byte("f"), []byte("g")))
-	require.Regexp(t, `finish failed`, w.Close())
+	for e, fun := range testcases {
+		mem := vfs.NewMem()
+		f, err := mem.Create("foo")
+		require.NoError(t, err)
+
+		var opts WriterOptions
+		opts.TablePropertyCollectors = append(opts.TablePropertyCollectors,
+			func() TablePropertyCollector {
+				return errorPropCollector{}
+			})
+
+		w := NewWriter(f, opts)
+
+		require.Regexp(t, e, fun(w))
+	}
 }

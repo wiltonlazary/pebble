@@ -19,11 +19,11 @@ import (
 	"golang.org/x/exp/rand"
 )
 
-func TestBlockWriter(t *testing.T) {
-	ikey := func(s string) InternalKey {
-		return InternalKey{UserKey: []byte(s)}
-	}
+func ikey(s string) InternalKey {
+	return InternalKey{UserKey: []byte(s)}
+}
 
+func TestBlockWriter(t *testing.T) {
 	w := &rawBlockWriter{
 		blockWriter: blockWriter{restartInterval: 16},
 	}
@@ -40,6 +40,39 @@ func TestBlockWriter(t *testing.T) {
 	if !bytes.Equal(expected, block) {
 		t.Fatalf("expected\n%q\nfound\n%q", expected, block)
 	}
+}
+
+func testBlockCleared(t *testing.T, w, b *blockWriter) {
+	require.Equal(t, w.restartInterval, b.restartInterval)
+	require.Equal(t, w.nEntries, b.nEntries)
+	require.Equal(t, w.nextRestart, b.nextRestart)
+	require.Equal(t, len(w.buf), len(b.buf))
+	require.Equal(t, len(w.restarts), len(b.restarts))
+	require.Equal(t, len(w.curKey), len(b.curKey))
+	require.Equal(t, len(w.prevKey), len(b.prevKey))
+	require.Equal(t, len(w.curValue), len(b.curValue))
+	require.Equal(t, w.tmp, b.tmp)
+
+	// Make sure that we didn't lose the allocated byte slices.
+	require.True(t, cap(w.buf) > 0 && cap(b.buf) == 0)
+	require.True(t, cap(w.restarts) > 0 && cap(b.restarts) == 0)
+	require.True(t, cap(w.curKey) > 0 && cap(b.curKey) == 0)
+	require.True(t, cap(w.prevKey) > 0 && cap(b.prevKey) == 0)
+	require.True(t, cap(w.curValue) > 0 && cap(b.curValue) == 0)
+}
+
+func TestBlockClear(t *testing.T) {
+	w := blockWriter{restartInterval: 16}
+	w.add(ikey("apple"), nil)
+	w.add(ikey("apricot"), nil)
+	w.add(ikey("banana"), nil)
+
+	w.clear()
+
+	// Once a block is cleared, we expect its fields to be cleared, but we expect
+	// it to keep its allocated byte slices.
+	b := blockWriter{}
+	testBlockCleared(t, &w, &b)
 }
 
 func TestInvalidInternalKeyDecoding(t *testing.T) {
@@ -156,20 +189,9 @@ func TestBlockIter2(t *testing.T) {
 						return err.Error()
 					}
 
-					for _, arg := range d.CmdArgs {
-						switch arg.Key {
-						case "globalSeqNum":
-							if len(arg.Vals) != 1 {
-								return fmt.Sprintf("%s: arg %s expects 1 value", d.Cmd, arg.Key)
-							}
-							v, err := strconv.Atoi(arg.Vals[0])
-							if err != nil {
-								return err.Error()
-							}
-							iter.globalSeqNum = uint64(v)
-						default:
-							return fmt.Sprintf("%s: unknown arg: %s", d.Cmd, arg.Key)
-						}
+					iter.globalSeqNum, err = scanGlobalSeqNum(d)
+					if err != nil {
+						return err.Error()
 					}
 
 					var b bytes.Buffer
@@ -181,14 +203,14 @@ func TestBlockIter2(t *testing.T) {
 						switch parts[0] {
 						case "seek-ge":
 							if len(parts) != 2 {
-								return fmt.Sprintf("seek-ge <key>\n")
+								return "seek-ge <key>\n"
 							}
-							iter.SeekGE([]byte(strings.TrimSpace(parts[1])))
+							iter.SeekGE([]byte(strings.TrimSpace(parts[1])), base.SeekGEFlagsNone)
 						case "seek-lt":
 							if len(parts) != 2 {
-								return fmt.Sprintf("seek-lt <key>\n")
+								return "seek-lt <key>\n"
 							}
-							iter.SeekLT([]byte(strings.TrimSpace(parts[1])))
+							iter.SeekLT([]byte(strings.TrimSpace(parts[1])), base.SeekLTFlagsNone)
 						case "first":
 							iter.First()
 						case "last":
@@ -198,7 +220,7 @@ func TestBlockIter2(t *testing.T) {
 						case "prev":
 							iter.Prev()
 						}
-						if iter.Valid() {
+						if iter.valid() {
 							fmt.Fprintf(&b, "<%s:%d>", iter.Key().UserKey, iter.Key().SeqNum())
 						} else if err := iter.Error(); err != nil {
 							fmt.Fprintf(&b, "<err=%v>", err)
@@ -249,7 +271,7 @@ func TestBlockIterKeyStability(t *testing.T) {
 	// restart-interval of 1 so that prefix compression was not performed.
 	for j := range expected {
 		keys := [][]byte{}
-		for key, _ := i.SeekGE(expected[j]); key != nil; key, _ = i.Next() {
+		for key, _ := i.SeekGE(expected[j], base.SeekGEFlagsNone); key != nil; key, _ = i.Next() {
 			check(key.UserKey)
 			keys = append(keys, key.UserKey)
 		}
@@ -258,7 +280,7 @@ func TestBlockIterKeyStability(t *testing.T) {
 
 	for j := range expected {
 		keys := [][]byte{}
-		for key, _ := i.SeekLT(expected[j]); key != nil; key, _ = i.Prev() {
+		for key, _ := i.SeekLT(expected[j], base.SeekLTFlagsNone); key != nil; key, _ = i.Prev() {
 			check(key.UserKey)
 			keys = append(keys, key.UserKey)
 		}
@@ -293,7 +315,7 @@ func TestBlockIterReverseDirections(t *testing.T) {
 			require.NoError(t, err)
 
 			pos := 3
-			if key, _ := i.SeekLT([]byte("carrot")); !bytes.Equal(keys[pos], key.UserKey) {
+			if key, _ := i.SeekLT([]byte("carrot"), base.SeekLTFlagsNone); !bytes.Equal(keys[pos], key.UserKey) {
 				t.Fatalf("expected %s, but found %s", keys[pos], key.UserKey)
 			}
 			for pos > targetPos {
@@ -338,9 +360,9 @@ func BenchmarkBlockIterSeekGE(b *testing.B) {
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
 					k := keys[rng.Intn(len(keys))]
-					it.SeekGE(k)
+					it.SeekGE(k, base.SeekGEFlagsNone)
 					if testing.Verbose() {
-						if !it.Valid() {
+						if !it.valid() {
 							b.Fatal("expected to find key")
 						}
 						if !bytes.Equal(k, it.Key().UserKey) {
@@ -380,14 +402,14 @@ func BenchmarkBlockIterSeekLT(b *testing.B) {
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
 					j := rng.Intn(len(keys))
-					it.SeekLT(keys[j])
+					it.SeekLT(keys[j], base.SeekLTFlagsNone)
 					if testing.Verbose() {
 						if j == 0 {
-							if it.Valid() {
+							if it.valid() {
 								b.Fatal("unexpected key")
 							}
 						} else {
-							if !it.Valid() {
+							if !it.valid() {
 								b.Fatal("expected to find key")
 							}
 							k := keys[j-1]
@@ -424,7 +446,7 @@ func BenchmarkBlockIterNext(b *testing.B) {
 
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
-					if !it.Valid() {
+					if !it.valid() {
 						it.First()
 					}
 					it.Next()
@@ -456,7 +478,7 @@ func BenchmarkBlockIterPrev(b *testing.B) {
 
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
-					if !it.Valid() {
+					if !it.valid() {
 						it.Last()
 					}
 					it.Prev()

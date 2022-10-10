@@ -59,16 +59,16 @@ func (i *iterAdapter) String() string {
 	return "iter-adapter"
 }
 
-func (i *iterAdapter) SeekGE(key []byte) bool {
-	return i.update(i.Iterator.SeekGE(key))
+func (i *iterAdapter) SeekGE(key []byte, flags base.SeekGEFlags) bool {
+	return i.update(i.Iterator.SeekGE(key, flags))
 }
 
-func (i *iterAdapter) SeekPrefixGE(prefix, key []byte, trySeekUsingNext bool) bool {
-	return i.update(i.Iterator.SeekPrefixGE(prefix, key, trySeekUsingNext))
+func (i *iterAdapter) SeekPrefixGE(prefix, key []byte, flags base.SeekGEFlags) bool {
+	return i.update(i.Iterator.SeekPrefixGE(prefix, key, flags))
 }
 
-func (i *iterAdapter) SeekLT(key []byte) bool {
-	return i.update(i.Iterator.SeekLT(key))
+func (i *iterAdapter) SeekLT(key []byte, flags base.SeekLTFlags) bool {
+	return i.update(i.Iterator.SeekLT(key, flags))
 }
 
 func (i *iterAdapter) First() bool {
@@ -159,7 +159,7 @@ func TestEmpty(t *testing.T) {
 	it.Last()
 	require.False(t, it.Valid())
 
-	require.False(t, it.SeekGE(key))
+	require.False(t, it.SeekGE(key, base.SeekGEFlagsNone))
 	require.False(t, it.Valid())
 }
 
@@ -198,19 +198,19 @@ func TestBasic(t *testing.T) {
 			add(makeIkey("key3"), makeValue(3))
 			add(makeIkey("key2"), makeValue(2))
 
-			require.True(t, it.SeekGE(makeKey("key")))
+			require.True(t, it.SeekGE(makeKey("key"), base.SeekGEFlagsNone))
 			require.True(t, it.Valid())
 			require.NotEqual(t, "key", it.Key().UserKey)
 
-			require.True(t, it.SeekGE(makeKey("key1")))
+			require.True(t, it.SeekGE(makeKey("key1"), base.SeekGEFlagsNone))
 			require.EqualValues(t, "key1", it.Key().UserKey)
 			require.EqualValues(t, makeValue(1), it.Value())
 
-			require.True(t, it.SeekGE(makeKey("key2")))
+			require.True(t, it.SeekGE(makeKey("key2"), base.SeekGEFlagsNone))
 			require.EqualValues(t, "key2", it.Key().UserKey)
 			require.EqualValues(t, makeValue(2), it.Value())
 
-			require.True(t, it.SeekGE(makeKey("key3")))
+			require.True(t, it.SeekGE(makeKey("key3"), base.SeekGEFlagsNone))
 			require.EqualValues(t, "key3", it.Key().UserKey)
 			require.EqualValues(t, makeValue(3), it.Value())
 
@@ -220,7 +220,7 @@ func TestBasic(t *testing.T) {
 			key.SetSeqNum(2)
 			add(key, nil)
 
-			require.True(t, it.SeekGE(makeKey("a")))
+			require.True(t, it.SeekGE(makeKey("a"), base.SeekGEFlagsNone))
 			require.True(t, it.Valid())
 			require.EqualValues(t, "a", it.Key().UserKey)
 			require.EqualValues(t, 2, it.Key().SeqNum())
@@ -236,7 +236,7 @@ func TestBasic(t *testing.T) {
 			key.SetSeqNum(1)
 			add(key, nil)
 
-			require.True(t, it.SeekGE(makeKey("b")))
+			require.True(t, it.SeekGE(makeKey("b"), base.SeekGEFlagsNone))
 			require.True(t, it.Valid())
 			require.EqualValues(t, "b", it.Key().UserKey)
 			require.EqualValues(t, 2, it.Key().SeqNum())
@@ -282,7 +282,7 @@ func TestConcurrentBasic(t *testing.T) {
 					defer wg.Done()
 
 					it := newIterAdapter(l.NewIter(nil, nil))
-					require.True(t, it.SeekGE(makeKey(fmt.Sprintf("%05d", i))))
+					require.True(t, it.SeekGE(makeKey(fmt.Sprintf("%05d", i)), base.SeekGEFlagsNone))
 					require.EqualValues(t, fmt.Sprintf("%05d", i), it.Key().UserKey)
 				}(i)
 			}
@@ -335,7 +335,7 @@ func TestConcurrentOneKey(t *testing.T) {
 					defer wg.Done()
 
 					it := newIterAdapter(l.NewIter(nil, nil))
-					it.SeekGE(key)
+					it.SeekGE(key, base.SeekGEFlagsNone)
 					require.True(t, it.Valid())
 					require.True(t, bytes.Equal(key, it.Key().UserKey))
 
@@ -367,7 +367,7 @@ func TestSkiplistAdd(t *testing.T) {
 			// Add nil key and value (treated same as empty).
 			err := add(base.InternalKey{}, nil)
 			require.Nil(t, err)
-			require.True(t, it.SeekGE([]byte{}))
+			require.True(t, it.SeekGE([]byte{}, base.SeekGEFlagsNone))
 			require.EqualValues(t, []byte{}, it.Key().UserKey)
 			require.EqualValues(t, []byte{}, it.Value())
 
@@ -382,35 +382,35 @@ func TestSkiplistAdd(t *testing.T) {
 			// Add empty key and value (treated same as nil).
 			err = add(makeIkey(""), []byte{})
 			require.Nil(t, err)
-			require.True(t, it.SeekGE([]byte{}))
+			require.True(t, it.SeekGE([]byte{}, base.SeekGEFlagsNone))
 			require.EqualValues(t, []byte{}, it.Key().UserKey)
 			require.EqualValues(t, []byte{}, it.Value())
 
 			// Add to empty list.
 			err = add(makeIntKey(2), makeValue(2))
 			require.Nil(t, err)
-			require.True(t, it.SeekGE(makeKey("00002")))
+			require.True(t, it.SeekGE(makeKey("00002"), base.SeekGEFlagsNone))
 			require.EqualValues(t, "00002", it.Key().UserKey)
 			require.EqualValues(t, makeValue(2), it.Value())
 
 			// Add first element in non-empty list.
 			err = add(makeIntKey(1), makeValue(1))
 			require.Nil(t, err)
-			require.True(t, it.SeekGE(makeKey("00001")))
+			require.True(t, it.SeekGE(makeKey("00001"), base.SeekGEFlagsNone))
 			require.EqualValues(t, "00001", it.Key().UserKey)
 			require.EqualValues(t, makeValue(1), it.Value())
 
 			// Add last element in non-empty list.
 			err = add(makeIntKey(4), makeValue(4))
 			require.Nil(t, err)
-			require.True(t, it.SeekGE(makeKey("00004")))
+			require.True(t, it.SeekGE(makeKey("00004"), base.SeekGEFlagsNone))
 			require.EqualValues(t, "00004", it.Key().UserKey)
 			require.EqualValues(t, makeValue(4), it.Value())
 
 			// Add element in middle of list.
 			err = add(makeIntKey(3), makeValue(3))
 			require.Nil(t, err)
-			require.True(t, it.SeekGE(makeKey("00003")))
+			require.True(t, it.SeekGE(makeKey("00003"), base.SeekGEFlagsNone))
 			require.EqualValues(t, "00003", it.Key().UserKey)
 			require.EqualValues(t, makeValue(3), it.Value())
 
@@ -457,7 +457,7 @@ func TestConcurrentAdd(t *testing.T) {
 
 						key := makeIntKey(i)
 						if add(key, nil) == nil {
-							require.True(t, it.SeekGE(key.UserKey))
+							require.True(t, it.SeekGE(key.UserKey, base.SeekGEFlagsNone))
 							require.EqualValues(t, key, it.Key())
 						}
 
@@ -544,62 +544,100 @@ func TestIteratorSeekGEAndSeekPrefixGE(t *testing.T) {
 		ins.Add(l, makeIntKey(v), makeValue(v))
 	}
 
-	require.True(t, it.SeekGE(makeKey("")))
+	require.True(t, it.SeekGE(makeKey(""), base.SeekGEFlagsNone))
 	require.True(t, it.Valid())
 	require.EqualValues(t, "01000", it.Key().UserKey)
 	require.EqualValues(t, "v01000", it.Value())
 
-	require.True(t, it.SeekGE(makeKey("01000")))
+	require.True(t, it.SeekGE(makeKey("01000"), base.SeekGEFlagsNone))
 	require.True(t, it.Valid())
 	require.EqualValues(t, "01000", it.Key().UserKey)
 	require.EqualValues(t, "v01000", it.Value())
 
-	require.True(t, it.SeekGE(makeKey("01005")))
+	require.True(t, it.SeekGE(makeKey("01005"), base.SeekGEFlagsNone))
 	require.True(t, it.Valid())
 	require.EqualValues(t, "01010", it.Key().UserKey)
 	require.EqualValues(t, "v01010", it.Value())
 
-	require.True(t, it.SeekGE(makeKey("01010")))
+	require.True(t, it.SeekGE(makeKey("01010"), base.SeekGEFlagsNone))
 	require.True(t, it.Valid())
 	require.EqualValues(t, "01010", it.Key().UserKey)
 	require.EqualValues(t, "v01010", it.Value())
 
-	require.False(t, it.SeekGE(makeKey("99999")))
+	require.False(t, it.SeekGE(makeKey("99999"), base.SeekGEFlagsNone))
 	require.False(t, it.Valid())
 
-	// Test SeekPrefixGE with trySeekUsingNext optimization.
+	// Test SeekGE with trySeekUsingNext optimization.
 	{
-		require.True(t, it.SeekPrefixGE(makeKey("01000"), makeKey("01000"), false))
+		require.True(t, it.SeekGE(makeKey("01000"), base.SeekGEFlagsNone))
 		require.True(t, it.Valid())
 		require.EqualValues(t, "01000", it.Key().UserKey)
 		require.EqualValues(t, "v01000", it.Value())
 
 		// Seeking to the same key.
-		require.True(t, it.SeekPrefixGE(makeKey("01000"), makeKey("01000"), true))
+		require.True(t, it.SeekGE(makeKey("01000"), base.SeekGEFlagsNone.EnableTrySeekUsingNext()))
 		require.True(t, it.Valid())
 		require.EqualValues(t, "01000", it.Key().UserKey)
 		require.EqualValues(t, "v01000", it.Value())
 
 		// Seeking to a nearby key that can be reached using Next.
-		require.True(t, it.SeekPrefixGE(makeKey("01020"), makeKey("01020"), true))
+		require.True(t, it.SeekGE(makeKey("01020"), base.SeekGEFlagsNone.EnableTrySeekUsingNext()))
 		require.True(t, it.Valid())
 		require.EqualValues(t, "01020", it.Key().UserKey)
 		require.EqualValues(t, "v01020", it.Value())
 
 		// Seeking to a key that cannot be reached using Next.
-		require.True(t, it.SeekPrefixGE(makeKey("01200"), makeKey("01200"), true))
+		require.True(t, it.SeekGE(makeKey("01200"), base.SeekGEFlagsNone.EnableTrySeekUsingNext()))
 		require.True(t, it.Valid())
 		require.EqualValues(t, "01200", it.Key().UserKey)
 		require.EqualValues(t, "v01200", it.Value())
 
 		// Seeking to an earlier key, but the caller lies. Incorrect result.
-		require.True(t, it.SeekPrefixGE(makeKey("01100"), makeKey("01100"), true))
+		require.True(t, it.SeekGE(makeKey("01100"), base.SeekGEFlagsNone.EnableTrySeekUsingNext()))
 		require.True(t, it.Valid())
 		require.EqualValues(t, "01200", it.Key().UserKey)
 		require.EqualValues(t, "v01200", it.Value())
 
 		// Telling the truth works.
-		require.True(t, it.SeekPrefixGE(makeKey("01100"), makeKey("01100"), false))
+		require.True(t, it.SeekGE(makeKey("01100"), base.SeekGEFlagsNone))
+		require.True(t, it.Valid())
+		require.EqualValues(t, "01100", it.Key().UserKey)
+		require.EqualValues(t, "v01100", it.Value())
+	}
+
+	// Test SeekPrefixGE with trySeekUsingNext optimization.
+	{
+		require.True(t, it.SeekPrefixGE(makeKey("01000"), makeKey("01000"), base.SeekGEFlagsNone))
+		require.True(t, it.Valid())
+		require.EqualValues(t, "01000", it.Key().UserKey)
+		require.EqualValues(t, "v01000", it.Value())
+
+		// Seeking to the same key.
+		require.True(t, it.SeekPrefixGE(makeKey("01000"), makeKey("01000"), base.SeekGEFlagsNone.EnableTrySeekUsingNext()))
+		require.True(t, it.Valid())
+		require.EqualValues(t, "01000", it.Key().UserKey)
+		require.EqualValues(t, "v01000", it.Value())
+
+		// Seeking to a nearby key that can be reached using Next.
+		require.True(t, it.SeekPrefixGE(makeKey("01020"), makeKey("01020"), base.SeekGEFlagsNone.EnableTrySeekUsingNext()))
+		require.True(t, it.Valid())
+		require.EqualValues(t, "01020", it.Key().UserKey)
+		require.EqualValues(t, "v01020", it.Value())
+
+		// Seeking to a key that cannot be reached using Next.
+		require.True(t, it.SeekPrefixGE(makeKey("01200"), makeKey("01200"), base.SeekGEFlagsNone.EnableTrySeekUsingNext()))
+		require.True(t, it.Valid())
+		require.EqualValues(t, "01200", it.Key().UserKey)
+		require.EqualValues(t, "v01200", it.Value())
+
+		// Seeking to an earlier key, but the caller lies. Incorrect result.
+		require.True(t, it.SeekPrefixGE(makeKey("01100"), makeKey("01100"), base.SeekGEFlagsNone.EnableTrySeekUsingNext()))
+		require.True(t, it.Valid())
+		require.EqualValues(t, "01200", it.Key().UserKey)
+		require.EqualValues(t, "v01200", it.Value())
+
+		// Telling the truth works.
+		require.True(t, it.SeekPrefixGE(makeKey("01100"), makeKey("01100"), base.SeekGEFlagsNone))
 		require.True(t, it.Valid())
 		require.EqualValues(t, "01100", it.Key().UserKey)
 		require.EqualValues(t, "v01100", it.Value())
@@ -607,11 +645,11 @@ func TestIteratorSeekGEAndSeekPrefixGE(t *testing.T) {
 
 	// Test seek for empty key.
 	ins.Add(l, base.InternalKey{}, nil)
-	require.True(t, it.SeekGE([]byte{}))
+	require.True(t, it.SeekGE([]byte{}, base.SeekGEFlagsNone))
 	require.True(t, it.Valid())
 	require.EqualValues(t, "", it.Key().UserKey)
 
-	require.True(t, it.SeekGE(makeKey("")))
+	require.True(t, it.SeekGE(makeKey(""), base.SeekGEFlagsNone))
 	require.True(t, it.Valid())
 	require.EqualValues(t, "", it.Key().UserKey)
 }
@@ -631,38 +669,38 @@ func TestIteratorSeekLT(t *testing.T) {
 		ins.Add(l, makeIntKey(v), makeValue(v))
 	}
 
-	require.False(t, it.SeekLT(makeKey("")))
+	require.False(t, it.SeekLT(makeKey(""), base.SeekLTFlagsNone))
 	require.False(t, it.Valid())
 
-	require.False(t, it.SeekLT(makeKey("01000")))
+	require.False(t, it.SeekLT(makeKey("01000"), base.SeekLTFlagsNone))
 	require.False(t, it.Valid())
 
-	require.True(t, it.SeekLT(makeKey("01001")))
+	require.True(t, it.SeekLT(makeKey("01001"), base.SeekLTFlagsNone))
 	require.True(t, it.Valid())
 	require.EqualValues(t, "01000", it.Key().UserKey)
 	require.EqualValues(t, "v01000", it.Value())
 
-	require.True(t, it.SeekLT(makeKey("01005")))
+	require.True(t, it.SeekLT(makeKey("01005"), base.SeekLTFlagsNone))
 	require.True(t, it.Valid())
 	require.EqualValues(t, "01000", it.Key().UserKey)
 	require.EqualValues(t, "v01000", it.Value())
 
-	require.True(t, it.SeekLT(makeKey("01991")))
+	require.True(t, it.SeekLT(makeKey("01991"), base.SeekLTFlagsNone))
 	require.True(t, it.Valid())
 	require.EqualValues(t, "01990", it.Key().UserKey)
 	require.EqualValues(t, "v01990", it.Value())
 
-	require.True(t, it.SeekLT(makeKey("99999")))
+	require.True(t, it.SeekLT(makeKey("99999"), base.SeekLTFlagsNone))
 	require.True(t, it.Valid())
 	require.EqualValues(t, "01990", it.Key().UserKey)
 	require.EqualValues(t, "v01990", it.Value())
 
 	// Test seek for empty key.
 	ins.Add(l, base.InternalKey{}, nil)
-	require.False(t, it.SeekLT([]byte{}))
+	require.False(t, it.SeekLT([]byte{}, base.SeekLTFlagsNone))
 	require.False(t, it.Valid())
 
-	require.True(t, it.SeekLT(makeKey("\x01")))
+	require.True(t, it.SeekLT(makeKey("\x01"), base.SeekLTFlagsNone))
 	require.True(t, it.Valid())
 	require.EqualValues(t, "", it.Key().UserKey)
 }
@@ -683,7 +721,7 @@ func TestIteratorBounds(t *testing.T) {
 	// SeekGE within the lower and upper bound succeeds.
 	for i := 3; i <= 6; i++ {
 		k := key(i)
-		require.True(t, it.SeekGE(k))
+		require.True(t, it.SeekGE(k, base.SeekGEFlagsNone))
 		require.EqualValues(t, string(k), string(it.Key().UserKey))
 	}
 
@@ -691,16 +729,16 @@ func TestIteratorBounds(t *testing.T) {
 	// checked).
 	for i := 1; i < 3; i++ {
 		k := key(i)
-		require.True(t, it.SeekGE(k))
+		require.True(t, it.SeekGE(k, base.SeekGEFlagsNone))
 		require.EqualValues(t, string(k), string(it.Key().UserKey))
 	}
 
 	// SeekGE beyond the upper bound fails.
 	for i := 7; i < 10; i++ {
-		require.False(t, it.SeekGE(key(i)))
+		require.False(t, it.SeekGE(key(i), base.SeekGEFlagsNone))
 	}
 
-	require.True(t, it.SeekGE(key(6)))
+	require.True(t, it.SeekGE(key(6), base.SeekGEFlagsNone))
 	require.EqualValues(t, "00006", it.Key().UserKey)
 	require.EqualValues(t, "v00006", it.Value())
 
@@ -709,23 +747,23 @@ func TestIteratorBounds(t *testing.T) {
 
 	// SeekLT within the lower and upper bound succeeds.
 	for i := 4; i <= 7; i++ {
-		require.True(t, it.SeekLT(key(i)))
+		require.True(t, it.SeekLT(key(i), base.SeekLTFlagsNone))
 		require.EqualValues(t, string(key(i-1)), string(it.Key().UserKey))
 	}
 
 	// SeekLT beyond the upper bound still succeeds (only the lower bound is
 	// checked).
 	for i := 8; i < 9; i++ {
-		require.True(t, it.SeekLT(key(8)))
+		require.True(t, it.SeekLT(key(8), base.SeekLTFlagsNone))
 		require.EqualValues(t, string(key(i-1)), string(it.Key().UserKey))
 	}
 
 	// SeekLT before the lower bound fails.
 	for i := 1; i < 4; i++ {
-		require.False(t, it.SeekLT(key(i)))
+		require.False(t, it.SeekLT(key(i), base.SeekLTFlagsNone))
 	}
 
-	require.True(t, it.SeekLT(key(4)))
+	require.True(t, it.SeekLT(key(4), base.SeekLTFlagsNone))
 	require.EqualValues(t, "00003", it.Key().UserKey)
 	require.EqualValues(t, "v00003", it.Value())
 
@@ -786,7 +824,7 @@ func BenchmarkReadWrite(b *testing.B) {
 
 				for pb.Next() {
 					if rng.Float32() < readFrac {
-						key, _ := it.SeekGE(randomKey(rng, buf).UserKey)
+						key, _ := it.SeekGE(randomKey(rng, buf).UserKey, base.SeekGEFlagsNone)
 						if key != nil {
 							_ = key
 							count++
@@ -882,17 +920,20 @@ func BenchmarkSeekPrefixGE(b *testing.B) {
 					k = []byte(fmt.Sprintf("%05d", j))
 				}
 				makeKey()
-				it.SeekPrefixGE(k, k, false)
+				it.SeekPrefixGE(k, k, base.SeekGEFlagsNone)
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
 					j += skip
-					trySeekUsingNext := useNext
+					var flags base.SeekGEFlags
+					if useNext {
+						flags = flags.EnableTrySeekUsingNext()
+					}
 					if j >= count {
 						j = 0
-						trySeekUsingNext = false
+						flags = flags.DisableTrySeekUsingNext()
 					}
 					makeKey()
-					it.SeekPrefixGE(k, k, trySeekUsingNext)
+					it.SeekPrefixGE(k, k, flags)
 				}
 			})
 		}

@@ -8,7 +8,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math"
 	"os"
 	"sort"
@@ -38,6 +37,18 @@ const (
 	maxMemTableSize = 4 << 30 // 4 GB
 )
 
+// TableCacheSize can be used to determine the table
+// cache size for a single db, given the maximum open
+// files which can be used by a table cache which is
+// only used by a single db.
+func TableCacheSize(maxOpenFiles int) int {
+	tableCacheSize := maxOpenFiles - numNonTableCacheFiles
+	if tableCacheSize < minTableCacheSize {
+		tableCacheSize = minTableCacheSize
+	}
+	return tableCacheSize
+}
+
 // Open opens a DB whose files live in the given directory.
 func Open(dirname string, opts *Options) (db *DB, _ error) {
 	// Make a copy of the options so that we don't mutate the passed in options.
@@ -59,7 +70,7 @@ func Open(dirname string, opts *Options) (db *DB, _ error) {
 		walDirname:          opts.WALDir,
 		opts:                opts,
 		cmp:                 opts.Comparer.Compare,
-		equal:               opts.Comparer.Equal,
+		equal:               opts.equal(),
 		merge:               opts.Merger.Merge,
 		split:               opts.Comparer.Split,
 		abbreviatedKey:      opts.Comparer.AbbreviatedKey,
@@ -101,16 +112,10 @@ func Open(dirname string, opts *Options) (db *DB, _ error) {
 		}
 	}()
 
-	if d.equal == nil {
-		d.equal = bytes.Equal
-	}
-
-	tableCacheSize := opts.MaxOpenFiles - NumNonTableCacheFiles
-	if tableCacheSize < MinTableCacheSize {
-		tableCacheSize = MinTableCacheSize
-	}
+	tableCacheSize := TableCacheSize(opts.MaxOpenFiles)
 	d.tableCache = newTableCacheContainer(opts.TableCache, d.cacheID, dirname, opts.FS, d.opts, tableCacheSize)
 	d.newIters = d.tableCache.newIters
+	d.tableNewRangeKeyIter = d.tableCache.newRangeKeyIter
 
 	d.commit = newCommitPipeline(commitEnv{
 		logSeqNum:     &d.mu.versions.atomic.logSeqNum,
@@ -118,12 +123,6 @@ func Open(dirname string, opts *Options) (db *DB, _ error) {
 		apply:         d.commitApply,
 		write:         d.commitWrite,
 	})
-	d.compactionLimiter = rate.NewLimiter(
-		rate.Limit(d.opts.private.minCompactionRate),
-		d.opts.private.minCompactionRate)
-	d.flushLimiter = rate.NewLimiter(
-		rate.Limit(d.opts.private.minFlushRate),
-		d.opts.private.minFlushRate)
 	d.deletionLimiter = rate.NewLimiter(
 		rate.Limit(d.opts.Experimental.MinDeletionRate),
 		d.opts.Experimental.MinDeletionRate)
@@ -136,6 +135,7 @@ func Open(dirname string, opts *Options) (db *DB, _ error) {
 	d.mu.cleaner.cond.L = &d.mu.Mutex
 	d.mu.compact.cond.L = &d.mu.Mutex
 	d.mu.compact.inProgress = make(map[*compaction]struct{})
+	d.mu.compact.noOngoingFlushStartTime = time.Now()
 	d.mu.snapshots.init()
 	// logSeqNum is the next sequence number that will be assigned. Start
 	// assigning sequence numbers from 1 to match rocksdb.
@@ -152,6 +152,24 @@ func Open(dirname string, opts *Options) (db *DB, _ error) {
 			return nil, err
 		}
 	}
+
+	// Ensure we close resources if we error out early. If the database is
+	// successfully opened, the named return value `db` will be set to `d`.
+	defer func() {
+		if db != nil {
+			// The database was successfully opened.
+			return
+		}
+		if d.dataDir != nil {
+			d.dataDir.Close()
+		}
+		if d.walDirname != d.dirname && d.walDir != nil {
+			d.walDir.Close()
+		}
+		if d.mu.formatVers.marker != nil {
+			d.mu.formatVers.marker.Close()
+		}
+	}()
 
 	// Open the database and WAL directories first in order to check for their
 	// existence.
@@ -179,7 +197,7 @@ func Open(dirname string, opts *Options) (db *DB, _ error) {
 	}
 
 	// Lock the database directory.
-	fileLock, err := opts.FS.Lock(base.MakeFilename(opts.FS, dirname, fileTypeLock, 0))
+	fileLock, err := opts.FS.Lock(base.MakeFilepath(opts.FS, dirname, fileTypeLock, 0))
 	if err != nil {
 		d.dataDir.Close()
 		if d.dataDir != d.walDir {
@@ -212,6 +230,15 @@ func Open(dirname string, opts *Options) (db *DB, _ error) {
 	// Find the currently active manifest, if there is one.
 	manifestMarker, manifestFileNum, exists, err := findCurrentManifest(d.mu.formatVers.vers, opts.FS, dirname)
 	setCurrent := setCurrentFunc(d.mu.formatVers.vers, manifestMarker, opts.FS, dirname, d.dataDir)
+	defer func() {
+		// Ensure we close the manifest marker if we error out for any reason.
+		// If the database is successfully opened, the *versionSet will take
+		// ownership over the manifest marker, ensuring it's closed when the DB
+		// is closed.
+		if db == nil {
+			manifestMarker.Close()
+		}
+	}()
 	if err != nil {
 		return nil, errors.Wrapf(err, "pebble: database %q", dirname)
 	} else if !exists && !d.opts.ReadOnly && !d.opts.ErrorIfNotExists {
@@ -230,7 +257,6 @@ func Open(dirname string, opts *Options) (db *DB, _ error) {
 		if err := d.mu.versions.currentVersion().CheckConsistency(dirname, opts.FS); err != nil {
 			return nil, err
 		}
-
 	}
 
 	// If the Options specify a format major version higher than the
@@ -363,13 +389,13 @@ func Open(dirname string, opts *Options) (db *DB, _ error) {
 		// crash before the manifest is synced could leave two WALs with
 		// unclean tails.
 		d.mu.versions.logLock()
-		if err := d.mu.versions.logAndApply(jobID, &ve, newFileMetrics(ve.NewFiles), func() []compactionInfo {
+		if err := d.mu.versions.logAndApply(jobID, &ve, newFileMetrics(ve.NewFiles), false /* forceRotation */, func() []compactionInfo {
 			return nil
 		}); err != nil {
 			return nil, err
 		}
 
-		newLogName := base.MakeFilename(opts.FS, d.walDirname, fileTypeLog, newLogNum)
+		newLogName := base.MakeFilepath(opts.FS, d.walDirname, fileTypeLog, newLogNum)
 		d.mu.log.queue = append(d.mu.log.queue, fileInfo{fileNum: newLogNum, fileSize: 0})
 		logFile, err := opts.FS.Create(newLogName)
 		if err != nil {
@@ -388,6 +414,7 @@ func Open(dirname string, opts *Options) (db *DB, _ error) {
 		d.mu.mem.queue[len(d.mu.mem.queue)-1].logNum = newLogNum
 
 		logFile = vfs.NewSyncingFile(logFile, vfs.SyncingFileOptions{
+			NoSyncOnClose:   d.opts.NoSyncOnClose,
 			BytesPerSync:    d.opts.WALBytesPerSync,
 			PreallocateSize: d.walPreallocateSize(),
 		})
@@ -400,8 +427,8 @@ func Open(dirname string, opts *Options) (db *DB, _ error) {
 	if !d.opts.ReadOnly {
 		// Write the current options to disk.
 		d.optionsFileNum = d.mu.versions.getNextFileNum()
-		tmpPath := base.MakeFilename(opts.FS, dirname, fileTypeTemp, d.optionsFileNum)
-		optionsPath := base.MakeFilename(opts.FS, dirname, fileTypeOptions, d.optionsFileNum)
+		tmpPath := base.MakeFilepath(opts.FS, dirname, fileTypeTemp, d.optionsFileNum)
+		optionsPath := base.MakeFilepath(opts.FS, dirname, fileTypeOptions, d.optionsFileNum)
 
 		// Write them to a temporary file first, in case we crash before
 		// we're done. A corrupt options file prevents opening the
@@ -440,8 +467,9 @@ func Open(dirname string, opts *Options) (db *DB, _ error) {
 		d.mu.versions.metrics.WAL.Files = int64(len(logFiles))
 	}
 	d.mu.tableStats.cond.L = &d.mu.Mutex
+	d.mu.tableValidation.cond.L = &d.mu.Mutex
 	if !d.opts.ReadOnly && !d.opts.private.disableTableStats {
-		d.maybeCollectTableStats()
+		d.maybeCollectTableStatsLocked()
 	}
 	d.calculateDiskAvailableBytes()
 
@@ -509,7 +537,7 @@ func GetVersion(dir string, fs vfs.FS) (string, error) {
 			if err != nil {
 				return "", err
 			}
-			data, err := ioutil.ReadAll(f)
+			data, err := io.ReadAll(f)
 			f.Close()
 
 			if err != nil {
@@ -671,8 +699,8 @@ func (d *DB) replayWAL(
 	// mem is nil here.
 	if !d.opts.ReadOnly {
 		c := newFlush(d.opts, d.mu.versions.currentVersion(),
-			1 /* base level */, toFlush, &d.atomic.bytesFlushed)
-		newVE, _, err := d.runCompaction(jobID, c, nilPacer)
+			1 /* base level */, toFlush)
+		newVE, _, err := d.runCompaction(jobID, c)
 		if err != nil {
 			return 0, err
 		}
@@ -691,7 +719,7 @@ func checkOptions(opts *Options, path string) (strictWALTail bool, err error) {
 	}
 	defer f.Close()
 
-	data, err := ioutil.ReadAll(f)
+	data, err := io.ReadAll(f)
 	if err != nil {
 		return false, err
 	}
@@ -740,7 +768,7 @@ func Peek(dirname string, fs vfs.FS) (*DBDesc, error) {
 		FormatMajorVersion: vers,
 	}
 	if exists {
-		desc.ManifestFilename = base.MakeFilename(fs, dirname, fileTypeManifest, manifestFileNum)
+		desc.ManifestFilename = base.MakeFilepath(fs, dirname, fileTypeManifest, manifestFileNum)
 	}
 	return desc, nil
 }

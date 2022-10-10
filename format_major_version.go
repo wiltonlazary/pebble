@@ -10,6 +10,8 @@ import (
 
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
+	"github.com/cockroachdb/pebble/internal/manifest"
+	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/cockroachdb/pebble/vfs/atomicfs"
 )
@@ -38,6 +40,8 @@ func (v FormatMajorVersion) String() string {
 }
 
 const (
+	// 21.2 versions.
+
 	// FormatDefault leaves the format version unspecified. The
 	// FormatDefault constant may be ratcheted upwards over time.
 	FormatDefault FormatMajorVersion = iota
@@ -66,9 +70,94 @@ const (
 	// kind, base.InternalKeyKindSetWithDelete. Previous Pebble versions will be
 	// unable to open this database.
 	FormatSetWithDelete
+
+	// 22.1 versions.
+
+	// FormatBlockPropertyCollector is a format major version that introduces
+	// BlockPropertyCollectors.
+	FormatBlockPropertyCollector
+	// FormatSplitUserKeysMarked is a format major version that guarantees that
+	// all files that share user keys with neighbors are marked for compaction
+	// in the manifest. Ratcheting to FormatSplitUserKeysMarked will block
+	// (without holding mutexes) until the scan of the LSM is complete and the
+	// manifest has been rotated.
+	FormatSplitUserKeysMarked
+
+	// 22.2 versions.
+
+	// FormatSplitUserKeysMarkedCompacted is a format major version that
+	// guarantees that all files explicitly marked for compaction in the manifest
+	// have been compacted. Combined with the FormatSplitUserKeysMarked format
+	// major version, this version guarantees that there are no user keys split
+	// across multiple files within a level L1+. Ratcheting to this format version
+	// will block (without holding mutexes) until all necessary compactions for
+	// files marked for compaction are complete.
+	FormatSplitUserKeysMarkedCompacted
+	// FormatRangeKeys is a format major version that introduces range keys.
+	FormatRangeKeys
+	// FormatMinTableFormatPebblev1 is a format major version that guarantees that
+	// tables created by or ingested into the DB at or above this format major
+	// version will have a table format version of at least Pebblev1 (Block
+	// Properties).
+	FormatMinTableFormatPebblev1
+	// FormatPrePebblev1Marked is a format major version that guarantees that all
+	// sstables with a table format version pre-Pebblev1 (i.e. those that are
+	// guaranteed to not contain block properties) are marked for compaction in
+	// the manifest. Ratcheting to FormatPrePebblev1Marked will block (without
+	// holding mutexes) until the scan of the LSM is complete and the manifest has
+	// been rotated.
+	FormatPrePebblev1Marked
+
+	// 23.1 versions.
+
+	// FormatPrePebblev1MarkedCompacted is a format major version that
+	// guarantees that all sstables explicitly marked for compaction in the
+	// manifest have been compacted. Ratcheting to this format version will block
+	// (without holding mutexes) until all necessary compactions for files marked
+	// for compaction are complete.
+	FormatPrePebblev1MarkedCompacted
+
 	// FormatNewest always contains the most recent format major version.
-	FormatNewest FormatMajorVersion = FormatSetWithDelete
+	// NB: When adding new versions, the MaxTableFormat method should also be
+	// updated to return the maximum allowable version for the new
+	// FormatMajorVersion.
+	FormatNewest FormatMajorVersion = FormatPrePebblev1MarkedCompacted
 )
+
+// MaxTableFormat returns the maximum sstable.TableFormat that can be used at
+// this FormatMajorVersion.
+func (v FormatMajorVersion) MaxTableFormat() sstable.TableFormat {
+	switch v {
+	case FormatDefault, FormatMostCompatible, formatVersionedManifestMarker,
+		FormatVersioned, FormatSetWithDelete:
+		return sstable.TableFormatRocksDBv2
+	case FormatBlockPropertyCollector, FormatSplitUserKeysMarked,
+		FormatSplitUserKeysMarkedCompacted:
+		return sstable.TableFormatPebblev1
+	case FormatRangeKeys, FormatMinTableFormatPebblev1, FormatPrePebblev1Marked,
+		FormatPrePebblev1MarkedCompacted:
+		return sstable.TableFormatPebblev2
+	default:
+		panic(fmt.Sprintf("pebble: unsupported format major version: %s", v))
+	}
+}
+
+// MinTableFormat returns the minimum sstable.TableFormat that can be used at
+// this FormatMajorVersion.
+func (v FormatMajorVersion) MinTableFormat() sstable.TableFormat {
+	switch v {
+	case FormatDefault, FormatMostCompatible, formatVersionedManifestMarker,
+		FormatVersioned, FormatSetWithDelete, FormatBlockPropertyCollector,
+		FormatSplitUserKeysMarked, FormatSplitUserKeysMarkedCompacted,
+		FormatRangeKeys:
+		return sstable.TableFormatLevelDB
+	case FormatMinTableFormatPebblev1, FormatPrePebblev1Marked,
+		FormatPrePebblev1MarkedCompacted:
+		return sstable.TableFormatPebblev1
+	default:
+		panic(fmt.Sprintf("pebble: unsupported format major version: %s", v))
+	}
+}
 
 // formatMajorVersionMigrations defines the migrations from one format
 // major version to the next. Each migration is defined as a closure
@@ -95,11 +184,7 @@ var formatMajorVersionMigrations = map[FormatMajorVersion]func(*DB) error{
 		// guaranteed to exist, because we unconditionally locate it
 		// during Open.
 		manifestFileNum := d.mu.versions.manifestFileNum
-		filename := d.mu.versions.fs.PathBase(base.MakeFilename(
-			d.mu.versions.fs,
-			d.mu.versions.dirname,
-			fileTypeManifest,
-			manifestFileNum))
+		filename := base.MakeFilename(fileTypeManifest, manifestFileNum)
 		if err := d.mu.versions.manifestMarker.Move(filename); err != nil {
 			return errors.Wrap(err, "moving manifest marker")
 		}
@@ -107,7 +192,7 @@ var formatMajorVersionMigrations = map[FormatMajorVersion]func(*DB) error{
 		// Now that we have a manifest marker file in place and pointing
 		// to the current MANIFEST, finalize the upgrade. If we fail for
 		// some reason, a retry of this migration is guaranteed to again
-		// move the manfiest marker file to the latest manifest. If
+		// move the manifest marker file to the latest manifest. If
 		// we're unable to finalize the upgrade, a subsequent call to
 		// Open will ignore the manifest marker.
 		if err := d.finalizeFormatVersUpgrade(formatVersionedManifestMarker); err != nil {
@@ -146,6 +231,49 @@ var formatMajorVersionMigrations = map[FormatMajorVersion]func(*DB) error{
 	// simply finalize the format version and we're done.
 	FormatSetWithDelete: func(d *DB) error {
 		return d.finalizeFormatVersUpgrade(FormatSetWithDelete)
+	},
+	FormatBlockPropertyCollector: func(d *DB) error {
+		return d.finalizeFormatVersUpgrade(FormatBlockPropertyCollector)
+	},
+	FormatSplitUserKeysMarked: func(d *DB) error {
+		// Mark any unmarked files with split-user keys. Note all format major
+		// versions migrations are invoked with DB.mu locked.
+		if err := d.markFilesLocked(markFilesWithSplitUserKeys(d.opts.Comparer.Equal)); err != nil {
+			return err
+		}
+		return d.finalizeFormatVersUpgrade(FormatSplitUserKeysMarked)
+	},
+	FormatSplitUserKeysMarkedCompacted: func(d *DB) error {
+		// Before finalizing the format major version, rewrite any sstables
+		// still marked for compaction. Note all format major versions
+		// migrations are invoked with DB.mu locked.
+		if err := d.compactMarkedFilesLocked(); err != nil {
+			return err
+		}
+		return d.finalizeFormatVersUpgrade(FormatSplitUserKeysMarkedCompacted)
+	},
+	FormatRangeKeys: func(d *DB) error {
+		return d.finalizeFormatVersUpgrade(FormatRangeKeys)
+	},
+	FormatMinTableFormatPebblev1: func(d *DB) error {
+		return d.finalizeFormatVersUpgrade(FormatMinTableFormatPebblev1)
+	},
+	FormatPrePebblev1Marked: func(d *DB) error {
+		// Mark any unmarked files that contain only table properties. Note all
+		// format major versions migrations are invoked with DB.mu locked.
+		if err := d.markFilesLocked(markFilesPrePebblev1(d.tableCache)); err != nil {
+			return err
+		}
+		return d.finalizeFormatVersUpgrade(FormatPrePebblev1Marked)
+	},
+	FormatPrePebblev1MarkedCompacted: func(d *DB) error {
+		// Before finalizing the format major version, rewrite any sstables
+		// still marked for compaction. Note all format major versions
+		// migrations are invoked with DB.mu locked.
+		if err := d.compactMarkedFilesLocked(); err != nil {
+			return err
+		}
+		return d.finalizeFormatVersUpgrade(FormatPrePebblev1MarkedCompacted)
 	},
 }
 
@@ -213,6 +341,12 @@ func (d *DB) ratchetFormatMajorVersionLocked(formatVers FormatMajorVersion) erro
 		return errors.Newf("pebble: database already at format major version %d; cannot reduce to %d",
 			d.mu.formatVers.vers, formatVers)
 	}
+	if d.mu.formatVers.ratcheting {
+		return errors.Newf("pebble: database format major version upgrade is in-progress")
+	}
+	d.mu.formatVers.ratcheting = true
+	defer func() { d.mu.formatVers.ratcheting = false }()
+
 	for nextVers := d.mu.formatVers.vers + 1; nextVers <= formatVers; nextVers++ {
 		if err := formatMajorVersionMigrations[nextVers](d); err != nil {
 			return errors.Wrapf(err, "migrating to version %d", nextVers)
@@ -246,4 +380,193 @@ func (d *DB) finalizeFormatVersUpgrade(formatVers FormatMajorVersion) error {
 	d.mu.formatVers.vers = formatVers
 	d.opts.EventListener.FormatUpgrade(formatVers)
 	return nil
+}
+
+// compactMarkedFilesLocked performs a migration that schedules rewrite
+// compactions to compact away any sstables marked for compaction.
+// compactMarkedFilesLocked is run while ratcheting the database's format major
+// version to FormatSplitUserKeysMarkedCompacted.
+//
+// Note that while this method is called with the DB.mu held, and will not
+// return until all marked files have been compacted, the mutex is dropped while
+// waiting for compactions to complete (or for slots to free up).
+func (d *DB) compactMarkedFilesLocked() error {
+	curr := d.mu.versions.currentVersion()
+	for curr.Stats.MarkedForCompaction > 0 {
+		// Attempt to schedule a compaction to rewrite a file marked for
+		// compaction.
+		d.maybeScheduleCompactionPicker(func(picker compactionPicker, env compactionEnv) *pickedCompaction {
+			return picker.pickRewriteCompaction(env)
+		})
+
+		// The above attempt might succeed and schedule a rewrite compaction. Or
+		// there might not be available compaction concurrency to schedule the
+		// compaction.  Or compaction of the file might have already been in
+		// progress. In any scenario, wait until there's some change in the
+		// state of active compactions.
+
+		// Before waiting, check that the database hasn't been closed. Trying to
+		// schedule the compaction may have dropped d.mu while waiting for a
+		// manifest write to complete. In that dropped interim, the database may
+		// have been closed.
+		if err := d.closed.Load(); err != nil {
+			return err.(error)
+		}
+		// NB: Waiting on this condition variable drops d.mu while blocked.
+		d.mu.compact.cond.Wait()
+
+		// Some flush or compaction was scheduled or completed. Loop again to
+		// check again for files that must be compacted. The next iteration may
+		// find same file again, but that's okay. It'll eventually succeed in
+		// scheduling the compaction and eventually be woken by its completion.
+		curr = d.mu.versions.currentVersion()
+	}
+	return nil
+}
+
+// findFilesFunc scans the LSM for files, returning true if at least one
+// file was found. The returned array contains the matched files, if any, per
+// level.
+type findFilesFunc func(v *version) (found bool, files [numLevels][]*fileMetadata, _ error)
+
+// markFilesWithSplitUserKeys scans the LSM's levels 1 through 6 for adjacent
+// files that contain the same user key. Such arrangements of files were
+// permitted in RocksDB and in Pebble up to SHA a860bbad.
+var markFilesWithSplitUserKeys = func(equal Equal) findFilesFunc {
+	return func(v *version) (found bool, files [numLevels][]*fileMetadata, _ error) {
+		// Files with split user keys are expected to be rare and performing key
+		// comparisons for every file within the LSM is expensive, so drop the
+		// database lock while scanning the file metadata.
+		for l := numLevels - 1; l > 0; l-- {
+			iter := v.Levels[l].Iter()
+			var prevFile *fileMetadata
+			var prevUserKey []byte
+			for f := iter.First(); f != nil; f = iter.Next() {
+				if prevUserKey != nil && equal(prevUserKey, f.Smallest.UserKey) {
+					// NB: We may append a file twice, once as prevFile and once
+					// as f. That's okay, and handled below.
+					files[l] = append(files[l], prevFile, f)
+					found = true
+				}
+				if f.Largest.IsExclusiveSentinel() {
+					prevUserKey = nil
+					prevFile = nil
+				} else {
+					prevUserKey = f.Largest.UserKey
+					prevFile = f
+				}
+			}
+		}
+		return
+	}
+}
+
+// markFilesPrePebblev1 scans the LSM for files that do not support block
+// properties (i.e. a table format version pre-Pebblev1).
+var markFilesPrePebblev1 = func(tc *tableCacheContainer) findFilesFunc {
+	return func(v *version) (found bool, files [numLevels][]*fileMetadata, err error) {
+		for l := numLevels - 1; l > 0; l-- {
+			iter := v.Levels[l].Iter()
+			for f := iter.First(); f != nil; f = iter.Next() {
+				err = tc.withReader(f, func(r *sstable.Reader) error {
+					tf, err := r.TableFormat()
+					if err != nil {
+						return err
+					}
+					if tf < sstable.TableFormatPebblev1 {
+						found = true
+						files[l] = append(files[l], f)
+					}
+					return nil
+				})
+				if err != nil {
+					return
+				}
+			}
+		}
+		return
+	}
+}
+
+// markFilesLock durably marks the files that match the given findFilesFunc for
+// compaction.
+func (d *DB) markFilesLocked(findFn findFilesFunc) error {
+	jobID := d.mu.nextJobID
+	d.mu.nextJobID++
+
+	vers := d.mu.versions.currentVersion()
+	var (
+		found bool
+		files [numLevels][]*fileMetadata
+		err   error
+	)
+	func() {
+		// Note the unusual locking: unlock, defer Lock(). The scan of the files in
+		// the version does not need to block other operations that require the
+		// DB.mu. Drop it for the scan, before re-acquiring it.
+		d.mu.Unlock()
+		defer d.mu.Lock()
+		found, files, err = findFn(vers)
+	}()
+	if err != nil {
+		return err
+	}
+
+	// The database lock has been acquired again by the defer within the above
+	// anonymous function.
+	if !found {
+		// Nothing to do.
+		return nil
+	}
+
+	// After scanning, if we found files to mark, we fetch the current state of
+	// the LSM (which may have changed) and set MarkedForCompaction on the files,
+	// and update the version's Stats.MarkedForCompaction count, which are both
+	// protected by d.mu.
+
+	// Lock the manifest for a coherent view of the LSM. The database lock has
+	// been re-acquired by the defer within the above anonymous function.
+	d.mu.versions.logLock()
+	vers = d.mu.versions.currentVersion()
+	for l, filesToMark := range files {
+		if len(filesToMark) == 0 {
+			continue
+		}
+		for _, f := range filesToMark {
+			// Ignore files to be marked that have already been compacted or marked.
+			if f.CompactionState == manifest.CompactionStateCompacted ||
+				f.MarkedForCompaction {
+				continue
+			}
+			// Else, mark the file for compaction in this version.
+			vers.Stats.MarkedForCompaction++
+			f.MarkedForCompaction = true
+		}
+		// The compaction picker uses the markedForCompactionAnnotator to
+		// quickly find files marked for compaction, or to quickly determine
+		// that there are no such files marked for compaction within a level.
+		// A b-tree node may be annotated with an annotation recording that
+		// there are no files marked for compaction within the node's subtree,
+		// based on the assumption that it's static.
+		//
+		// Since we're marking files for compaction, these b-tree nodes'
+		// annotations will be out of date. Clear the compaction-picking
+		// annotation, so that it's recomputed the next time the compaction
+		// picker looks for a file marked for compaction.
+		vers.Levels[l].InvalidateAnnotation(markedForCompactionAnnotator{})
+	}
+
+	// The 'marked-for-compaction' bit is persisted in the MANIFEST file
+	// metadata. We've already modified the in-memory file metadata, but the
+	// manifest hasn't been updated. Force rotation to a new MANIFEST file,
+	// which will write every file metadata to the new manifest file and ensure
+	// that the now marked-for-compaction file metadata are persisted as marked.
+	// NB: This call to logAndApply will unlockthe MANIFEST, which we locked up
+	// above before obtaining `vers`.
+	return d.mu.versions.logAndApply(
+		jobID,
+		&manifest.VersionEdit{},
+		map[int]*LevelMetrics{},
+		true, /* forceRotation */
+		func() []compactionInfo { return d.getInProgressCompactionInfoLocked(nil) })
 }

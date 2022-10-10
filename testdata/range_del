@@ -88,22 +88,22 @@ seek-lt b
 seek-lt c
 seek-lt d
 ----
-a:d
-b:bcd
-c:d
+a: (d, .)
+b: (bcd, .)
+c: (d, .)
 .
-a:d
-b:bcd
-c:d
+a: (d, .)
+b: (bcd, .)
+c: (d, .)
 .
-c:d
-b:bcd
-a:d
+c: (d, .)
+b: (bcd, .)
+a: (d, .)
 .
 .
-a:d
-b:bcd
-c:d
+a: (d, .)
+b: (bcd, .)
+c: (d, .)
 
 iter seq=7
 first
@@ -121,20 +121,20 @@ seek-lt b
 seek-lt c
 seek-lt d
 ----
-a:d
-c:d
+a: (d, .)
+c: (d, .)
 .
-a:d
-c:d
-c:d
+a: (d, .)
+c: (d, .)
+c: (d, .)
 .
-c:d
-a:d
+c: (d, .)
+a: (d, .)
 .
 .
-a:d
-a:d
-c:d
+a: (d, .)
+a: (d, .)
+c: (d, .)
 
 # Multiple memtables.
 
@@ -230,22 +230,22 @@ seek-lt b
 seek-lt c
 seek-lt d
 ----
-a:d
-b:bcd
-c:d
+a: (d, .)
+b: (bcd, .)
+c: (d, .)
 .
-a:d
-b:bcd
-c:d
+a: (d, .)
+b: (bcd, .)
+c: (d, .)
 .
-c:d
-b:bcd
-a:d
+c: (d, .)
+b: (bcd, .)
+a: (d, .)
 .
 .
-a:d
-b:bcd
-c:d
+a: (d, .)
+b: (bcd, .)
+c: (d, .)
 
 iter seq=7
 first
@@ -263,20 +263,20 @@ seek-lt b
 seek-lt c
 seek-lt d
 ----
-a:d
-c:d
+a: (d, .)
+c: (d, .)
 .
-a:d
-c:d
-c:d
+a: (d, .)
+c: (d, .)
+c: (d, .)
 .
-c:d
-a:d
+c: (d, .)
+a: (d, .)
 .
 .
-a:d
-a:d
-c:d
+a: (d, .)
+a: (d, .)
+c: (d, .)
 
 # Overlapping range deletions in the same memtable.
 
@@ -374,15 +374,15 @@ prev
 prev
 prev
 ----
-a:1
-b:1
-c:1
-d:1
+a: (1, .)
+b: (1, .)
+c: (1, .)
+d: (1, .)
 .
-d:1
-c:1
-b:1
-a:1
+d: (1, .)
+c: (1, .)
+b: (1, .)
+a: (1, .)
 .
 
 iter seq=3
@@ -391,9 +391,9 @@ next
 last
 prev
 ----
-d:1
+d: (1, .)
 .
-d:1
+d: (1, .)
 .
 
 iter seq=5
@@ -404,11 +404,11 @@ last
 prev
 prev
 ----
-a:2
-d:2
+a: (2, .)
+d: (2, .)
 .
-d:2
-a:2
+d: (2, .)
+a: (2, .)
 .
 
 iter seq=7
@@ -421,13 +421,13 @@ prev
 prev
 prev
 ----
-a:3
-b:3
-d:3
+a: (3, .)
+b: (3, .)
+d: (3, .)
 .
-d:3
-b:3
-a:3
+d: (3, .)
+b: (3, .)
+a: (3, .)
 .
 
 iter seq=9
@@ -442,15 +442,15 @@ prev
 prev
 prev
 ----
-a:4
-b:4
-c:4
-d:4
+a: (4, .)
+b: (4, .)
+c: (4, .)
+d: (4, .)
 .
-d:4
-c:4
-b:4
-a:4
+d: (4, .)
+c: (4, .)
+b: (4, .)
+a: (4, .)
 .
 
 # Overlapping range deletions in different memtables. Note that the
@@ -550,15 +550,15 @@ prev
 prev
 prev
 ----
-a:1
-b:1
-c:1
-d:1
+a: (1, .)
+b: (1, .)
+c: (1, .)
+d: (1, .)
 .
-d:1
-c:1
-b:1
-a:1
+d: (1, .)
+c: (1, .)
+b: (1, .)
+a: (1, .)
 .
 
 iter seq=3
@@ -567,9 +567,9 @@ next
 last
 prev
 ----
-d:1
+d: (1, .)
 .
-d:1
+d: (1, .)
 .
 
 iter seq=5
@@ -580,11 +580,11 @@ last
 prev
 prev
 ----
-a:2
-d:2
+a: (2, .)
+d: (2, .)
 .
-d:2
-a:2
+d: (2, .)
+a: (2, .)
 .
 
 iter seq=7
@@ -597,13 +597,13 @@ prev
 prev
 prev
 ----
-a:3
-b:3
-d:3
+a: (3, .)
+b: (3, .)
+d: (3, .)
 .
-d:3
-b:3
-a:3
+d: (3, .)
+b: (3, .)
+a: (3, .)
 .
 
 iter seq=9
@@ -618,15 +618,15 @@ prev
 prev
 prev
 ----
-a:4
-b:4
-c:4
-d:4
+a: (4, .)
+b: (4, .)
+c: (4, .)
+d: (4, .)
 .
-d:4
-c:4
-b:4
-a:4
+d: (4, .)
+c: (4, .)
+b: (4, .)
+a: (4, .)
 .
 
 # User-key that spans tables in a level.
@@ -641,9 +641,9 @@ L1
 ----
 mem: 1
 1:
-  000004:[a-a]
-  000005:[a-a]
-  000006:[a-a]
+  000004:[a#3,SET-a#3,SET]
+  000005:[a#2,SET-a#2,SET]
+  000006:[a#1,SET-a#1,SET]
 
 get seq=1
 a
@@ -673,12 +673,12 @@ last
 seek-lt a
 seek-lt b
 ----
-a:1
-a:1
+a: (1, .)
+a: (1, .)
 .
-a:1
+a: (1, .)
 .
-a:1
+a: (1, .)
 
 iter seq=3
 first
@@ -688,12 +688,12 @@ last
 seek-lt a
 seek-lt b
 ----
-a:2
-a:2
+a: (2, .)
+a: (2, .)
 .
-a:2
+a: (2, .)
 .
-a:2
+a: (2, .)
 
 iter seq=4
 first
@@ -703,12 +703,12 @@ last
 seek-lt a
 seek-lt b
 ----
-a:3
-a:3
+a: (3, .)
+a: (3, .)
 .
-a:3
+a: (3, .)
 .
-a:3
+a: (3, .)
 
 define
 L1
@@ -720,9 +720,9 @@ L1
 ----
 mem: 1
 1:
-  000004:[a-a]
-  000005:[a-a]
-  000006:[a-a]
+  000004:[a#3,MERGE-a#3,MERGE]
+  000005:[a#2,MERGE-a#2,MERGE]
+  000006:[a#1,MERGE-a#1,MERGE]
 
 get seq=1
 a
@@ -752,12 +752,12 @@ last
 seek-lt a
 seek-lt b
 ----
-a:1
-a:1
+a: (1, .)
+a: (1, .)
 .
-a:1
+a: (1, .)
 .
-a:1
+a: (1, .)
 
 iter seq=3
 first
@@ -767,12 +767,12 @@ last
 seek-lt a
 seek-lt b
 ----
-a:12
-a:12
+a: (12, .)
+a: (12, .)
 .
-a:12
+a: (12, .)
 .
-a:12
+a: (12, .)
 
 iter seq=4
 first
@@ -782,12 +782,12 @@ last
 seek-lt a
 seek-lt b
 ----
-a:123
-a:123
+a: (123, .)
+a: (123, .)
 .
-a:123
+a: (123, .)
 .
-a:123
+a: (123, .)
 
 # User-key spread across multiple levels.
 
@@ -803,11 +803,11 @@ L3
 ----
 mem: 1
 1:
-  000004:[a-a]
+  000004:[a#3,MERGE-a#3,MERGE]
 2:
-  000005:[a-a]
+  000005:[a#2,MERGE-a#2,MERGE]
 3:
-  000006:[a-a]
+  000006:[a#1,MERGE-a#1,MERGE]
 
 get seq=1
 a
@@ -842,12 +842,12 @@ last
 seek-lt a
 seek-lt b
 ----
-a:1
-a:1
+a: (1, .)
+a: (1, .)
 .
-a:1
+a: (1, .)
 .
-a:1
+a: (1, .)
 
 iter seq=3
 first
@@ -857,12 +857,12 @@ last
 seek-lt a
 seek-lt b
 ----
-a:12
-a:12
+a: (12, .)
+a: (12, .)
 .
-a:12
+a: (12, .)
 .
-a:12
+a: (12, .)
 
 iter seq=4
 first
@@ -872,12 +872,12 @@ last
 seek-lt a
 seek-lt b
 ----
-a:123
-a:123
+a: (123, .)
+a: (123, .)
 .
-a:123
+a: (123, .)
 .
-a:123
+a: (123, .)
 
 iter seq=5
 first
@@ -887,12 +887,12 @@ last
 seek-lt a
 seek-lt b
 ----
-a:1234
-a:1234
+a: (1234, .)
+a: (1234, .)
 .
-a:1234
+a: (1234, .)
 .
-a:1234
+a: (1234, .)
 
 # Range deletions on multiple levels.
 define
@@ -916,13 +916,13 @@ L3
 ----
 mem: 1
 0.0:
-  000004:[a-d]
+  000004:[a#4,SET-d#4,SET]
 1:
-  000005:[a-d]
+  000005:[a#3,SET-d#3,SET]
 2:
-  000006:[a-d]
+  000006:[a#2,RANGEDEL-d#2,SET]
 3:
-  000007:[a-d]
+  000007:[a#1,SET-d#1,SET]
 
 get seq=2
 a
@@ -978,21 +978,21 @@ prev
 prev
 prev
 ----
-a:1
-b:1
-c:1
-d:1
-d:1
-c:1
-b:1
-a:1
+a: (1, .)
+b: (1, .)
+c: (1, .)
+d: (1, .)
+d: (1, .)
+c: (1, .)
+b: (1, .)
+a: (1, .)
 
 iter seq=3
 first
 last
 ----
-d:2
-d:2
+d: (2, .)
+d: (2, .)
 
 iter seq=4
 first
@@ -1000,10 +1000,10 @@ next
 last
 prev
 ----
-a:3
-d:3
-d:3
-a:3
+a: (3, .)
+d: (3, .)
+d: (3, .)
+a: (3, .)
 
 iter seq=5
 first
@@ -1013,12 +1013,12 @@ last
 prev
 prev
 ----
-a:4
-b:4
-d:4
-d:4
-b:4
-a:4
+a: (4, .)
+b: (4, .)
+d: (4, .)
+d: (4, .)
+b: (4, .)
+a: (4, .)
 
 # Range deletions spanning tables within a level.
 
@@ -1042,11 +1042,11 @@ L2
 ----
 mem: 1
 1:
-  000004:[a-b]
-  000005:[b-c]
-  000006:[c-d]
+  000004:[a#2,RANGEDEL-b#72057594037927935,RANGEDEL]
+  000005:[b#2,RANGEDEL-c#72057594037927935,RANGEDEL]
+  000006:[c#2,RANGEDEL-d#72057594037927935,RANGEDEL]
 2:
-  000007:[a-d]
+  000007:[a#1,SET-d#1,SET]
 
 get seq=2
 a
@@ -1091,21 +1091,21 @@ prev
 prev
 prev
 ----
-a:1
-b:1
-c:1
-d:1
-d:1
-c:1
-b:1
-a:1
+a: (1, .)
+b: (1, .)
+c: (1, .)
+d: (1, .)
+d: (1, .)
+c: (1, .)
+b: (1, .)
+a: (1, .)
 
 iter seq=3
 first
 last
 ----
-d:1
-d:1
+d: (1, .)
+d: (1, .)
 
 iter seq=4
 first
@@ -1117,14 +1117,14 @@ prev
 prev
 prev
 ----
-a:3
-b:3
-c:3
-d:3
-d:3
-c:3
-b:3
-a:3
+a: (3, .)
+b: (3, .)
+c: (3, .)
+d: (3, .)
+d: (3, .)
+c: (3, .)
+b: (3, .)
+a: (3, .)
 
 # Invalid LSM structure (range deletion at newer level covers newer
 # write at an older level). This LSM structure is not generated
@@ -1138,9 +1138,9 @@ L2
 ----
 mem: 1
 1:
-  000004:[a-b]
+  000004:[a#1,RANGEDEL-b#72057594037927935,RANGEDEL]
 2:
-  000005:[a-a]
+  000005:[a#2,SET-a#2,SET]
 
 get seq=3
 a
@@ -1163,29 +1163,29 @@ L0
 ----
 mem: 1
 0.1:
-  000005:[a-a]
-  000006:[c-c]
+  000005:[a#2,SET-a#2,SET]
+  000006:[c#3,SET-c#3,SET]
 0.0:
-  000004:[a-e]
+  000004:[a#1,RANGEDEL-e#72057594037927935,RANGEDEL]
 
 compact a-e
 ----
 1:
-  000007:[a-c]
-  000008:[c-e]
+  000007:[a#2,SET-c#72057594037927935,RANGEDEL]
+  000008:[c#3,SET-e#72057594037927935,RANGEDEL]
 
 compact d-e
 ----
 1:
-  000007:[a-c]
+  000007:[a#2,SET-c#72057594037927935,RANGEDEL]
 2:
-  000008:[c-e]
+  000008:[c#3,SET-e#72057594037927935,RANGEDEL]
 
 iter seq=4
 seek-ge b
 next
 ----
-c:v
+c: (v, .)
 .
 
 # Reverse the above test: compact the left file containing the split range
@@ -1201,31 +1201,31 @@ L0
 ----
 mem: 1
 0.1:
-  000005:[a-a]
-  000006:[c-c]
+  000005:[a#2,SET-a#2,SET]
+  000006:[c#3,SET-c#3,SET]
 0.0:
-  000004:[a-e]
+  000004:[a#1,RANGEDEL-e#72057594037927935,RANGEDEL]
 
 compact a-e
 ----
 1:
-  000007:[a-c]
-  000008:[c-e]
+  000007:[a#2,SET-c#72057594037927935,RANGEDEL]
+  000008:[c#3,SET-e#72057594037927935,RANGEDEL]
 
 compact a-b
 ----
 1:
-  000008:[c-e]
+  000008:[c#3,SET-e#72057594037927935,RANGEDEL]
 2:
-  000007:[a-c]
+  000007:[a#2,SET-c#72057594037927935,RANGEDEL]
 
 iter seq=4
 seek-lt d
 prev
 prev
 ----
-c:v
-a:v
+c: (v, .)
+a: (v, .)
 .
 
 # A range tombstone straddles two sstables. One is compacted two
@@ -1247,29 +1247,29 @@ L2
 ----
 mem: 1
 0.1:
-  000005:[a-a]
-  000006:[c-c]
+  000005:[a#2,SET-a#2,SET]
+  000006:[c#3,SET-c#3,SET]
 0.0:
-  000004:[a-e]
+  000004:[a#1,RANGEDEL-e#72057594037927935,RANGEDEL]
 2:
-  000007:[d-d]
+  000007:[d#0,SET-d#0,SET]
 
 compact a-b
 ----
 1:
-  000008:[a-c]
-  000009:[c-d]
-  000010:[d-e]
+  000008:[a#2,SET-c#72057594037927935,RANGEDEL]
+  000009:[c#3,SET-d#72057594037927935,RANGEDEL]
+  000010:[d#1,RANGEDEL-e#72057594037927935,RANGEDEL]
 2:
-  000007:[d-d]
+  000007:[d#0,SET-d#0,SET]
 
 compact d-e
 ----
 1:
-  000008:[a-c]
+  000008:[a#2,SET-c#72057594037927935,RANGEDEL]
+  000009:[c#3,SET-d#72057594037927935,RANGEDEL]
 3:
-  000013:[c-d]
-  000014:[d-e]
+  000011:[d#1,RANGEDEL-e#72057594037927935,RANGEDEL]
 
 get seq=4
 c
@@ -1278,11 +1278,12 @@ c:v
 
 compact a-b L1
 ----
+1:
+  000009:[c#3,SET-d#72057594037927935,RANGEDEL]
 2:
-  000015:[a-c]
+  000008:[a#2,SET-c#72057594037927935,RANGEDEL]
 3:
-  000013:[c-d]
-  000014:[d-e]
+  000011:[d#1,RANGEDEL-e#72057594037927935,RANGEDEL]
 
 get seq=4
 c
@@ -1306,34 +1307,34 @@ L2
 ----
 mem: 1
 0.1:
-  000005:[a-a]
-  000006:[c-c]
+  000005:[a#2,SET-a#2,SET]
+  000006:[c#3,SET-c#3,SET]
 0.0:
-  000004:[a-e]
-  000007:[f-f]
+  000004:[a#1,RANGEDEL-e#72057594037927935,RANGEDEL]
+  000007:[f#4,SET-f#4,SET]
 2:
-  000008:[d-d]
+  000008:[d#0,SET-d#0,SET]
 
 compact a-b
 ----
 0.0:
-  000007:[f-f]
+  000007:[f#4,SET-f#4,SET]
 1:
-  000009:[a-c]
-  000010:[c-d]
-  000011:[d-e]
+  000009:[a#2,SET-c#72057594037927935,RANGEDEL]
+  000010:[c#3,SET-d#72057594037927935,RANGEDEL]
+  000011:[d#1,RANGEDEL-e#72057594037927935,RANGEDEL]
 2:
-  000008:[d-d]
+  000008:[d#0,SET-d#0,SET]
 
 compact d-e
 ----
 0.0:
-  000007:[f-f]
+  000007:[f#4,SET-f#4,SET]
 1:
-  000009:[a-c]
+  000009:[a#2,SET-c#72057594037927935,RANGEDEL]
+  000010:[c#3,SET-d#72057594037927935,RANGEDEL]
 3:
-  000014:[c-d]
-  000015:[d-e]
+  000012:[d#1,RANGEDEL-e#72057594037927935,RANGEDEL]
 
 get seq=4
 c
@@ -1343,20 +1344,20 @@ c:v
 compact f-f L0
 ----
 1:
-  000009:[a-c]
-  000007:[f-f]
+  000009:[a#2,SET-c#72057594037927935,RANGEDEL]
+  000010:[c#3,SET-d#72057594037927935,RANGEDEL]
+  000007:[f#4,SET-f#4,SET]
 3:
-  000014:[c-d]
-  000015:[d-e]
+  000012:[d#1,RANGEDEL-e#72057594037927935,RANGEDEL]
 
 compact a-f L1
 ----
 2:
-  000016:[a-c]
-  000017:[f-f]
+  000013:[a#2,SET-c#72057594037927935,RANGEDEL]
+  000014:[c#3,SET-d#72057594037927935,RANGEDEL]
+  000015:[f#4,SET-f#4,SET]
 3:
-  000014:[c-d]
-  000015:[d-e]
+  000012:[d#1,RANGEDEL-e#72057594037927935,RANGEDEL]
 
 get seq=4
 c
@@ -1376,19 +1377,20 @@ L2
 ----
 mem: 1
 0.1:
-  000005:[a-f]
+  000005:[a#4,RANGEDEL-f#72057594037927935,RANGEDEL]
 0.0:
-  000004:[a-f]
+  000004:[a#3,RANGEDEL-f#72057594037927935,RANGEDEL]
 1:
-  000006:[b-e]
+  000006:[b#2,RANGEDEL-e#72057594037927935,RANGEDEL]
 2:
-  000007:[c-d]
+  000007:[c#1,RANGEDEL-d#72057594037927935,RANGEDEL]
 
 wait-pending-table-stats
 000007
 ----
 num-entries: 1
 num-deletions: 1
+num-range-key-sets: 0
 point-deletions-bytes-estimate: 0
 range-deletions-bytes-estimate: 0
 
@@ -1397,6 +1399,7 @@ wait-pending-table-stats
 ----
 num-entries: 1
 num-deletions: 1
+num-range-key-sets: 0
 point-deletions-bytes-estimate: 0
 range-deletions-bytes-estimate: 836
 
@@ -1405,6 +1408,7 @@ wait-pending-table-stats
 ----
 num-entries: 1
 num-deletions: 1
+num-range-key-sets: 0
 point-deletions-bytes-estimate: 0
 range-deletions-bytes-estimate: 1672
 
@@ -1413,6 +1417,7 @@ wait-pending-table-stats
 ----
 num-entries: 2
 num-deletions: 2
+num-range-key-sets: 0
 point-deletions-bytes-estimate: 0
 range-deletions-bytes-estimate: 1672
 
@@ -1439,19 +1444,20 @@ L3
 ----
 mem: 1
 0.0:
-  000004:[a-d]
+  000004:[a#4,SET-d#4,SET]
 1:
-  000005:[a-d]
+  000005:[a#3,SET-d#3,SET]
 2:
-  000006:[a-d]
+  000006:[a#2,RANGEDEL-d#2,SET]
 3:
-  000007:[a-d]
+  000007:[a#1,SET-d#1,SET]
 
 wait-pending-table-stats
 000007
 ----
 num-entries: 4
 num-deletions: 0
+num-range-key-sets: 0
 point-deletions-bytes-estimate: 0
 range-deletions-bytes-estimate: 0
 
@@ -1460,14 +1466,16 @@ wait-pending-table-stats
 ----
 num-entries: 2
 num-deletions: 1
+num-range-key-sets: 0
 point-deletions-bytes-estimate: 0
-range-deletions-bytes-estimate: 787
+range-deletions-bytes-estimate: 42
 
 wait-pending-table-stats
 000005
 ----
 num-entries: 3
 num-deletions: 1
+num-range-key-sets: 0
 point-deletions-bytes-estimate: 0
 range-deletions-bytes-estimate: 68
 
@@ -1476,6 +1484,7 @@ wait-pending-table-stats
 ----
 num-entries: 4
 num-deletions: 1
+num-range-key-sets: 0
 point-deletions-bytes-estimate: 0
 range-deletions-bytes-estimate: 100
 
@@ -1497,20 +1506,21 @@ L2
 ----
 mem: 1
 0.1:
-  000004:[a-z]
+  000004:[a#6,RANGEDEL-z#72057594037927935,RANGEDEL]
 0.0:
-  000005:[a-d]
-  000006:[e-z]
+  000005:[a#5,RANGEDEL-d#72057594037927935,RANGEDEL]
+  000006:[e#4,RANGEDEL-z#72057594037927935,RANGEDEL]
 1:
-  000007:[a-c]
+  000007:[a#2,SET-c#2,SET]
 2:
-  000008:[x-x]
+  000008:[x#1,SET-x#1,SET]
 
 wait-pending-table-stats
 000005
 ----
 num-entries: 1
 num-deletions: 1
+num-range-key-sets: 0
 point-deletions-bytes-estimate: 0
 range-deletions-bytes-estimate: 782
 
@@ -1519,6 +1529,7 @@ wait-pending-table-stats
 ----
 num-entries: 1
 num-deletions: 1
+num-range-key-sets: 0
 point-deletions-bytes-estimate: 0
 range-deletions-bytes-estimate: 771
 
@@ -1527,5 +1538,6 @@ wait-pending-table-stats
 ----
 num-entries: 2
 num-deletions: 2
+num-range-key-sets: 0
 point-deletions-bytes-estimate: 0
 range-deletions-bytes-estimate: 1553

@@ -16,7 +16,7 @@ import (
 
 func TestGenerator(t *testing.T) {
 	rng := randvar.NewRand()
-	g := newGenerator(rng)
+	g := newGenerator(rng, defaultConfig(), newKeyManager())
 
 	g.newBatch()
 	g.newBatch()
@@ -52,16 +52,16 @@ func TestGenerator(t *testing.T) {
 	require.EqualValues(t, 0, len(g.snapshots))
 	require.EqualValues(t, 1, len(g.liveWriters))
 
-	g.iterClose()
-	g.iterClose()
-	g.iterClose()
+	g.randIter(g.iterClose)()
+	g.randIter(g.iterClose)()
+	g.randIter(g.iterClose)()
 	require.EqualValues(t, 0, len(g.liveIters))
 
 	if testing.Verbose() {
 		t.Logf("\n%s", g)
 	}
 
-	g = newGenerator(rng)
+	g = newGenerator(rng, defaultConfig(), newKeyManager())
 
 	g.newSnapshot()
 	g.newSnapshot()
@@ -85,16 +85,16 @@ func TestGenerator(t *testing.T) {
 	require.EqualValues(t, 0, len(g.snapshots))
 	require.EqualValues(t, 1, len(g.liveWriters))
 
-	g.iterClose()
-	g.iterClose()
-	g.iterClose()
+	g.randIter(g.iterClose)()
+	g.randIter(g.iterClose)()
+	g.randIter(g.iterClose)()
 	require.EqualValues(t, 0, len(g.liveIters))
 
 	if testing.Verbose() {
 		t.Logf("\n%s", g)
 	}
 
-	g = newGenerator(rng)
+	g = newGenerator(rng, defaultConfig(), newKeyManager())
 
 	g.newIndexedBatch()
 	g.newIndexedBatch()
@@ -105,9 +105,9 @@ func TestGenerator(t *testing.T) {
 	g.writerApply()
 	g.writerApply()
 	g.writerApply()
-	g.iterClose()
-	g.iterClose()
-	g.iterClose()
+	g.randIter(g.iterClose)()
+	g.randIter(g.iterClose)()
+	g.randIter(g.iterClose)()
 
 	require.EqualValues(t, 0, len(g.liveBatches))
 	require.EqualValues(t, 0, len(g.batches))
@@ -129,7 +129,7 @@ func TestGeneratorRandom(t *testing.T) {
 	generateFromSeed := func() string {
 		rng := rand.New(rand.NewSource(seed))
 		count := ops.Uint64(rng)
-		return formatOps(generate(rng, count, defaultConfig))
+		return formatOps(generate(rng, count, defaultConfig(), newKeyManager()))
 	}
 
 	// Ensure that generate doesn't use any other source of randomness other

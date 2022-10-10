@@ -7,6 +7,7 @@ package pebble
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"runtime"
 	"strconv"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/cache"
 	"github.com/cockroachdb/pebble/internal/humanize"
+	"github.com/cockroachdb/pebble/internal/manifest"
 	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/vfs"
 )
@@ -52,6 +54,41 @@ type FilterPolicy = base.FilterPolicy
 // TablePropertyCollector exports the sstable.TablePropertyCollector type.
 type TablePropertyCollector = sstable.TablePropertyCollector
 
+// BlockPropertyCollector exports the sstable.BlockPropertyCollector type.
+type BlockPropertyCollector = sstable.BlockPropertyCollector
+
+// BlockPropertyFilter exports the sstable.BlockPropertyFilter type.
+type BlockPropertyFilter = base.BlockPropertyFilter
+
+// IterKeyType configures which types of keys an iterator should surface.
+type IterKeyType int8
+
+const (
+	// IterKeyTypePointsOnly configures an iterator to iterate over point keys
+	// only.
+	IterKeyTypePointsOnly IterKeyType = iota
+	// IterKeyTypeRangesOnly configures an iterator to iterate over range keys
+	// only.
+	IterKeyTypeRangesOnly
+	// IterKeyTypePointsAndRanges configures an iterator iterate over both point
+	// keys and range keys simultaneously.
+	IterKeyTypePointsAndRanges
+)
+
+// String implements fmt.Stringer.
+func (t IterKeyType) String() string {
+	switch t {
+	case IterKeyTypePointsOnly:
+		return "points-only"
+	case IterKeyTypeRangesOnly:
+		return "ranges-only"
+	case IterKeyTypePointsAndRanges:
+		return "points-and-ranges"
+	default:
+		panic(fmt.Sprintf("unknown key type %d", t))
+	}
+}
+
 // IterOptions hold the optional per-query parameters for NewIter.
 //
 // Like Options, a nil *IterOptions is valid and means to use the default
@@ -72,9 +109,72 @@ type IterOptions struct {
 	// false to skip scanning. This function must be thread-safe since the same
 	// function can be used by multiple iterators, if the iterator is cloned.
 	TableFilter func(userProps map[string]string) bool
+	// PointKeyFilters can be used to avoid scanning tables and blocks in tables
+	// when iterating over point keys. It is requires that this slice is sorted in
+	// increasing order of the BlockPropertyFilter.ShortID. This slice represents
+	// an intersection across all filters, i.e., all filters must indicate that the
+	// block is relevant.
+	PointKeyFilters []BlockPropertyFilter
+	// RangeKeyFilters can be usefd to avoid scanning tables and blocks in tables
+	// when iterating over range keys. The same requirements that apply to
+	// PointKeyFilters apply here too.
+	RangeKeyFilters []BlockPropertyFilter
+	// KeyTypes configures which types of keys to iterate over: point keys,
+	// range keys, or both.
+	KeyTypes IterKeyType
+	// RangeKeyMasking can be used to enable automatic masking of point keys by
+	// range keys. Range key masking is only supported during combined range key
+	// and point key iteration mode (IterKeyTypePointsAndRanges).
+	RangeKeyMasking RangeKeyMasking
+
+	// OnlyReadGuaranteedDurable is an advanced option that is only supported by
+	// the Reader implemented by DB. When set to true, only the guaranteed to be
+	// durable state is visible in the iterator.
+	// - This definition is made under the assumption that the FS implementation
+	//   is providing a durability guarantee when data is synced.
+	// - The visible state represents a consistent point in the history of the
+	//   DB.
+	// - The implementation is free to choose a conservative definition of what
+	//   is guaranteed durable. For simplicity, the current implementation
+	//   ignores memtables. A more sophisticated implementation could track the
+	//   highest seqnum that is synced to the WAL and published and use that as
+	//   the visible seqnum for an iterator. Note that the latter approach is
+	//   not strictly better than the former since we can have DBs that are (a)
+	//   synced more rarely than memtable flushes, (b) have no WAL. (a) is
+	//   likely to be true in a future CockroachDB context where the DB
+	//   containing the state machine may be rarely synced.
+	// NB: this current implementation relies on the fact that memtables are
+	// flushed in seqnum order, and any ingested sstables that happen to have a
+	// lower seqnum than a non-flushed memtable don't have any overlapping keys.
+	// This is the fundamental level invariant used in other code too, like when
+	// merging iterators.
+	//
+	// Semantically, using this option provides the caller a "snapshot" as of
+	// the time the most recent memtable was flushed. An alternate interface
+	// would be to add a NewSnapshot variant. Creating a snapshot is heavier
+	// weight than creating an iterator, so we have opted to support this
+	// iterator option.
+	OnlyReadGuaranteedDurable bool
+	// UseL6Filters allows the caller to opt into reading filter blocks for L6
+	// sstables. Helpful if a lot of SeekPrefixGEs are expected in quick
+	// succession, that are also likely to not yield a single key. Filter blocks in
+	// L6 can be relatively large, often larger than data blocks, so the benefit of
+	// loading them in the cache is minimized if the probability of the key
+	// existing is not low or if we just expect a one-time Seek (where loading the
+	// data block directly is better).
+	UseL6Filters bool
 
 	// Internal options.
+
 	logger Logger
+	// Level corresponding to this file. Only passed in if constructed by a
+	// levelIter.
+	level manifest.Level
+	// disableLazyCombinedIteration is an internal testing option.
+	disableLazyCombinedIteration bool
+
+	// NB: If adding new Options, you must account for them in iterator
+	// construction and Iterator.SetOptions.
 }
 
 // GetLowerBound returns the LowerBound or nil if the receiver is nil.
@@ -93,11 +193,96 @@ func (o *IterOptions) GetUpperBound() []byte {
 	return o.UpperBound
 }
 
+func (o *IterOptions) pointKeys() bool {
+	if o == nil {
+		return true
+	}
+	return o.KeyTypes == IterKeyTypePointsOnly || o.KeyTypes == IterKeyTypePointsAndRanges
+}
+
+func (o *IterOptions) rangeKeys() bool {
+	if o == nil {
+		return false
+	}
+	return o.KeyTypes == IterKeyTypeRangesOnly || o.KeyTypes == IterKeyTypePointsAndRanges
+}
+
 func (o *IterOptions) getLogger() Logger {
 	if o == nil || o.logger == nil {
 		return DefaultLogger
 	}
 	return o.logger
+}
+
+// RangeKeyMasking configures automatic hiding of point keys by range keys. A
+// non-nil Suffix enables range-key masking. When enabled, range keys with
+// suffixes ≥ Suffix behave as masks. All point keys that are contained within a
+// masking range key's bounds and have suffixes greater than the range key's
+// suffix are automatically skipped.
+//
+// Specifically, when configured with a RangeKeyMasking.Suffix _s_, and there
+// exists a range key with suffix _r_ covering a point key with suffix _p_, and
+//
+//     _s_ ≤ _r_ < _p_
+//
+// then the point key is elided.
+//
+// Range-key masking may only be used when iterating over both point keys and
+// range keys with IterKeyTypePointsAndRanges.
+type RangeKeyMasking struct {
+	// Suffix configures which range keys may mask point keys. Only range keys
+	// that are defined at suffixes greater than or equal to Suffix will mask
+	// point keys.
+	Suffix []byte
+	// Filter is an optional field that may be used to improve performance of
+	// range-key masking through a block-property filter defined over key
+	// suffixes. If non-nil, Filter is called by Pebble to construct a
+	// block-property filter mask at iterator creation. The filter is used to
+	// skip whole point-key blocks containing point keys with suffixes greater
+	// than a covering range-key's suffix.
+	//
+	// To use this functionality, the caller must create and configure (through
+	// Options.BlockPropertyCollectors) a block-property collector that records
+	// the maxmimum suffix contained within a block. The caller then must write
+	// and provide a BlockPropertyFilterMask implementation on that same
+	// property. See the BlockPropertyFilterMask type for more information.
+	Filter func() BlockPropertyFilterMask
+}
+
+// BlockPropertyFilterMask extends the BlockPropertyFilter interface for use
+// with range-key masking. Unlike an ordinary block property filter, a
+// BlockPropertyFilterMask's filtering criteria is allowed to change when Pebble
+// invokes its SetSuffix method.
+//
+// When a Pebble iterator steps into a range key's bounds and the range key has
+// a suffix greater than or equal to RangeKeyMasking.Suffix, the range key acts
+// as a mask. The masking range key hides all point keys that fall within the
+// range key's bounds and have suffixes > the range key's suffix. Without a
+// filter mask configured, Pebble performs this hiding by stepping through point
+// keys and comparing suffixes. If large numbers of point keys are masked, this
+// requires Pebble to load, iterate through and discard a large number of
+// sstable blocks containing masked point keys.
+//
+// If a block-property collector and a filter mask are configured, Pebble may
+// skip loading some point-key blocks altogether. If a block's keys are known to
+// all fall within the bounds of the masking range key and the block was
+// annotated by a block-property collector with the maximal suffix, Pebble can
+// ask the filter mask to compare the property to the current masking range
+// key's suffix. If the mask reports no intersection, the block may be skipped.
+//
+// If unsuffixed and suffixed keys are written to the database, care must be
+// taken to avoid unintentionally masking un-suffixed keys located in the same
+// block as suffixed keys. One solution is to interpret unsuffixed keys as
+// containing the maximal suffix value, ensuring that blocks containing
+// unsuffixed keys are always loaded.
+type BlockPropertyFilterMask interface {
+	BlockPropertyFilter
+
+	// SetSuffix configures the mask with the suffix of a range key. The filter
+	// should return false from Intersects whenever it's provided with a
+	// property encoding a block's minimum suffix that's greater (according to
+	// Compare) than the provided suffix.
+	SetSuffix(suffix []byte) error
 }
 
 // WriteOptions hold the optional per-query parameters for Set and Delete
@@ -294,12 +479,6 @@ type Options struct {
 		// concurrency slots as determined by the two options is chosen.
 		CompactionDebtConcurrency int
 
-		// DeleteRangeFlushDelay configures how long the database should wait
-		// before forcing a flush of a memtable that contains a range
-		// deletion. Disk space cannot be reclaimed until the range deletion
-		// is flushed. No automatic flush occurs if zero.
-		DeleteRangeFlushDelay time.Duration
-
 		// MinDeletionRate is the minimum number of bytes per second that would
 		// be deleted. Deletion pacing is used to slow down deletions when
 		// compactions finish up or readers close, and newly-obsolete files need
@@ -363,6 +542,35 @@ type Options struct {
 		//
 		// NOTE: callers should take care to not mutate the key being validated.
 		KeyValidationFunc func(userKey []byte) error
+
+		// ValidateOnIngest schedules validation of sstables after they have
+		// been ingested.
+		//
+		// By default, this value is false.
+		ValidateOnIngest bool
+
+		// MultiLevelCompaction allows the compaction of SSTs from more than two
+		// levels iff a conventional two level compaction will quickly trigger a
+		// compaction in the output level.
+		MultiLevelCompaction bool
+
+		// MaxWriterConcurrency is used to indicate the maximum number of
+		// compression workers the compression queue is allowed to use. If
+		// MaxWriterConcurrency > 0, then the Writer will use parallelism, to
+		// compress and write blocks to disk. Otherwise, the writer will
+		// compress and write blocks to disk synchronously.
+		MaxWriterConcurrency int
+
+		// ForceWriterParallelism is used to force parallelism in the sstable
+		// Writer for the metamorphic tests. Even with the MaxWriterConcurrency
+		// option set, we only enable parallelism in the sstable Writer if there
+		// is enough CPU available, and this option bypasses that.
+		ForceWriterParallelism bool
+
+		// CPUWorkPermissionGranter should be set if Pebble should be given the
+		// ability to optionally schedule additional CPU. See the documentation
+		// for CPUWorkPermissionGranter for more details.
+		CPUWorkPermissionGranter CPUWorkPermissionGranter
 	}
 
 	// Filters is a map from filter policy name to filter policy. It is used for
@@ -370,6 +578,18 @@ type Options struct {
 	// different filter policies. It is not necessary to populate this filters
 	// map during normal usage of a DB.
 	Filters map[string]FilterPolicy
+
+	// FlushDelayDeleteRange configures how long the database should wait before
+	// forcing a flush of a memtable that contains a range deletion. Disk space
+	// cannot be reclaimed until the range deletion is flushed. No automatic
+	// flush occurs if zero.
+	FlushDelayDeleteRange time.Duration
+
+	// FlushDelayRangeKey configures how long the database should wait before
+	// forcing a flush of a memtable that contains a range key. Range keys in
+	// the memtable prevent lazy combined iteration, so it's desirable to flush
+	// range keys promptly. No automatic flush occurs if zero.
+	FlushDelayRangeKey time.Duration
 
 	// FlushSplitBytes denotes the target number of bytes per sublevel in
 	// each flush split interval (i.e. range between two flush split keys)
@@ -404,13 +624,14 @@ type Options struct {
 	// The default value uses the underlying operating system's file system.
 	FS vfs.FS
 
+	// The count of L0 files necessary to trigger an L0 compaction.
+	L0CompactionFileThreshold int
+
 	// The amount of L0 read-amplification necessary to trigger an L0 compaction.
 	L0CompactionThreshold int
 
-	// Hard limit on L0 read-amplification. Writes are stopped when this
-	// threshold is reached. If Experimental.L0SublevelCompactions is enabled
-	// this threshold is measured against the number of L0 sublevels. Otherwise
-	// it is measured against the number of files in L0.
+	// Hard limit on L0 read-amplification, computed as the number of L0
+	// sublevels. Writes are stopped when this threshold is reached.
 	L0StopWritesThreshold int
 
 	// The maximum number of bytes for LBase. The base level is the level which
@@ -463,9 +684,23 @@ type Options struct {
 	Merger *Merger
 
 	// MaxConcurrentCompactions specifies the maximum number of concurrent
-	// compactions. The default is 1. Concurrent compactions are only performed
-	// when L0 read-amplification passes the L0CompactionConcurrency threshold.
-	MaxConcurrentCompactions int
+	// compactions. The default is 1. Concurrent compactions are performed
+	// - when L0 read-amplification passes the L0CompactionConcurrency threshold
+	// - for automatic background compactions
+	// - when a manual compaction for a level is split and parallelized
+	// MaxConcurrentCompactions must be greater than 0.
+	MaxConcurrentCompactions func() int
+
+	// DisableAutomaticCompactions dictates whether automatic compactions are
+	// scheduled or not. The default is false (enabled). This option is only used
+	// externally when running a manual compaction, and internally for tests.
+	DisableAutomaticCompactions bool
+
+	// NoSyncOnClose decides whether the Pebble instance will enforce a
+	// close-time synchronization (e.g., fdatasync() or sync_file_range())
+	// on files it writes to. Setting this to true removes the guarantee for a
+	// sync on close. Some implementations can still issue a non-blocking sync.
+	NoSyncOnClose bool
 
 	// NumPrevManifest is the number of non-current or older manifests which
 	// we want to keep around for debugging purposes. By default, we're going
@@ -490,6 +725,11 @@ type Options struct {
 	// functions. A new TablePropertyCollector is created for each sstable built
 	// and lives for the lifetime of the table.
 	TablePropertyCollectors []func() TablePropertyCollector
+
+	// BlockPropertyCollectors is a list of BlockPropertyCollector creation
+	// functions. A new BlockPropertyCollector is created for each sstable
+	// built and lives for the lifetime of writing that table.
+	BlockPropertyCollectors []func() BlockPropertyCollector
 
 	// WALBytesPerSync sets the number of bytes to write to a WAL before calling
 	// Sync on it in the background. Just like with BytesPerSync above, this
@@ -532,26 +772,25 @@ type Options struct {
 		// RocksDB 6.2.1.
 		strictWALTail bool
 
-		// TODO(peter): A private option to enable flush/compaction pacing. Only used
-		// by tests. Compaction/flush pacing is disabled until we fix the impact on
-		// throughput.
-		enablePacing bool
-
 		// A private option to disable stats collection.
 		disableTableStats bool
 
-		// A private option disable automatic compactions.
-		disableAutomaticCompactions bool
+		// fsCloser holds a closer that should be invoked after a DB using these
+		// Options is closed. This is used to automatically stop the
+		// long-running goroutine associated with the disk-health-checking FS.
+		// See the initialization of FS in EnsureDefaults. Note that care has
+		// been taken to ensure that it is still safe to continue using the FS
+		// after this closer has been invoked. However, if write operations
+		// against the FS are made after the DB is closed, the FS may leak a
+		// goroutine indefinitely.
+		fsCloser io.Closer
 
-		// minCompactionRate sets the minimum rate at which compactions occur. The
-		// default is 4 MB/s. Currently disabled as this option has no effect while
-		// private.enablePacing is false.
-		minCompactionRate int
-
-		// minFlushRate sets the minimum rate at which the MemTables are flushed. The
-		// default is 1 MB/s. Currently disabled as this option has no effect while
-		// private.enablePacing is false.
-		minFlushRate int
+		// disableLazyCombinedIteration is a private option used by the
+		// metamorphic tests to test equivalence between lazy-combined iteration
+		// and constructing the range-key iterator upfront. It's a private
+		// option to avoid littering the public interface with options that we
+		// do not want to allow users to actually configure.
+		disableLazyCombinedIteration bool
 	}
 }
 
@@ -588,6 +827,32 @@ func (o *Options) EnsureDefaults() *Options {
 	}
 	if o.L0CompactionThreshold <= 0 {
 		o.L0CompactionThreshold = 4
+	}
+	if o.L0CompactionFileThreshold <= 0 {
+		// Some justification for the default of 500:
+		// Why not smaller?:
+		// - The default target file size for L0 is 2MB, so 500 files is <= 1GB
+		//   of data. At observed compaction speeds of > 20MB/s, L0 can be
+		//   cleared of all files in < 1min, so this backlog is not huge.
+		// - 500 files is low overhead for instantiating L0 sublevels from
+		//   scratch.
+		// - Lower values were observed to cause excessive and inefficient
+		//   compactions out of L0 in a TPCC import benchmark.
+		// Why not larger?:
+		// - More than 1min to compact everything out of L0.
+		// - CockroachDB's admission control system uses a threshold of 1000
+		//   files to start throttling writes to Pebble. Using 500 here gives
+		//   us headroom between when Pebble should start compacting L0 and
+		//   when the admission control threshold is reached.
+		//
+		// We can revisit this default in the future based on better
+		// experimental understanding.
+		//
+		// TODO(jackson): Experiment with slightly lower thresholds [or higher
+		// admission control thresholds] to see whether a higher L0 score at the
+		// threshold (currently 2.0) is necessary for some workloads to avoid
+		// starving L0 in favor of lower-level compactions.
+		o.L0CompactionFileThreshold = 500
 	}
 	if o.L0StopWritesThreshold <= 0 {
 		o.L0StopWritesThreshold = 12
@@ -631,14 +896,8 @@ func (o *Options) EnsureDefaults() *Options {
 		o.Merger = DefaultMerger
 	}
 	o.private.strictWALTail = true
-	if o.private.minCompactionRate == 0 {
-		o.private.minCompactionRate = 4 << 20 // 4 MB/s
-	}
-	if o.private.minFlushRate == 0 {
-		o.private.minFlushRate = 1 << 20 // 1 MB/s
-	}
-	if o.MaxConcurrentCompactions <= 0 {
-		o.MaxConcurrentCompactions = 1
+	if o.MaxConcurrentCompactions == nil {
+		o.MaxConcurrentCompactions = func() int { return 1 }
 	}
 	if o.NumPrevManifest <= 0 {
 		o.NumPrevManifest = 1
@@ -649,7 +908,7 @@ func (o *Options) EnsureDefaults() *Options {
 	}
 
 	if o.FS == nil {
-		o.FS = vfs.WithDiskHealthChecks(vfs.Default, 5*time.Second,
+		o.FS, o.private.fsCloser = vfs.WithDiskHealthChecks(vfs.Default, 5*time.Second,
 			func(name string, duration time.Duration) {
 				o.EventListener.DiskSlow(DiskSlowInfo{
 					Path:     name,
@@ -672,6 +931,13 @@ func (o *Options) EnsureDefaults() *Options {
 
 	o.initMaps()
 	return o
+}
+
+func (o *Options) equal() Equal {
+	if o.Comparer.Equal == nil {
+		return bytes.Equal
+	}
+	return o.Comparer.Equal
 }
 
 // initMaps initializes the Comparers, Filters, and Mergers maps.
@@ -736,22 +1002,22 @@ func (o *Options) String() string {
 	fmt.Fprintf(&buf, "  cleaner=%s\n", o.Cleaner)
 	fmt.Fprintf(&buf, "  compaction_debt_concurrency=%d\n", o.Experimental.CompactionDebtConcurrency)
 	fmt.Fprintf(&buf, "  comparer=%s\n", o.Comparer.Name)
-	fmt.Fprintf(&buf, "  delete_range_flush_delay=%s\n", o.Experimental.DeleteRangeFlushDelay)
 	fmt.Fprintf(&buf, "  disable_wal=%t\n", o.DisableWAL)
+	fmt.Fprintf(&buf, "  flush_delay_delete_range=%s\n", o.FlushDelayDeleteRange)
+	fmt.Fprintf(&buf, "  flush_delay_range_key=%s\n", o.FlushDelayRangeKey)
 	fmt.Fprintf(&buf, "  flush_split_bytes=%d\n", o.FlushSplitBytes)
 	fmt.Fprintf(&buf, "  format_major_version=%d\n", o.FormatMajorVersion)
 	fmt.Fprintf(&buf, "  l0_compaction_concurrency=%d\n", o.Experimental.L0CompactionConcurrency)
+	fmt.Fprintf(&buf, "  l0_compaction_file_threshold=%d\n", o.L0CompactionFileThreshold)
 	fmt.Fprintf(&buf, "  l0_compaction_threshold=%d\n", o.L0CompactionThreshold)
 	fmt.Fprintf(&buf, "  l0_stop_writes_threshold=%d\n", o.L0StopWritesThreshold)
 	fmt.Fprintf(&buf, "  lbase_max_bytes=%d\n", o.LBaseMaxBytes)
-	fmt.Fprintf(&buf, "  max_concurrent_compactions=%d\n", o.MaxConcurrentCompactions)
+	fmt.Fprintf(&buf, "  max_concurrent_compactions=%d\n", o.MaxConcurrentCompactions())
 	fmt.Fprintf(&buf, "  max_manifest_file_size=%d\n", o.MaxManifestFileSize)
 	fmt.Fprintf(&buf, "  max_open_files=%d\n", o.MaxOpenFiles)
 	fmt.Fprintf(&buf, "  mem_table_size=%d\n", o.MemTableSize)
 	fmt.Fprintf(&buf, "  mem_table_stop_writes_threshold=%d\n", o.MemTableStopWritesThreshold)
-	fmt.Fprintf(&buf, "  min_compaction_rate=%d\n", o.private.minCompactionRate)
 	fmt.Fprintf(&buf, "  min_deletion_rate=%d\n", o.Experimental.MinDeletionRate)
-	fmt.Fprintf(&buf, "  min_flush_rate=%d\n", o.private.minFlushRate)
 	fmt.Fprintf(&buf, "  merger=%s\n", o.Merger.Name)
 	fmt.Fprintf(&buf, "  read_compaction_rate=%d\n", o.Experimental.ReadCompactionRate)
 	fmt.Fprintf(&buf, "  read_sampling_multiplier=%d\n", o.Experimental.ReadSamplingMultiplier)
@@ -767,8 +1033,20 @@ func (o *Options) String() string {
 		fmt.Fprintf(&buf, "%s", o.TablePropertyCollectors[i]().Name())
 	}
 	fmt.Fprintf(&buf, "]\n")
+	fmt.Fprintf(&buf, "  validate_on_ingest=%t\n", o.Experimental.ValidateOnIngest)
 	fmt.Fprintf(&buf, "  wal_dir=%s\n", o.WALDir)
 	fmt.Fprintf(&buf, "  wal_bytes_per_sync=%d\n", o.WALBytesPerSync)
+	fmt.Fprintf(&buf, "  max_writer_concurrency=%d\n", o.Experimental.MaxWriterConcurrency)
+	fmt.Fprintf(&buf, "  force_writer_parallelism=%t\n", o.Experimental.ForceWriterParallelism)
+
+	// Private options.
+	if o.private.disableLazyCombinedIteration {
+		// This option is only encoded if true, because we do not want it to
+		// appear in production serialized Options files, since it's a
+		// testing-only option. It's only serialized when true, which still
+		// ensures that the metamorphic tests may propagate it to subprocesses.
+		fmt.Fprintln(&buf, "  disable_lazy_combined_iteration=true")
+	}
 
 	for i := range o.Levels {
 		l := &o.Levels[i]
@@ -842,7 +1120,7 @@ type ParseHooks struct {
 	NewComparer     func(name string) (*Comparer, error)
 	NewFilterPolicy func(name string) (FilterPolicy, error)
 	NewMerger       func(name string) (*Merger, error)
-	SkipUnknown     func(name string) bool
+	SkipUnknown     func(name, value string) bool
 }
 
 // Parse parses the options from the specified string. Note that certain
@@ -860,7 +1138,7 @@ func (o *Options) Parse(s string, hooks *ParseHooks) error {
 			switch key {
 			case "pebble_version":
 			default:
-				if hooks != nil && hooks.SkipUnknown != nil && hooks.SkipUnknown(section+"."+key) {
+				if hooks != nil && hooks.SkipUnknown != nil && hooks.SkipUnknown(section+"."+key, value) {
 					return nil
 				}
 				return errors.Errorf("pebble: unknown option: %s.%s",
@@ -907,9 +1185,17 @@ func (o *Options) Parse(s string, hooks *ParseHooks) error {
 			case "compaction_debt_concurrency":
 				o.Experimental.CompactionDebtConcurrency, err = strconv.Atoi(value)
 			case "delete_range_flush_delay":
-				o.Experimental.DeleteRangeFlushDelay, err = time.ParseDuration(value)
+				// NB: This is a deprecated serialization of the
+				// `flush_delay_delete_range`.
+				o.FlushDelayDeleteRange, err = time.ParseDuration(value)
 			case "disable_wal":
 				o.DisableWAL, err = strconv.ParseBool(value)
+			case "disable_lazy_combined_iteration":
+				o.private.disableLazyCombinedIteration, err = strconv.ParseBool(value)
+			case "flush_delay_delete_range":
+				o.FlushDelayDeleteRange, err = time.ParseDuration(value)
+			case "flush_delay_range_key":
+				o.FlushDelayRangeKey, err = time.ParseDuration(value)
 			case "flush_split_bytes":
 				o.FlushSplitBytes, err = strconv.ParseInt(value, 10, 64)
 			case "format_major_version":
@@ -927,6 +1213,8 @@ func (o *Options) Parse(s string, hooks *ParseHooks) error {
 				}
 			case "l0_compaction_concurrency":
 				o.Experimental.L0CompactionConcurrency, err = strconv.Atoi(value)
+			case "l0_compaction_file_threshold":
+				o.L0CompactionFileThreshold, err = strconv.Atoi(value)
 			case "l0_compaction_threshold":
 				o.L0CompactionThreshold, err = strconv.Atoi(value)
 			case "l0_stop_writes_threshold":
@@ -936,7 +1224,13 @@ func (o *Options) Parse(s string, hooks *ParseHooks) error {
 			case "lbase_max_bytes":
 				o.LBaseMaxBytes, err = strconv.ParseInt(value, 10, 64)
 			case "max_concurrent_compactions":
-				o.MaxConcurrentCompactions, err = strconv.Atoi(value)
+				var concurrentCompactions int
+				concurrentCompactions, err = strconv.Atoi(value)
+				if concurrentCompactions <= 0 {
+					err = errors.New("max_concurrent_compactions cannot be <= 0")
+				} else {
+					o.MaxConcurrentCompactions = func() int { return concurrentCompactions }
+				}
 			case "max_manifest_file_size":
 				o.MaxManifestFileSize, err = strconv.ParseInt(value, 10, 64)
 			case "max_open_files":
@@ -946,11 +1240,13 @@ func (o *Options) Parse(s string, hooks *ParseHooks) error {
 			case "mem_table_stop_writes_threshold":
 				o.MemTableStopWritesThreshold, err = strconv.Atoi(value)
 			case "min_compaction_rate":
-				o.private.minCompactionRate, err = strconv.Atoi(value)
+				// Do nothing; option existed in older versions of pebble, and
+				// may be meaningful again eventually.
 			case "min_deletion_rate":
 				o.Experimental.MinDeletionRate, err = strconv.Atoi(value)
 			case "min_flush_rate":
-				o.private.minFlushRate, err = strconv.Atoi(value)
+				// Do nothing; option existed in older versions of pebble, and
+				// may be meaningful again eventually.
 			case "strict_wal_tail":
 				o.private.strictWALTail, err = strconv.ParseBool(value)
 			case "merger":
@@ -979,12 +1275,18 @@ func (o *Options) Parse(s string, hooks *ParseHooks) error {
 				}
 			case "table_property_collectors":
 				// TODO(peter): set o.TablePropertyCollectors
+			case "validate_on_ingest":
+				o.Experimental.ValidateOnIngest, err = strconv.ParseBool(value)
 			case "wal_dir":
 				o.WALDir = value
 			case "wal_bytes_per_sync":
 				o.WALBytesPerSync, err = strconv.Atoi(value)
+			case "max_writer_concurrency":
+				o.Experimental.MaxWriterConcurrency, err = strconv.Atoi(value)
+			case "force_writer_parallelism":
+				o.Experimental.ForceWriterParallelism, err = strconv.ParseBool(value)
 			default:
-				if hooks != nil && hooks.SkipUnknown != nil && hooks.SkipUnknown(section+"."+key) {
+				if hooks != nil && hooks.SkipUnknown != nil && hooks.SkipUnknown(section+"."+key, value) {
 					return nil
 				}
 				return errors.Errorf("pebble: unknown option: %s.%s",
@@ -997,7 +1299,7 @@ func (o *Options) Parse(s string, hooks *ParseHooks) error {
 			if n, err := fmt.Sscanf(section, `Level "%d"`, &index); err != nil {
 				return err
 			} else if n != 1 {
-				if hooks != nil && hooks.SkipUnknown != nil && hooks.SkipUnknown(section) {
+				if hooks != nil && hooks.SkipUnknown != nil && hooks.SkipUnknown(section, value) {
 					return nil
 				}
 				return errors.Errorf("pebble: unknown section: %q", errors.Safe(section))
@@ -1045,14 +1347,14 @@ func (o *Options) Parse(s string, hooks *ParseHooks) error {
 			case "target_file_size":
 				l.TargetFileSize, err = strconv.ParseInt(value, 10, 64)
 			default:
-				if hooks != nil && hooks.SkipUnknown != nil && hooks.SkipUnknown(section+"."+key) {
+				if hooks != nil && hooks.SkipUnknown != nil && hooks.SkipUnknown(section+"."+key, value) {
 					return nil
 				}
 				return errors.Errorf("pebble: unknown option: %s.%s", errors.Safe(section), errors.Safe(key))
 			}
 			return err
 		}
-		if hooks != nil && hooks.SkipUnknown != nil && hooks.SkipUnknown(section+"."+key) {
+		if hooks != nil && hooks.SkipUnknown != nil && hooks.SkipUnknown(section+"."+key, value) {
 			return nil
 		}
 		return errors.Errorf("pebble: unknown section: %q", errors.Safe(section))
@@ -1147,16 +1449,17 @@ func (o *Options) MakeReaderOptions() sstable.ReaderOptions {
 
 // MakeWriterOptions constructs sstable.WriterOptions for the specified level
 // from the corresponding options in the receiver.
-func (o *Options) MakeWriterOptions(level int) sstable.WriterOptions {
+func (o *Options) MakeWriterOptions(level int, format sstable.TableFormat) sstable.WriterOptions {
 	var writerOpts sstable.WriterOptions
+	writerOpts.TableFormat = format
 	if o != nil {
 		writerOpts.Cache = o.Cache
 		writerOpts.Comparer = o.Comparer
 		if o.Merger != nil {
 			writerOpts.MergerName = o.Merger.Name
 		}
-		writerOpts.TableFormat = sstable.TableFormatRocksDBv2
 		writerOpts.TablePropertyCollectors = o.TablePropertyCollectors
+		writerOpts.BlockPropertyCollectors = o.BlockPropertyCollectors
 	}
 	levelOpts := o.Level(level)
 	writerOpts.BlockRestartInterval = levelOpts.BlockRestartInterval

@@ -5,6 +5,7 @@
 package manifest
 
 import (
+	"bytes"
 	"fmt"
 	"strconv"
 	"strings"
@@ -14,8 +15,10 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/datadriven"
+	"github.com/cockroachdb/pebble/internal/testkeys"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/cockroachdb/redact"
+	"github.com/stretchr/testify/require"
 )
 
 func levelMetadata(level int, files ...*FileMetadata) LevelMetadata {
@@ -27,6 +30,7 @@ func ikey(s string) InternalKey {
 }
 
 func TestIkeyRange(t *testing.T) {
+	cmp := base.DefaultComparer.Compare
 	testCases := []struct {
 		input, want string
 	}{
@@ -71,11 +75,10 @@ func TestIkeyRange(t *testing.T) {
 		var f []*FileMetadata
 		if tc.input != "" {
 			for i, s := range strings.Split(tc.input, " ") {
-				f = append(f, &FileMetadata{
-					FileNum:  base.FileNum(i),
-					Smallest: ikey(s[0:1]),
-					Largest:  ikey(s[2:3]),
-				})
+				m := (&FileMetadata{
+					FileNum: base.FileNum(i),
+				}).ExtendPointKeyBounds(cmp, ikey(s[0:1]), ikey(s[2:3]))
+				f = append(f, m)
 			}
 		}
 		levelMetadata := makeLevelMetadata(base.DefaultComparer.Compare, 0, f)
@@ -89,259 +92,125 @@ func TestIkeyRange(t *testing.T) {
 }
 
 func TestOverlaps(t *testing.T) {
-	m00 := &FileMetadata{
-		FileNum:  700,
-		Size:     1,
-		Smallest: base.ParseInternalKey("b.SET.7008"),
-		Largest:  base.ParseInternalKey("e.SET.7009"),
-	}
-	m01 := &FileMetadata{
-		FileNum:  701,
-		Size:     1,
-		Smallest: base.ParseInternalKey("c.SET.7018"),
-		Largest:  base.ParseInternalKey("f.SET.7019"),
-	}
-	m02 := &FileMetadata{
-		FileNum:  702,
-		Size:     1,
-		Smallest: base.ParseInternalKey("f.SET.7028"),
-		Largest:  base.ParseInternalKey("g.SET.7029"),
-	}
-	m03 := &FileMetadata{
-		FileNum:  703,
-		Size:     1,
-		Smallest: base.ParseInternalKey("x.SET.7038"),
-		Largest:  base.ParseInternalKey("y.SET.7039"),
-	}
-	m04 := &FileMetadata{
-		FileNum:  704,
-		Size:     1,
-		Smallest: base.ParseInternalKey("n.SET.7048"),
-		Largest:  base.ParseInternalKey("p.SET.7049"),
-	}
-	m05 := &FileMetadata{
-		FileNum:  705,
-		Size:     1,
-		Smallest: base.ParseInternalKey("p.SET.7058"),
-		Largest:  base.ParseInternalKey("p.SET.7059"),
-	}
-	m06 := &FileMetadata{
-		FileNum:  706,
-		Size:     1,
-		Smallest: base.ParseInternalKey("p.SET.7068"),
-		Largest:  base.ParseInternalKey("u.SET.7069"),
-	}
-	m07 := &FileMetadata{
-		FileNum:  707,
-		Size:     1,
-		Smallest: base.ParseInternalKey("r.SET.7078"),
-		Largest:  base.ParseInternalKey("s.SET.7079"),
-	}
-
-	m10 := &FileMetadata{
-		FileNum:  710,
-		Size:     1,
-		Smallest: base.ParseInternalKey("d.SET.7108"),
-		Largest:  base.ParseInternalKey("g.SET.7109"),
-	}
-	m11 := &FileMetadata{
-		FileNum:  711,
-		Size:     1,
-		Smallest: base.ParseInternalKey("g.SET.7118"),
-		Largest:  base.ParseInternalKey("j.SET.7119"),
-	}
-	m12 := &FileMetadata{
-		FileNum:  712,
-		Size:     1,
-		Smallest: base.ParseInternalKey("n.SET.7128"),
-		Largest:  base.ParseInternalKey("p.SET.7129"),
-	}
-	m13 := &FileMetadata{
-		FileNum:  713,
-		Size:     1,
-		Smallest: base.ParseInternalKey("p.SET.7148"),
-		Largest:  base.ParseInternalKey("p.SET.7149"),
-	}
-	m14 := &FileMetadata{
-		FileNum:  714,
-		Size:     1,
-		Smallest: base.ParseInternalKey("p.SET.7138"),
-		Largest:  base.ParseInternalKey("u.SET.7139"),
-	}
-
-	v := Version{
-		Levels: [NumLevels]LevelMetadata{
-			0: levelMetadata(0, m00, m01, m02, m03, m04, m05, m06, m07),
-			1: levelMetadata(1, m10, m11, m12, m13, m14),
-		},
-	}
-
-	testCases := []struct {
-		level        int
-		ukey0, ukey1 string
-		want         string
-	}{
-		// Level 0: m00=b-e, m01=c-f, m02=f-g, m03=x-y, m04=n-p, m05=p-p, m06=p-u, m07=r-s.
-		// Note that:
-		//   - the slice isn't sorted (e.g. m02=f-g, m03=x-y, m04=n-p),
-		//   - m00 and m01 overlap (not just touch),
-		//   - m06 contains m07,
-		//   - m00, m01 and m02 transitively overlap/touch each other, and
-		//   - m04, m05, m06 and m07 transitively overlap/touch each other.
-		{0, "a", "a", ""},
-		{0, "a", "b", "m00 m01 m02"},
-		{0, "a", "d", "m00 m01 m02"},
-		{0, "a", "e", "m00 m01 m02"},
-		{0, "a", "g", "m00 m01 m02"},
-		{0, "a", "z", "m00 m01 m02 m03 m04 m05 m06 m07"},
-		{0, "c", "e", "m00 m01 m02"},
-		{0, "d", "d", "m00 m01 m02"},
-		{0, "g", "n", "m00 m01 m02 m04 m05 m06 m07"},
-		{0, "h", "i", ""},
-		{0, "h", "o", "m04 m05 m06 m07"},
-		{0, "h", "u", "m04 m05 m06 m07"},
-		{0, "k", "l", ""},
-		{0, "k", "o", "m04 m05 m06 m07"},
-		{0, "k", "p", "m04 m05 m06 m07"},
-		{0, "n", "o", "m04 m05 m06 m07"},
-		{0, "n", "z", "m03 m04 m05 m06 m07"},
-		{0, "o", "z", "m03 m04 m05 m06 m07"},
-		{0, "p", "z", "m03 m04 m05 m06 m07"},
-		{0, "q", "z", "m03 m04 m05 m06 m07"},
-		{0, "r", "s", "m04 m05 m06 m07"},
-		{0, "r", "z", "m03 m04 m05 m06 m07"},
-		{0, "s", "z", "m03 m04 m05 m06 m07"},
-		{0, "u", "z", "m03 m04 m05 m06 m07"},
-		{0, "y", "z", "m03"},
-		{0, "z", "z", ""},
-
-		// Level 1: m10=d-g, m11=g-j, m12=n-p, m13=p-p, m14=p-u.
-		{1, "a", "a", ""},
-		{1, "a", "b", ""},
-		{1, "a", "d", "m10"},
-		{1, "a", "e", "m10"},
-		{1, "a", "g", "m10 m11"},
-		{1, "a", "z", "m10 m11 m12 m13 m14"},
-		{1, "c", "e", "m10"},
-		{1, "d", "d", "m10"},
-		{1, "g", "n", "m10 m11 m12"},
-		{1, "h", "i", "m11"},
-		{1, "h", "o", "m11 m12"},
-		{1, "h", "u", "m11 m12 m13 m14"},
-		{1, "k", "l", ""},
-		{1, "k", "o", "m12"},
-		{1, "k", "p", "m12 m13 m14"},
-		{1, "n", "o", "m12"},
-		{1, "n", "z", "m12 m13 m14"},
-		{1, "o", "z", "m12 m13 m14"},
-		{1, "p", "z", "m12 m13 m14"},
-		{1, "q", "z", "m14"},
-		{1, "r", "s", "m14"},
-		{1, "r", "z", "m14"},
-		{1, "s", "z", "m14"},
-		{1, "u", "z", "m14"},
-		{1, "y", "z", ""},
-		{1, "z", "z", ""},
-
-		// Level 2: empty.
-		{2, "a", "z", ""},
-	}
-
-	cmp := base.DefaultComparer.Compare
-	for _, tc := range testCases {
-		overlaps := v.Overlaps(tc.level, cmp, []byte(tc.ukey0), []byte(tc.ukey1))
-		iter := overlaps.Iter()
-		var s []string
-		for meta := iter.First(); meta != nil; meta = iter.Next() {
-			s = append(s, fmt.Sprintf("m%02d", meta.FileNum%100))
+	var v *Version
+	cmp := testkeys.Comparer.Compare
+	fmtKey := testkeys.Comparer.FormatKey
+	datadriven.RunTest(t, "testdata/overlaps", func(d *datadriven.TestData) string {
+		switch d.Cmd {
+		case "define":
+			var err error
+			v, err = ParseVersionDebug(cmp, fmtKey, 64>>10 /* flush split bytes */, d.Input)
+			if err != nil {
+				return err.Error()
+			}
+			return v.String()
+		case "overlaps":
+			var level int
+			var start, end string
+			var exclusiveEnd bool
+			d.ScanArgs(t, "level", &level)
+			d.ScanArgs(t, "start", &start)
+			d.ScanArgs(t, "end", &end)
+			d.ScanArgs(t, "exclusive-end", &exclusiveEnd)
+			var buf bytes.Buffer
+			v.Overlaps(level, testkeys.Comparer.Compare, []byte(start), []byte(end), exclusiveEnd).Each(func(f *FileMetadata) {
+				fmt.Fprintf(&buf, "%s\n", f.DebugString(base.DefaultFormatter, false))
+			})
+			return buf.String()
+		default:
+			return fmt.Sprintf("unknown command: %s", d.Cmd)
 		}
-		got := strings.Join(s, " ")
-		if got != tc.want {
-			t.Errorf("level=%d, range=%s-%s\ngot  %v\nwant %v", tc.level, tc.ukey0, tc.ukey1, got, tc.want)
-		}
-	}
+	})
 }
 
 func TestContains(t *testing.T) {
-	m00 := &FileMetadata{
-		FileNum:  700,
-		Size:     1,
-		Smallest: base.ParseInternalKey("b.SET.7008"),
-		Largest:  base.ParseInternalKey("e.SET.7009"),
+	cmp := base.DefaultComparer.Compare
+	newFileMeta := func(fileNum base.FileNum, size uint64, smallest, largest base.InternalKey) *FileMetadata {
+		m := (&FileMetadata{
+			FileNum: fileNum,
+			Size:    size,
+		}).ExtendPointKeyBounds(cmp, smallest, largest)
+		return m
 	}
-	m01 := &FileMetadata{
-		FileNum:  701,
-		Size:     1,
-		Smallest: base.ParseInternalKey("c.SET.7018"),
-		Largest:  base.ParseInternalKey("f.SET.7019"),
-	}
-	m02 := &FileMetadata{
-		FileNum:  702,
-		Size:     1,
-		Smallest: base.ParseInternalKey("f.SET.7028"),
-		Largest:  base.ParseInternalKey("g.SET.7029"),
-	}
-	m03 := &FileMetadata{
-		FileNum:  703,
-		Size:     1,
-		Smallest: base.ParseInternalKey("x.SET.7038"),
-		Largest:  base.ParseInternalKey("y.SET.7039"),
-	}
-	m04 := &FileMetadata{
-		FileNum:  704,
-		Size:     1,
-		Smallest: base.ParseInternalKey("n.SET.7048"),
-		Largest:  base.ParseInternalKey("p.SET.7049"),
-	}
-	m05 := &FileMetadata{
-		FileNum:  705,
-		Size:     1,
-		Smallest: base.ParseInternalKey("p.SET.7058"),
-		Largest:  base.ParseInternalKey("p.SET.7059"),
-	}
-	m06 := &FileMetadata{
-		FileNum:  706,
-		Size:     1,
-		Smallest: base.ParseInternalKey("p.SET.7068"),
-		Largest:  base.ParseInternalKey("u.SET.7069"),
-	}
-	m07 := &FileMetadata{
-		FileNum:  707,
-		Size:     1,
-		Smallest: base.ParseInternalKey("r.SET.7078"),
-		Largest:  base.ParseInternalKey("s.SET.7079"),
-	}
+	m00 := newFileMeta(
+		700,
+		1,
+		base.ParseInternalKey("b.SET.7008"),
+		base.ParseInternalKey("e.SET.7009"),
+	)
+	m01 := newFileMeta(
+		701,
+		1,
+		base.ParseInternalKey("c.SET.7018"),
+		base.ParseInternalKey("f.SET.7019"),
+	)
+	m02 := newFileMeta(
+		702,
+		1,
+		base.ParseInternalKey("f.SET.7028"),
+		base.ParseInternalKey("g.SET.7029"),
+	)
+	m03 := newFileMeta(
+		703,
+		1,
+		base.ParseInternalKey("x.SET.7038"),
+		base.ParseInternalKey("y.SET.7039"),
+	)
+	m04 := newFileMeta(
+		704,
+		1,
+		base.ParseInternalKey("n.SET.7048"),
+		base.ParseInternalKey("p.SET.7049"),
+	)
+	m05 := newFileMeta(
+		705,
+		1,
+		base.ParseInternalKey("p.SET.7058"),
+		base.ParseInternalKey("p.SET.7059"),
+	)
+	m06 := newFileMeta(
+		706,
+		1,
+		base.ParseInternalKey("p.SET.7068"),
+		base.ParseInternalKey("u.SET.7069"),
+	)
+	m07 := newFileMeta(
+		707,
+		1,
+		base.ParseInternalKey("r.SET.7078"),
+		base.ParseInternalKey("s.SET.7079"),
+	)
 
-	m10 := &FileMetadata{
-		FileNum:  710,
-		Size:     1,
-		Smallest: base.ParseInternalKey("d.SET.7108"),
-		Largest:  base.ParseInternalKey("g.SET.7109"),
-	}
-	m11 := &FileMetadata{
-		FileNum:  711,
-		Size:     1,
-		Smallest: base.ParseInternalKey("g.SET.7118"),
-		Largest:  base.ParseInternalKey("j.SET.7119"),
-	}
-	m12 := &FileMetadata{
-		FileNum:  712,
-		Size:     1,
-		Smallest: base.ParseInternalKey("n.SET.7128"),
-		Largest:  base.ParseInternalKey("p.SET.7129"),
-	}
-	m13 := &FileMetadata{
-		FileNum:  713,
-		Size:     1,
-		Smallest: base.ParseInternalKey("p.SET.7148"),
-		Largest:  base.ParseInternalKey("p.SET.7149"),
-	}
-	m14 := &FileMetadata{
-		FileNum:  714,
-		Size:     1,
-		Smallest: base.ParseInternalKey("p.SET.7138"),
-		Largest:  base.ParseInternalKey("u.SET.7139"),
-	}
+	m10 := newFileMeta(
+		710,
+		1,
+		base.ParseInternalKey("d.SET.7108"),
+		base.ParseInternalKey("g.SET.7109"),
+	)
+	m11 := newFileMeta(
+		711,
+		1,
+		base.ParseInternalKey("g.SET.7118"),
+		base.ParseInternalKey("j.SET.7119"),
+	)
+	m12 := newFileMeta(
+		712,
+		1,
+		base.ParseInternalKey("n.SET.7128"),
+		base.ParseInternalKey("p.SET.7129"),
+	)
+	m13 := newFileMeta(
+		713,
+		1,
+		base.ParseInternalKey("p.SET.7148"),
+		base.ParseInternalKey("p.SET.7149"),
+	)
+	m14 := newFileMeta(
+		714,
+		1,
+		base.ParseInternalKey("p.SET.7138"),
+		base.ParseInternalKey("u.SET.7139"),
+	)
 
 	v := Version{
 		Levels: [NumLevels]LevelMetadata{
@@ -394,7 +263,6 @@ func TestContains(t *testing.T) {
 		{2, m14, false},
 	}
 
-	cmp := base.DefaultComparer.Compare
 	for _, tc := range testCases {
 		got := v.Contains(tc.level, cmp, tc.file)
 		if got != tc.want {
@@ -418,55 +286,24 @@ func TestVersionUnref(t *testing.T) {
 func TestCheckOrdering(t *testing.T) {
 	cmp := base.DefaultComparer.Compare
 	fmtKey := base.DefaultComparer.FormatKey
-	parseMeta := func(s string) FileMetadata {
-		parts := strings.Split(s, "-")
-		if len(parts) != 2 {
-			t.Fatalf("malformed table spec: %s", s)
-		}
-		m := FileMetadata{
-			Smallest: base.ParseInternalKey(strings.TrimSpace(parts[0])),
-			Largest:  base.ParseInternalKey(strings.TrimSpace(parts[1])),
-		}
-		m.SmallestSeqNum = m.Smallest.SeqNum()
-		m.LargestSeqNum = m.Largest.SeqNum()
-		return m
-	}
-
 	datadriven.RunTest(t, "testdata/version_check_ordering",
 		func(d *datadriven.TestData) string {
 			switch d.Cmd {
 			case "check-ordering":
-				// TODO(sumeer): move this Version parsing code to utils, to
-				// avoid repeating it, and make it the inverse of
-				// Version.DebugString().
-				var filesByLevel [NumLevels][]*FileMetadata
-				var files *[]*FileMetadata
-				fileNum := base.FileNum(1)
-
-				for _, data := range strings.Split(d.Input, "\n") {
-					switch data {
-					case "L0", "L1", "L2", "L3", "L4", "L5", "L6":
-						level, err := strconv.Atoi(data[1:])
-						if err != nil {
-							return err.Error()
-						}
-						files = &filesByLevel[level]
-
-					default:
-						meta := parseMeta(data)
-						meta.FileNum = fileNum
-						fileNum++
-						*files = append(*files, &meta)
-					}
-				}
-
-				result := "OK"
-				v := NewVersion(cmp, fmtKey, 10<<20, filesByLevel)
-				err := v.CheckOrdering(cmp, base.DefaultFormatter)
+				v, err := ParseVersionDebug(cmp, fmtKey, 10<<20, d.Input)
 				if err != nil {
-					result = fmt.Sprint(err)
+					return err.Error()
 				}
-				return result
+				// L0 files compare on sequence numbers. Use the seqnums from the
+				// smallest / largest bounds for the table.
+				v.Levels[0].Slice().Each(func(m *FileMetadata) {
+					m.SmallestSeqNum = m.Smallest.SeqNum()
+					m.LargestSeqNum = m.Largest.SeqNum()
+				})
+				if err = v.CheckOrdering(cmp, base.DefaultFormatter); err != nil {
+					return err.Error()
+				}
+				return "OK"
 
 			default:
 				return fmt.Sprintf("unknown command: %s", d.Cmd)
@@ -557,7 +394,7 @@ func TestCheckConsistency(t *testing.T) {
 					if err != nil {
 						return err.Error()
 					}
-					path := base.MakeFilename(mem, dir, base.FileTypeTable, m.FileNum)
+					path := base.MakeFilepath(mem, dir, base.FileTypeTable, m.FileNum)
 					_ = mem.Remove(path)
 					f, err := mem.Create(path)
 					if err != nil {
@@ -575,4 +412,113 @@ func TestCheckConsistency(t *testing.T) {
 				return fmt.Sprintf("unknown command: %s", d.Cmd)
 			}
 		})
+}
+
+func TestExtendBounds(t *testing.T) {
+	cmp := base.DefaultComparer.Compare
+	parseBounds := func(line string) (lower, upper InternalKey) {
+		parts := strings.Split(line, "-")
+		if len(parts) == 1 {
+			parts = strings.Split(parts[0], ":")
+			start, end := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+			lower = base.ParseInternalKey(start)
+			switch k := lower.Kind(); k {
+			case base.InternalKeyKindRangeDelete:
+				upper = base.MakeRangeDeleteSentinelKey([]byte(end))
+			case base.InternalKeyKindRangeKeySet, base.InternalKeyKindRangeKeyUnset, base.InternalKeyKindRangeKeyDelete:
+				upper = base.MakeExclusiveSentinelKey(k, []byte(end))
+			default:
+				panic(fmt.Sprintf("unknown kind %s with end key", k))
+			}
+		} else {
+			l, u := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+			lower, upper = base.ParseInternalKey(l), base.ParseInternalKey(u)
+		}
+		return
+	}
+	format := func(m *FileMetadata) string {
+		var b bytes.Buffer
+		var smallest, largest string
+		switch m.boundTypeSmallest {
+		case boundTypePointKey:
+			smallest = "point"
+		case boundTypeRangeKey:
+			smallest = "range"
+		default:
+			return fmt.Sprintf("unknown bound type %d", m.boundTypeSmallest)
+		}
+		switch m.boundTypeLargest {
+		case boundTypePointKey:
+			largest = "point"
+		case boundTypeRangeKey:
+			largest = "range"
+		default:
+			return fmt.Sprintf("unknown bound type %d", m.boundTypeLargest)
+		}
+		bounds, err := m.boundsMarker()
+		if err != nil {
+			panic(err)
+		}
+		fmt.Fprintf(&b, "%s\n", m.DebugString(base.DefaultFormatter, true))
+		fmt.Fprintf(&b, "  bounds: (smallest=%s,largest=%s) (0x%08b)\n", smallest, largest, bounds)
+		return b.String()
+	}
+	m := &FileMetadata{}
+	datadriven.RunTest(t, "testdata/file_metadata_bounds", func(d *datadriven.TestData) string {
+		switch d.Cmd {
+		case "reset":
+			m = &FileMetadata{}
+			return ""
+		case "extend-point-key-bounds":
+			u, l := parseBounds(d.Input)
+			m.ExtendPointKeyBounds(cmp, u, l)
+			return format(m)
+		case "extend-range-key-bounds":
+			u, l := parseBounds(d.Input)
+			m.ExtendRangeKeyBounds(cmp, u, l)
+			return format(m)
+		default:
+			return fmt.Sprintf("unknown command %s\n", d.Cmd)
+		}
+	})
+}
+
+func TestFileMetadata_ParseRoundTrip(t *testing.T) {
+	testCases := []struct {
+		name   string
+		input  string
+		output string
+	}{
+		{
+			name:  "point keys only",
+			input: "000001:[a#0,SET-z#0,DEL] points:[a#0,SET-z#0,DEL]",
+		},
+		{
+			name:  "range keys only",
+			input: "000001:[a#0,RANGEKEYSET-z#0,RANGEKEYDEL] ranges:[a#0,RANGEKEYSET-z#0,RANGEKEYDEL]",
+		},
+		{
+			name:  "point and range keys",
+			input: "000001:[a#0,RANGEKEYSET-d#0,DEL] points:[b#0,SET-d#0,DEL] ranges:[a#0,RANGEKEYSET-c#0,RANGEKEYDEL]",
+		},
+		{
+			name:   "whitespace",
+			input:  " 000001 : [ a#0,SET - z#0,DEL] points : [ a#0,SET - z#0,DEL] ",
+			output: "000001:[a#0,SET-z#0,DEL] points:[a#0,SET-z#0,DEL]",
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			m, err := ParseFileMetadataDebug(tc.input)
+			require.NoError(t, err)
+			err = m.Validate(base.DefaultComparer.Compare, base.DefaultFormatter)
+			require.NoError(t, err)
+			got := m.DebugString(base.DefaultFormatter, true)
+			want := tc.input
+			if tc.output != "" {
+				want = tc.output
+			}
+			require.Equal(t, want, got)
+		})
+	}
 }

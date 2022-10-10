@@ -5,7 +5,6 @@
 package vfs
 
 import (
-	"io/ioutil"
 	"os"
 	"testing"
 	"time"
@@ -16,13 +15,15 @@ import (
 func TestFileWrappersHaveFd(t *testing.T) {
 	// Use the real filesystem so that we can test vfs.Default, which returns
 	// files with Fd().
-	tmpf, err := ioutil.TempFile("", "pebble-db-fd-file")
+	tmpf, err := os.CreateTemp("", "pebble-db-fd-file")
 	require.NoError(t, err)
 	filename := tmpf.Name()
 	defer os.Remove(filename)
 
 	// File wrapper case 1: Check if diskHealthCheckingFile has Fd().
-	fs2 := WithDiskHealthChecks(Default, 10 * time.Second, func(s string, duration time.Duration) {})
+	fs2, closer := WithDiskHealthChecks(Default, 10*time.Second,
+		func(s string, duration time.Duration) {})
+	defer closer.Close()
 	f2, err := fs2.Open(filename)
 	require.NoError(t, err)
 	if _, ok := f2.(fdGetter); !ok {

@@ -15,7 +15,8 @@ import (
 
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/datadriven"
-	"github.com/cockroachdb/pebble/internal/rangedel"
+	"github.com/cockroachdb/pebble/internal/keyspan"
+	"github.com/cockroachdb/pebble/internal/rangekey"
 )
 
 func TestSnapshotIndex(t *testing.T) {
@@ -73,11 +74,14 @@ func (m *debugMerger) Finish(includesBase bool) ([]byte, io.Closer, error) {
 }
 
 func TestCompactionIter(t *testing.T) {
+	var merge Merge
 	var keys []InternalKey
+	var rangeKeys []keyspan.Span
 	var vals [][]byte
 	var snapshots []uint64
 	var elideTombstones bool
 	var allowZeroSeqnum bool
+	var interleavingIter *keyspan.InterleavingIter
 
 	// The input to the data-driven test is dependent on the format major
 	// version we are testing against.
@@ -93,20 +97,32 @@ func TestCompactionIter(t *testing.T) {
 		// SSTables are not released while iterating, and therefore not
 		// susceptible to use-after-free bugs, we skip the zeroing of
 		// RangeDelete keys.
-		iter := newInvalidatingIter(&fakeIter{keys: keys, vals: vals})
+		fi := &fakeIter{keys: keys, vals: vals}
+		interleavingIter = &keyspan.InterleavingIter{}
+		interleavingIter.Init(
+			base.DefaultComparer,
+			fi,
+			keyspan.NewIter(base.DefaultComparer.Compare, rangeKeys),
+			nil, nil, nil)
+		iter := newInvalidatingIter(interleavingIter)
 		iter.ignoreKind(InternalKeyKindRangeDelete)
-
-		return newCompactionIter(
-			DefaultComparer.Compare,
-			DefaultComparer.FormatKey,
-			func(key, value []byte) (base.ValueMerger, error) {
+		if merge == nil {
+			merge = func(key, value []byte) (base.ValueMerger, error) {
 				m := &debugMerger{}
 				m.buf = append(m.buf, value...)
 				return m, nil
-			},
+			}
+		}
+
+		return newCompactionIter(
+			DefaultComparer.Compare,
+			DefaultComparer.Equal,
+			DefaultComparer.FormatKey,
+			merge,
 			iter,
 			snapshots,
-			&rangedel.Fragmenter{},
+			&keyspan.Fragmenter{},
+			&keyspan.Fragmenter{},
 			allowZeroSeqnum,
 			func([]byte) bool {
 				return elideTombstones
@@ -122,12 +138,25 @@ func TestCompactionIter(t *testing.T) {
 		datadriven.RunTest(t, fileFunc(formatVersion), func(d *datadriven.TestData) string {
 			switch d.Cmd {
 			case "define":
+				merge = nil
+				if len(d.CmdArgs) > 0 && d.CmdArgs[0].Key == "merger" &&
+					len(d.CmdArgs[0].Vals) > 0 && d.CmdArgs[0].Vals[0] == "deletable" {
+					merge = newDeletableSumValueMerger
+				}
 				keys = keys[:0]
 				vals = vals[:0]
+				rangeKeys = rangeKeys[:0]
 				for _, key := range strings.Split(d.Input, "\n") {
 					j := strings.Index(key, ":")
 					keys = append(keys, base.ParseInternalKey(key[:j]))
 					vals = append(vals, []byte(key[j+1:]))
+				}
+				return ""
+
+			case "define-range-keys":
+				for _, key := range strings.Split(d.Input, "\n") {
+					s := keyspan.ParseSpan(strings.TrimSpace(key))
+					rangeKeys = append(rangeKeys, s)
 				}
 				return ""
 
@@ -182,9 +211,20 @@ func TestCompactionIter(t *testing.T) {
 						if len(parts) == 2 {
 							key = []byte(parts[1])
 						}
-						for _, v := range iter.Tombstones(key, false) {
-							fmt.Fprintf(&b, "%s-%s#%d\n",
-								v.Start.UserKey, v.End, v.Start.SeqNum())
+						for _, v := range iter.Tombstones(key) {
+							for _, k := range v.Keys {
+								fmt.Fprintf(&b, "%s-%s#%d\n", v.Start, v.End, k.SeqNum())
+							}
+						}
+						fmt.Fprintf(&b, ".\n")
+						continue
+					case "range-keys":
+						var key []byte
+						if len(parts) == 2 {
+							key = []byte(parts[1])
+						}
+						for _, v := range iter.RangeKeys(key) {
+							fmt.Fprintf(&b, "%s\n", v)
 						}
 						fmt.Fprintf(&b, ".\n")
 						continue
@@ -194,7 +234,16 @@ func TestCompactionIter(t *testing.T) {
 					if iter.Valid() {
 						fmt.Fprintf(&b, "%s:%s\n", iter.Key(), iter.Value())
 						if iter.Key().Kind() == InternalKeyKindRangeDelete {
-							iter.rangeDelFrag.Add(iter.cloneKey(iter.Key()), iter.Value())
+							iter.rangeDelFrag.Add(keyspan.Span{
+								Start: append([]byte{}, iter.Key().UserKey...),
+								End:   append([]byte{}, iter.Value()...),
+								Keys: []keyspan.Key{
+									{Trailer: iter.Key().Trailer},
+								},
+							})
+						}
+						if rangekey.IsRangeKey(iter.Key().Kind()) {
+							iter.rangeKeyFrag.Add(*interleavingIter.Span())
 						}
 					} else if err := iter.Error(); err != nil {
 						fmt.Fprintf(&b, "err=%v\n", err)

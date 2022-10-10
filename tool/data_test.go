@@ -15,6 +15,7 @@ import (
 
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/datadriven"
+	"github.com/cockroachdb/pebble/internal/testkeys"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/require"
@@ -54,7 +55,7 @@ func runTests(t *testing.T, path string) {
 				args = append(args, strings.Fields(d.Input)...)
 
 				// The testdata files contain paths with "/" path separators, but we
-				// might be running on a sytem with a different path separator
+				// might be running on a system with a different path separator
 				// (e.g. Windows). Copy the input data into a mem filesystem which
 				// always uses "/" for the path separator.
 				for i := range args {
@@ -70,7 +71,6 @@ func runTests(t *testing.T, path string) {
 				var buf bytes.Buffer
 				stdout = &buf
 				stderr = &buf
-				osExit = func(int) {}
 
 				var secs int64
 				timeNow = func() time.Time { secs++; return time.Unix(secs, 0) }
@@ -78,7 +78,6 @@ func runTests(t *testing.T, path string) {
 				defer func() {
 					stdout = os.Stdout
 					stderr = os.Stderr
-					osExit = os.Exit
 					timeNow = time.Now
 				}()
 
@@ -112,7 +111,12 @@ func runTests(t *testing.T, path string) {
 					return &m
 				}()
 
-				tool := New(DefaultComparer(comparer), Comparers(altComparer), Mergers(merger), FS(fs))
+				tool := New(
+					DefaultComparer(comparer),
+					Comparers(altComparer, testkeys.Comparer),
+					Mergers(merger),
+					FS(fs),
+				)
 
 				c := &cobra.Command{}
 				c.AddCommand(tool.Commands...)

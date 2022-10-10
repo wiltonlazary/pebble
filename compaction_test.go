@@ -10,6 +10,7 @@ import (
 	"math"
 	"math/rand"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"runtime"
 	"sort"
@@ -25,6 +26,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/datadriven"
 	"github.com/cockroachdb/pebble/internal/errorfs"
+	"github.com/cockroachdb/pebble/internal/keyspan"
 	"github.com/cockroachdb/pebble/internal/manifest"
 	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/vfs"
@@ -40,11 +42,12 @@ func newVersion(opts *Options, files [numLevels][]*fileMetadata) *version {
 }
 
 type compactionPickerForTesting struct {
-	score     float64
-	level     int
-	baseLevel int
-	opts      *Options
-	vers      *manifest.Version
+	score         float64
+	level         int
+	baseLevel     int
+	opts          *Options
+	vers          *manifest.Version
+	maxLevelBytes [7]int64
 }
 
 var _ compactionPicker = &compactionPickerForTesting{}
@@ -82,10 +85,19 @@ func (p *compactionPickerForTesting) pickAuto(env compactionEnv) (pc *pickedComp
 		outputLevel: outputLevel,
 		file:        iter.Take(),
 	}
-	return pickAutoHelper(env, p.opts, p.vers, cInfo, p.baseLevel, diskAvailBytesInf)
+	if cInfo.level == 0 {
+		return pickL0(env, p.opts, p.vers, p.baseLevel, diskAvailBytesInf)
+	}
+	return pickAutoLPositive(env, p.opts, p.vers, cInfo, p.baseLevel, diskAvailBytesInf, p.maxLevelBytes)
 }
 
 func (p *compactionPickerForTesting) pickElisionOnlyCompaction(
+	env compactionEnv,
+) (pc *pickedCompaction) {
+	return nil
+}
+
+func (p *compactionPickerForTesting) pickRewriteCompaction(
 	env compactionEnv,
 ) (pc *pickedCompaction) {
 	return nil
@@ -97,7 +109,7 @@ func (p *compactionPickerForTesting) pickManual(
 	if p == nil {
 		return nil, false
 	}
-	return pickManualHelper(p.opts, manual, p.vers, p.baseLevel, diskAvailBytesInf), false
+	return pickManualHelper(p.opts, manual, p.vers, p.baseLevel, diskAvailBytesInf, p.maxLevelBytes), false
 }
 
 func (p *compactionPickerForTesting) pickReadTriggeredCompaction(
@@ -117,6 +129,14 @@ func TestPickCompaction(t *testing.T) {
 	}
 
 	opts := (*Options)(nil).EnsureDefaults()
+	newFileMeta := func(fileNum FileNum, size uint64, smallest, largest base.InternalKey) *fileMetadata {
+		m := (&fileMetadata{
+			FileNum: fileNum,
+			Size:    size,
+		}).ExtendPointKeyBounds(opts.Comparer.Compare, smallest, largest)
+		return m
+	}
+
 	testCases := []struct {
 		desc    string
 		version *version
@@ -127,12 +147,12 @@ func TestPickCompaction(t *testing.T) {
 			desc: "no compaction",
 			version: newVersion(opts, [numLevels][]*fileMetadata{
 				0: {
-					{
-						FileNum:  100,
-						Size:     1,
-						Smallest: base.ParseInternalKey("i.SET.101"),
-						Largest:  base.ParseInternalKey("j.SET.102"),
-					},
+					newFileMeta(
+						100,
+						1,
+						base.ParseInternalKey("i.SET.101"),
+						base.ParseInternalKey("j.SET.102"),
+					),
 				},
 			}),
 			want: "",
@@ -142,12 +162,12 @@ func TestPickCompaction(t *testing.T) {
 			desc: "1 L0 file",
 			version: newVersion(opts, [numLevels][]*fileMetadata{
 				0: {
-					{
-						FileNum:  100,
-						Size:     1,
-						Smallest: base.ParseInternalKey("i.SET.101"),
-						Largest:  base.ParseInternalKey("j.SET.102"),
-					},
+					newFileMeta(
+						100,
+						1,
+						base.ParseInternalKey("i.SET.101"),
+						base.ParseInternalKey("j.SET.102"),
+					),
 				},
 			}),
 			picker: compactionPickerForTesting{
@@ -162,18 +182,18 @@ func TestPickCompaction(t *testing.T) {
 			desc: "2 L0 files (0 overlaps)",
 			version: newVersion(opts, [numLevels][]*fileMetadata{
 				0: {
-					{
-						FileNum:  100,
-						Size:     1,
-						Smallest: base.ParseInternalKey("i.SET.101"),
-						Largest:  base.ParseInternalKey("j.SET.102"),
-					},
-					{
-						FileNum:  110,
-						Size:     1,
-						Smallest: base.ParseInternalKey("k.SET.111"),
-						Largest:  base.ParseInternalKey("l.SET.112"),
-					},
+					newFileMeta(
+						100,
+						1,
+						base.ParseInternalKey("i.SET.101"),
+						base.ParseInternalKey("j.SET.102"),
+					),
+					newFileMeta(
+						110,
+						1,
+						base.ParseInternalKey("k.SET.111"),
+						base.ParseInternalKey("l.SET.112"),
+					),
 				},
 			}),
 			picker: compactionPickerForTesting{
@@ -181,25 +201,25 @@ func TestPickCompaction(t *testing.T) {
 				level:     0,
 				baseLevel: 1,
 			},
-			want: "100  ",
+			want: "100,110  ",
 		},
 
 		{
 			desc: "2 L0 files, with ikey overlap",
 			version: newVersion(opts, [numLevels][]*fileMetadata{
 				0: {
-					{
-						FileNum:  100,
-						Size:     1,
-						Smallest: base.ParseInternalKey("i.SET.101"),
-						Largest:  base.ParseInternalKey("p.SET.102"),
-					},
-					{
-						FileNum:  110,
-						Size:     1,
-						Smallest: base.ParseInternalKey("j.SET.111"),
-						Largest:  base.ParseInternalKey("q.SET.112"),
-					},
+					newFileMeta(
+						100,
+						1,
+						base.ParseInternalKey("i.SET.101"),
+						base.ParseInternalKey("p.SET.102"),
+					),
+					newFileMeta(
+						110,
+						1,
+						base.ParseInternalKey("j.SET.111"),
+						base.ParseInternalKey("q.SET.112"),
+					),
 				},
 			}),
 			picker: compactionPickerForTesting{
@@ -214,18 +234,18 @@ func TestPickCompaction(t *testing.T) {
 			desc: "2 L0 files, with ukey overlap",
 			version: newVersion(opts, [numLevels][]*fileMetadata{
 				0: {
-					{
-						FileNum:  100,
-						Size:     1,
-						Smallest: base.ParseInternalKey("i.SET.101"),
-						Largest:  base.ParseInternalKey("i.SET.102"),
-					},
-					{
-						FileNum:  110,
-						Size:     1,
-						Smallest: base.ParseInternalKey("i.SET.111"),
-						Largest:  base.ParseInternalKey("i.SET.112"),
-					},
+					newFileMeta(
+						100,
+						1,
+						base.ParseInternalKey("i.SET.101"),
+						base.ParseInternalKey("i.SET.102"),
+					),
+					newFileMeta(
+						110,
+						1,
+						base.ParseInternalKey("i.SET.111"),
+						base.ParseInternalKey("i.SET.112"),
+					),
 				},
 			}),
 			picker: compactionPickerForTesting{
@@ -240,26 +260,26 @@ func TestPickCompaction(t *testing.T) {
 			desc: "1 L0 file, 2 L1 files (0 overlaps)",
 			version: newVersion(opts, [numLevels][]*fileMetadata{
 				0: {
-					{
-						FileNum:  100,
-						Size:     1,
-						Smallest: base.ParseInternalKey("i.SET.101"),
-						Largest:  base.ParseInternalKey("i.SET.102"),
-					},
+					newFileMeta(
+						100,
+						1,
+						base.ParseInternalKey("i.SET.101"),
+						base.ParseInternalKey("i.SET.102"),
+					),
 				},
 				1: {
-					{
-						FileNum:  200,
-						Size:     1,
-						Smallest: base.ParseInternalKey("a.SET.201"),
-						Largest:  base.ParseInternalKey("b.SET.202"),
-					},
-					{
-						FileNum:  210,
-						Size:     1,
-						Smallest: base.ParseInternalKey("y.SET.211"),
-						Largest:  base.ParseInternalKey("z.SET.212"),
-					},
+					newFileMeta(
+						200,
+						1,
+						base.ParseInternalKey("a.SET.201"),
+						base.ParseInternalKey("b.SET.202"),
+					),
+					newFileMeta(
+						210,
+						1,
+						base.ParseInternalKey("y.SET.211"),
+						base.ParseInternalKey("z.SET.212"),
+					),
 				},
 			}),
 			picker: compactionPickerForTesting{
@@ -274,52 +294,52 @@ func TestPickCompaction(t *testing.T) {
 			desc: "1 L0 file, 2 L1 files (1 overlap), 4 L2 files (3 overlaps)",
 			version: newVersion(opts, [numLevels][]*fileMetadata{
 				0: {
-					{
-						FileNum:  100,
-						Size:     1,
-						Smallest: base.ParseInternalKey("i.SET.101"),
-						Largest:  base.ParseInternalKey("t.SET.102"),
-					},
+					newFileMeta(
+						100,
+						1,
+						base.ParseInternalKey("i.SET.101"),
+						base.ParseInternalKey("t.SET.102"),
+					),
 				},
 				1: {
-					{
-						FileNum:  200,
-						Size:     1,
-						Smallest: base.ParseInternalKey("a.SET.201"),
-						Largest:  base.ParseInternalKey("e.SET.202"),
-					},
-					{
-						FileNum:  210,
-						Size:     1,
-						Smallest: base.ParseInternalKey("f.SET.211"),
-						Largest:  base.ParseInternalKey("j.SET.212"),
-					},
+					newFileMeta(
+						200,
+						1,
+						base.ParseInternalKey("a.SET.201"),
+						base.ParseInternalKey("e.SET.202"),
+					),
+					newFileMeta(
+						210,
+						1,
+						base.ParseInternalKey("f.SET.211"),
+						base.ParseInternalKey("j.SET.212"),
+					),
 				},
 				2: {
-					{
-						FileNum:  300,
-						Size:     1,
-						Smallest: base.ParseInternalKey("a.SET.301"),
-						Largest:  base.ParseInternalKey("b.SET.302"),
-					},
-					{
-						FileNum:  310,
-						Size:     1,
-						Smallest: base.ParseInternalKey("c.SET.311"),
-						Largest:  base.ParseInternalKey("g.SET.312"),
-					},
-					{
-						FileNum:  320,
-						Size:     1,
-						Smallest: base.ParseInternalKey("h.SET.321"),
-						Largest:  base.ParseInternalKey("m.SET.322"),
-					},
-					{
-						FileNum:  330,
-						Size:     1,
-						Smallest: base.ParseInternalKey("n.SET.331"),
-						Largest:  base.ParseInternalKey("z.SET.332"),
-					},
+					newFileMeta(
+						300,
+						1,
+						base.ParseInternalKey("a.SET.301"),
+						base.ParseInternalKey("b.SET.302"),
+					),
+					newFileMeta(
+						310,
+						1,
+						base.ParseInternalKey("c.SET.311"),
+						base.ParseInternalKey("g.SET.312"),
+					),
+					newFileMeta(
+						320,
+						1,
+						base.ParseInternalKey("h.SET.321"),
+						base.ParseInternalKey("m.SET.322"),
+					),
+					newFileMeta(
+						330,
+						1,
+						base.ParseInternalKey("n.SET.331"),
+						base.ParseInternalKey("z.SET.332"),
+					),
 				},
 			}),
 			picker: compactionPickerForTesting{
@@ -334,44 +354,44 @@ func TestPickCompaction(t *testing.T) {
 			desc: "4 L1 files, 2 L2 files, can grow",
 			version: newVersion(opts, [numLevels][]*fileMetadata{
 				1: {
-					{
-						FileNum:  200,
-						Size:     1,
-						Smallest: base.ParseInternalKey("i1.SET.201"),
-						Largest:  base.ParseInternalKey("i2.SET.202"),
-					},
-					{
-						FileNum:  210,
-						Size:     1,
-						Smallest: base.ParseInternalKey("j1.SET.211"),
-						Largest:  base.ParseInternalKey("j2.SET.212"),
-					},
-					{
-						FileNum:  220,
-						Size:     1,
-						Smallest: base.ParseInternalKey("k1.SET.221"),
-						Largest:  base.ParseInternalKey("k2.SET.222"),
-					},
-					{
-						FileNum:  230,
-						Size:     1,
-						Smallest: base.ParseInternalKey("l1.SET.231"),
-						Largest:  base.ParseInternalKey("l2.SET.232"),
-					},
+					newFileMeta(
+						200,
+						1,
+						base.ParseInternalKey("i1.SET.201"),
+						base.ParseInternalKey("i2.SET.202"),
+					),
+					newFileMeta(
+						210,
+						1,
+						base.ParseInternalKey("j1.SET.211"),
+						base.ParseInternalKey("j2.SET.212"),
+					),
+					newFileMeta(
+						220,
+						1,
+						base.ParseInternalKey("k1.SET.221"),
+						base.ParseInternalKey("k2.SET.222"),
+					),
+					newFileMeta(
+						230,
+						1,
+						base.ParseInternalKey("l1.SET.231"),
+						base.ParseInternalKey("l2.SET.232"),
+					),
 				},
 				2: {
-					{
-						FileNum:  300,
-						Size:     1,
-						Smallest: base.ParseInternalKey("a0.SET.301"),
-						Largest:  base.ParseInternalKey("l0.SET.302"),
-					},
-					{
-						FileNum:  310,
-						Size:     1,
-						Smallest: base.ParseInternalKey("l2.SET.311"),
-						Largest:  base.ParseInternalKey("z2.SET.312"),
-					},
+					newFileMeta(
+						300,
+						1,
+						base.ParseInternalKey("a0.SET.301"),
+						base.ParseInternalKey("l0.SET.302"),
+					),
+					newFileMeta(
+						310,
+						1,
+						base.ParseInternalKey("l2.SET.311"),
+						base.ParseInternalKey("z2.SET.312"),
+					),
 				},
 			}),
 			picker: compactionPickerForTesting{
@@ -386,44 +406,44 @@ func TestPickCompaction(t *testing.T) {
 			desc: "4 L1 files, 2 L2 files, can't grow (range)",
 			version: newVersion(opts, [numLevels][]*fileMetadata{
 				1: {
-					{
-						FileNum:  200,
-						Size:     1,
-						Smallest: base.ParseInternalKey("i1.SET.201"),
-						Largest:  base.ParseInternalKey("i2.SET.202"),
-					},
-					{
-						FileNum:  210,
-						Size:     1,
-						Smallest: base.ParseInternalKey("j1.SET.211"),
-						Largest:  base.ParseInternalKey("j2.SET.212"),
-					},
-					{
-						FileNum:  220,
-						Size:     1,
-						Smallest: base.ParseInternalKey("k1.SET.221"),
-						Largest:  base.ParseInternalKey("k2.SET.222"),
-					},
-					{
-						FileNum:  230,
-						Size:     1,
-						Smallest: base.ParseInternalKey("l1.SET.231"),
-						Largest:  base.ParseInternalKey("l2.SET.232"),
-					},
+					newFileMeta(
+						200,
+						1,
+						base.ParseInternalKey("i1.SET.201"),
+						base.ParseInternalKey("i2.SET.202"),
+					),
+					newFileMeta(
+						210,
+						1,
+						base.ParseInternalKey("j1.SET.211"),
+						base.ParseInternalKey("j2.SET.212"),
+					),
+					newFileMeta(
+						220,
+						1,
+						base.ParseInternalKey("k1.SET.221"),
+						base.ParseInternalKey("k2.SET.222"),
+					),
+					newFileMeta(
+						230,
+						1,
+						base.ParseInternalKey("l1.SET.231"),
+						base.ParseInternalKey("l2.SET.232"),
+					),
 				},
 				2: {
-					{
-						FileNum:  300,
-						Size:     1,
-						Smallest: base.ParseInternalKey("a0.SET.301"),
-						Largest:  base.ParseInternalKey("j0.SET.302"),
-					},
-					{
-						FileNum:  310,
-						Size:     1,
-						Smallest: base.ParseInternalKey("j2.SET.311"),
-						Largest:  base.ParseInternalKey("z2.SET.312"),
-					},
+					newFileMeta(
+						300,
+						1,
+						base.ParseInternalKey("a0.SET.301"),
+						base.ParseInternalKey("j0.SET.302"),
+					),
+					newFileMeta(
+						310,
+						1,
+						base.ParseInternalKey("j2.SET.311"),
+						base.ParseInternalKey("z2.SET.312"),
+					),
 				},
 			}),
 			picker: compactionPickerForTesting{
@@ -438,44 +458,44 @@ func TestPickCompaction(t *testing.T) {
 			desc: "4 L1 files, 2 L2 files, can't grow (size)",
 			version: newVersion(opts, [numLevels][]*fileMetadata{
 				1: {
-					{
-						FileNum:  200,
-						Size:     expandedCompactionByteSizeLimit(opts, 1, math.MaxUint64) - 1,
-						Smallest: base.ParseInternalKey("i1.SET.201"),
-						Largest:  base.ParseInternalKey("i2.SET.202"),
-					},
-					{
-						FileNum:  210,
-						Size:     expandedCompactionByteSizeLimit(opts, 1, math.MaxUint64) - 1,
-						Smallest: base.ParseInternalKey("j1.SET.211"),
-						Largest:  base.ParseInternalKey("j2.SET.212"),
-					},
-					{
-						FileNum:  220,
-						Size:     expandedCompactionByteSizeLimit(opts, 1, math.MaxUint64) - 1,
-						Smallest: base.ParseInternalKey("k1.SET.221"),
-						Largest:  base.ParseInternalKey("k2.SET.222"),
-					},
-					{
-						FileNum:  230,
-						Size:     expandedCompactionByteSizeLimit(opts, 1, math.MaxUint64) - 1,
-						Smallest: base.ParseInternalKey("l1.SET.231"),
-						Largest:  base.ParseInternalKey("l2.SET.232"),
-					},
+					newFileMeta(
+						200,
+						expandedCompactionByteSizeLimit(opts, 1, math.MaxUint64)-1,
+						base.ParseInternalKey("i1.SET.201"),
+						base.ParseInternalKey("i2.SET.202"),
+					),
+					newFileMeta(
+						210,
+						expandedCompactionByteSizeLimit(opts, 1, math.MaxUint64)-1,
+						base.ParseInternalKey("j1.SET.211"),
+						base.ParseInternalKey("j2.SET.212"),
+					),
+					newFileMeta(
+						220,
+						expandedCompactionByteSizeLimit(opts, 1, math.MaxUint64)-1,
+						base.ParseInternalKey("k1.SET.221"),
+						base.ParseInternalKey("k2.SET.222"),
+					),
+					newFileMeta(
+						230,
+						expandedCompactionByteSizeLimit(opts, 1, math.MaxUint64)-1,
+						base.ParseInternalKey("l1.SET.231"),
+						base.ParseInternalKey("l2.SET.232"),
+					),
 				},
 				2: {
-					{
-						FileNum:  300,
-						Size:     expandedCompactionByteSizeLimit(opts, 2, math.MaxUint64) - 1,
-						Smallest: base.ParseInternalKey("a0.SET.301"),
-						Largest:  base.ParseInternalKey("l0.SET.302"),
-					},
-					{
-						FileNum:  310,
-						Size:     expandedCompactionByteSizeLimit(opts, 2, math.MaxUint64) - 1,
-						Smallest: base.ParseInternalKey("l2.SET.311"),
-						Largest:  base.ParseInternalKey("z2.SET.312"),
-					},
+					newFileMeta(
+						300,
+						expandedCompactionByteSizeLimit(opts, 2, math.MaxUint64)-1,
+						base.ParseInternalKey("a0.SET.301"),
+						base.ParseInternalKey("l0.SET.302"),
+					),
+					newFileMeta(
+						310,
+						expandedCompactionByteSizeLimit(opts, 2, math.MaxUint64)-1,
+						base.ParseInternalKey("l2.SET.311"),
+						base.ParseInternalKey("z2.SET.312"),
+					),
 				},
 			}),
 			picker: compactionPickerForTesting{
@@ -498,11 +518,9 @@ func TestPickCompaction(t *testing.T) {
 		tc.picker.opts = opts
 		tc.picker.vers = tc.version
 		vs.picker = &tc.picker
-		env := compactionEnv{bytesCompacted: new(uint64)}
-
-		pc, got := vs.picker.pickAuto(env), ""
+		pc, got := vs.picker.pickAuto(compactionEnv{}), ""
 		if pc != nil {
-			c := newCompaction(pc, opts, env.bytesCompacted)
+			c := newCompaction(pc, opts)
 			got0 := fileNums(c.startLevel.files)
 			got1 := fileNums(c.outputLevel.files)
 			got2 := fileNums(c.grandparents)
@@ -517,6 +535,11 @@ func TestPickCompaction(t *testing.T) {
 func TestElideTombstone(t *testing.T) {
 	opts := &Options{}
 	opts.EnsureDefaults()
+
+	newFileMeta := func(smallest, largest base.InternalKey) *fileMetadata {
+		m := (&fileMetadata{}).ExtendPointKeyBounds(opts.Comparer.Compare, smallest, largest)
+		return m
+	}
 
 	type want struct {
 		key      string
@@ -542,44 +565,44 @@ func TestElideTombstone(t *testing.T) {
 			level: 1,
 			version: newVersion(opts, [numLevels][]*fileMetadata{
 				1: {
-					{
-						Smallest: base.ParseInternalKey("c.SET.801"),
-						Largest:  base.ParseInternalKey("g.SET.800"),
-					},
-					{
-						Smallest: base.ParseInternalKey("x.SET.701"),
-						Largest:  base.ParseInternalKey("y.SET.700"),
-					},
+					newFileMeta(
+						base.ParseInternalKey("c.SET.801"),
+						base.ParseInternalKey("g.SET.800"),
+					),
+					newFileMeta(
+						base.ParseInternalKey("x.SET.701"),
+						base.ParseInternalKey("y.SET.700"),
+					),
 				},
 				2: {
-					{
-						Smallest: base.ParseInternalKey("d.SET.601"),
-						Largest:  base.ParseInternalKey("h.SET.600"),
-					},
-					{
-						Smallest: base.ParseInternalKey("r.SET.501"),
-						Largest:  base.ParseInternalKey("t.SET.500"),
-					},
+					newFileMeta(
+						base.ParseInternalKey("d.SET.601"),
+						base.ParseInternalKey("h.SET.600"),
+					),
+					newFileMeta(
+						base.ParseInternalKey("r.SET.501"),
+						base.ParseInternalKey("t.SET.500"),
+					),
 				},
 				3: {
-					{
-						Smallest: base.ParseInternalKey("f.SET.401"),
-						Largest:  base.ParseInternalKey("g.SET.400"),
-					},
-					{
-						Smallest: base.ParseInternalKey("w.SET.301"),
-						Largest:  base.ParseInternalKey("x.SET.300"),
-					},
+					newFileMeta(
+						base.ParseInternalKey("f.SET.401"),
+						base.ParseInternalKey("g.SET.400"),
+					),
+					newFileMeta(
+						base.ParseInternalKey("w.SET.301"),
+						base.ParseInternalKey("x.SET.300"),
+					),
 				},
 				4: {
-					{
-						Smallest: base.ParseInternalKey("f.SET.201"),
-						Largest:  base.ParseInternalKey("m.SET.200"),
-					},
-					{
-						Smallest: base.ParseInternalKey("t.SET.101"),
-						Largest:  base.ParseInternalKey("t.SET.100"),
-					},
+					newFileMeta(
+						base.ParseInternalKey("f.SET.201"),
+						base.ParseInternalKey("m.SET.200"),
+					),
+					newFileMeta(
+						base.ParseInternalKey("t.SET.101"),
+						base.ParseInternalKey("t.SET.100"),
+					),
 				},
 			}),
 			wants: []want{
@@ -610,22 +633,22 @@ func TestElideTombstone(t *testing.T) {
 			level: 1,
 			version: newVersion(opts, [numLevels][]*fileMetadata{
 				6: {
-					{
-						Smallest: base.ParseInternalKey("i.SET.401"),
-						Largest:  base.ParseInternalKey("i.SET.400"),
-					},
-					{
-						Smallest: base.ParseInternalKey("i.SET.301"),
-						Largest:  base.ParseInternalKey("k.SET.300"),
-					},
-					{
-						Smallest: base.ParseInternalKey("k.SET.201"),
-						Largest:  base.ParseInternalKey("m.SET.200"),
-					},
-					{
-						Smallest: base.ParseInternalKey("m.SET.101"),
-						Largest:  base.ParseInternalKey("m.SET.100"),
-					},
+					newFileMeta(
+						base.ParseInternalKey("i.SET.401"),
+						base.ParseInternalKey("i.SET.400"),
+					),
+					newFileMeta(
+						base.ParseInternalKey("i.SET.301"),
+						base.ParseInternalKey("k.SET.300"),
+					),
+					newFileMeta(
+						base.ParseInternalKey("k.SET.201"),
+						base.ParseInternalKey("m.SET.200"),
+					),
+					newFileMeta(
+						base.ParseInternalKey("m.SET.101"),
+						base.ParseInternalKey("m.SET.100"),
+					),
 				},
 			}),
 			wants: []want{
@@ -643,6 +666,7 @@ func TestElideTombstone(t *testing.T) {
 	for _, tc := range testCases {
 		c := compaction{
 			cmp:      DefaultComparer.Compare,
+			comparer: DefaultComparer,
 			version:  tc.version,
 			inputs:   []compactionLevel{{level: tc.level}, {level: tc.level + 1}},
 			smallest: base.ParseInternalKey("a.SET.0"),
@@ -660,6 +684,13 @@ func TestElideTombstone(t *testing.T) {
 
 func TestElideRangeTombstone(t *testing.T) {
 	opts := (*Options)(nil).EnsureDefaults()
+
+	newFileMeta := func(smallest, largest base.InternalKey) *fileMetadata {
+		m := (&fileMetadata{}).ExtendPointKeyBounds(
+			opts.Comparer.Compare, smallest, largest,
+		)
+		return m
+	}
 
 	type want struct {
 		key      string
@@ -687,44 +718,44 @@ func TestElideRangeTombstone(t *testing.T) {
 			level: 1,
 			version: newVersion(opts, [numLevels][]*fileMetadata{
 				1: {
-					{
-						Smallest: base.ParseInternalKey("c.SET.801"),
-						Largest:  base.ParseInternalKey("g.SET.800"),
-					},
-					{
-						Smallest: base.ParseInternalKey("x.SET.701"),
-						Largest:  base.ParseInternalKey("y.SET.700"),
-					},
+					newFileMeta(
+						base.ParseInternalKey("c.SET.801"),
+						base.ParseInternalKey("g.SET.800"),
+					),
+					newFileMeta(
+						base.ParseInternalKey("x.SET.701"),
+						base.ParseInternalKey("y.SET.700"),
+					),
 				},
 				2: {
-					{
-						Smallest: base.ParseInternalKey("d.SET.601"),
-						Largest:  base.ParseInternalKey("h.SET.600"),
-					},
-					{
-						Smallest: base.ParseInternalKey("r.SET.501"),
-						Largest:  base.ParseInternalKey("t.SET.500"),
-					},
+					newFileMeta(
+						base.ParseInternalKey("d.SET.601"),
+						base.ParseInternalKey("h.SET.600"),
+					),
+					newFileMeta(
+						base.ParseInternalKey("r.SET.501"),
+						base.ParseInternalKey("t.SET.500"),
+					),
 				},
 				3: {
-					{
-						Smallest: base.ParseInternalKey("f.SET.401"),
-						Largest:  base.ParseInternalKey("g.SET.400"),
-					},
-					{
-						Smallest: base.ParseInternalKey("w.SET.301"),
-						Largest:  base.ParseInternalKey("x.SET.300"),
-					},
+					newFileMeta(
+						base.ParseInternalKey("f.SET.401"),
+						base.ParseInternalKey("g.SET.400"),
+					),
+					newFileMeta(
+						base.ParseInternalKey("w.SET.301"),
+						base.ParseInternalKey("x.SET.300"),
+					),
 				},
 				4: {
-					{
-						Smallest: base.ParseInternalKey("f.SET.201"),
-						Largest:  base.ParseInternalKey("m.SET.200"),
-					},
-					{
-						Smallest: base.ParseInternalKey("t.SET.101"),
-						Largest:  base.ParseInternalKey("t.SET.100"),
-					},
+					newFileMeta(
+						base.ParseInternalKey("f.SET.201"),
+						base.ParseInternalKey("m.SET.200"),
+					),
+					newFileMeta(
+						base.ParseInternalKey("t.SET.101"),
+						base.ParseInternalKey("t.SET.100"),
+					),
 				},
 			}),
 			wants: []want{
@@ -754,20 +785,20 @@ func TestElideRangeTombstone(t *testing.T) {
 			level: -1,
 			version: newVersion(opts, [numLevels][]*fileMetadata{
 				0: {
-					{
-						Smallest: base.ParseInternalKey("h.SET.901"),
-						Largest:  base.ParseInternalKey("j.SET.900"),
-					},
+					newFileMeta(
+						base.ParseInternalKey("h.SET.901"),
+						base.ParseInternalKey("j.SET.900"),
+					),
 				},
 				1: {
-					{
-						Smallest: base.ParseInternalKey("c.SET.801"),
-						Largest:  base.ParseInternalKey("g.SET.800"),
-					},
-					{
-						Smallest: base.ParseInternalKey("x.SET.701"),
-						Largest:  base.ParseInternalKey("y.SET.700"),
-					},
+					newFileMeta(
+						base.ParseInternalKey("c.SET.801"),
+						base.ParseInternalKey("g.SET.800"),
+					),
+					newFileMeta(
+						base.ParseInternalKey("x.SET.701"),
+						base.ParseInternalKey("y.SET.700"),
+					),
 				},
 			}),
 			wants: []want{
@@ -781,6 +812,7 @@ func TestElideRangeTombstone(t *testing.T) {
 	for _, tc := range testCases {
 		c := compaction{
 			cmp:      DefaultComparer.Compare,
+			comparer: DefaultComparer,
 			version:  tc.version,
 			inputs:   []compactionLevel{{level: tc.level}, {level: tc.level + 1}},
 			smallest: base.ParseInternalKey("a.SET.0"),
@@ -797,6 +829,102 @@ func TestElideRangeTombstone(t *testing.T) {
 	}
 }
 
+func TestCompactionTransform(t *testing.T) {
+	datadriven.RunTest(t, "testdata/compaction_transform", func(td *datadriven.TestData) string {
+		switch td.Cmd {
+		case "transform":
+			var snapshots []uint64
+			var keyRanges []manifest.UserKeyRange
+			disableElision := false
+			for i := range td.CmdArgs {
+				switch td.CmdArgs[i].Key {
+				case "snapshots":
+					for _, snapshot := range td.CmdArgs[i].Vals {
+						s, err := strconv.ParseUint(snapshot, 10, 64)
+						if err != nil {
+							return err.Error()
+						}
+						snapshots = append(snapshots, s)
+					}
+				case "in-use-key-ranges":
+					for _, keyRange := range td.CmdArgs[i].Vals {
+						parts := strings.SplitN(keyRange, "-", 2)
+						start := []byte(strings.TrimSpace(parts[0]))
+						end := []byte(strings.TrimSpace(parts[1]))
+						keyRanges = append(keyRanges, manifest.UserKeyRange{
+							Start: start,
+							End:   end,
+						})
+					}
+				case "disable-elision":
+					disableElision = true
+				}
+			}
+			span := keyspan.ParseSpan(td.Input)
+			for i := range span.Keys {
+				if i > 0 {
+					if span.Keys[i-1].Trailer < span.Keys[i].Trailer {
+						return "span keys not sorted"
+					}
+				}
+			}
+			var outSpan keyspan.Span
+			c := compaction{
+				cmp:                base.DefaultComparer.Compare,
+				comparer:           base.DefaultComparer,
+				disableSpanElision: disableElision,
+				inuseKeyRanges:     keyRanges,
+			}
+			transformer := rangeKeyCompactionTransform(snapshots, c.elideRangeTombstone)
+			if err := transformer.Transform(base.DefaultComparer.Compare, span, &outSpan); err != nil {
+				return fmt.Sprintf("error: %s", err)
+			}
+			return outSpan.String()
+		default:
+			return fmt.Sprintf("unknown command: %s", td.Cmd)
+		}
+	})
+}
+
+type cpuPermissionGranter struct {
+	granted int
+	used    bool
+}
+
+func (t *cpuPermissionGranter) TryGetProcs(count int) int {
+	t.granted += count
+	t.used = true
+	return count
+}
+
+func (t *cpuPermissionGranter) ReturnProcs(count int) {
+	t.granted -= count
+}
+
+// Simple test to check if compactions are using the granter, and if exactly the
+// used slots are being freed.
+func TestCompactionSlots(t *testing.T) {
+	mem := vfs.NewMem()
+	opts := &Options{
+		FS: mem,
+	}
+	g := &cpuPermissionGranter{}
+	opts.Experimental.CPUWorkPermissionGranter = g
+	d, err := Open("", opts)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer d.Close()
+
+	d.Set([]byte{'a'}, []byte{'a'}, nil)
+	err = d.Compact([]byte{'a'}, []byte{'b'}, true)
+	if err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	require.True(t, g.used)
+	require.Equal(t, 0, g.granted)
+}
+
 func TestCompaction(t *testing.T) {
 	const memTableSize = 10000
 	// Tuned so that 2 values can reside in the memtable before a flush, but a
@@ -811,14 +939,11 @@ func TestCompaction(t *testing.T) {
 		DebugCheck:            DebugCheckLevels,
 		L0CompactionThreshold: 8,
 	}
-	opts.private.enablePacing = true
 	opts.testingRandomized()
 	d, err := Open("", opts)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	mockLimiter := mockCountLimiter{burst: int(math.MaxInt32)}
-	d.compactionLimiter = &mockLimiter
 
 	get1 := func(iter internalIterator) (ret string) {
 		b := &bytes.Buffer{}
@@ -842,7 +967,7 @@ func TestCompaction(t *testing.T) {
 		for _, levelMetadata := range v.Levels {
 			iter := levelMetadata.Iter()
 			for meta := iter.First(); meta != nil; meta = iter.Next() {
-				f, err := mem.Open(base.MakeFilename(mem, "", fileTypeTable, meta.FileNum))
+				f, err := mem.Open(base.MakeFilepath(mem, "", fileTypeTable, meta.FileNum))
 				if err != nil {
 					return "", "", errors.WithStack(err)
 				}
@@ -920,16 +1045,8 @@ func TestCompaction(t *testing.T) {
 			t.Errorf("%q: %v", tc.key, err)
 		}
 	}
-
 	if err := d.Close(); err != nil {
 		t.Fatalf("db Close: %v", err)
-	}
-
-	if mockLimiter.allowCount != 0 {
-		t.Errorf("limiter allow: got %d, want %d", mockLimiter.allowCount, 0)
-	}
-	if mockLimiter.waitCount == 0 {
-		t.Errorf("limiter wait: got %d, want >%d", mockLimiter.waitCount, 0)
 	}
 }
 
@@ -944,6 +1061,12 @@ func TestValidateVersionEdit(t *testing.T) {
 		return nil
 	}
 
+	cmp := DefaultComparer.Compare
+	newFileMeta := func(smallest, largest base.InternalKey) *fileMetadata {
+		m := (&fileMetadata{}).ExtendPointKeyBounds(cmp, smallest, largest)
+		return m
+	}
+
 	testCases := []struct {
 		desc    string
 		ve      *versionEdit
@@ -955,10 +1078,10 @@ func TestValidateVersionEdit(t *testing.T) {
 			ve: &versionEdit{
 				NewFiles: []manifest.NewFileEntry{
 					{
-						Meta: &fileMetadata{
-							Smallest: manifest.InternalKey{UserKey: []byte(badKey)},
-							Largest:  manifest.InternalKey{UserKey: []byte("z")},
-						},
+						Meta: newFileMeta(
+							manifest.InternalKey{UserKey: []byte(badKey)},
+							manifest.InternalKey{UserKey: []byte("z")},
+						),
 					},
 				},
 			},
@@ -970,10 +1093,10 @@ func TestValidateVersionEdit(t *testing.T) {
 			ve: &versionEdit{
 				NewFiles: []manifest.NewFileEntry{
 					{
-						Meta: &fileMetadata{
-							Smallest: manifest.InternalKey{UserKey: []byte("a")},
-							Largest:  manifest.InternalKey{UserKey: []byte(badKey)},
-						},
+						Meta: newFileMeta(
+							manifest.InternalKey{UserKey: []byte("a")},
+							manifest.InternalKey{UserKey: []byte(badKey)},
+						),
 					},
 				},
 			},
@@ -985,16 +1108,16 @@ func TestValidateVersionEdit(t *testing.T) {
 			ve: &versionEdit{
 				NewFiles: []manifest.NewFileEntry{
 					{
-						Meta: &fileMetadata{
-							Smallest: manifest.InternalKey{UserKey: []byte("a")},
-							Largest:  manifest.InternalKey{UserKey: []byte("c")},
-						},
+						Meta: newFileMeta(
+							manifest.InternalKey{UserKey: []byte("a")},
+							manifest.InternalKey{UserKey: []byte("c")},
+						),
 					},
 					{
-						Meta: &fileMetadata{
-							Smallest: manifest.InternalKey{UserKey: []byte(badKey)},
-							Largest:  manifest.InternalKey{UserKey: []byte("z")},
-						},
+						Meta: newFileMeta(
+							manifest.InternalKey{UserKey: []byte(badKey)},
+							manifest.InternalKey{UserKey: []byte("z")},
+						),
 					},
 				},
 			},
@@ -1005,10 +1128,10 @@ func TestValidateVersionEdit(t *testing.T) {
 			desc: "single deleted file; start key",
 			ve: &versionEdit{
 				DeletedFiles: map[manifest.DeletedFileEntry]*manifest.FileMetadata{
-					deletedFileEntry{Level: 0, FileNum: 0}: {
-						Smallest: manifest.InternalKey{UserKey: []byte(badKey)},
-						Largest:  manifest.InternalKey{UserKey: []byte("z")},
-					},
+					deletedFileEntry{Level: 0, FileNum: 0}: newFileMeta(
+						manifest.InternalKey{UserKey: []byte(badKey)},
+						manifest.InternalKey{UserKey: []byte("z")},
+					),
 				},
 			},
 			vFunc:   validateFn,
@@ -1018,10 +1141,10 @@ func TestValidateVersionEdit(t *testing.T) {
 			desc: "single deleted file; end key",
 			ve: &versionEdit{
 				DeletedFiles: map[manifest.DeletedFileEntry]*manifest.FileMetadata{
-					deletedFileEntry{Level: 0, FileNum: 0}: {
-						Smallest: manifest.InternalKey{UserKey: []byte("a")},
-						Largest:  manifest.InternalKey{UserKey: []byte(badKey)},
-					},
+					deletedFileEntry{Level: 0, FileNum: 0}: newFileMeta(
+						manifest.InternalKey{UserKey: []byte("a")},
+						manifest.InternalKey{UserKey: []byte(badKey)},
+					),
 				},
 			},
 			vFunc:   validateFn,
@@ -1031,14 +1154,14 @@ func TestValidateVersionEdit(t *testing.T) {
 			desc: "multiple deleted files",
 			ve: &versionEdit{
 				DeletedFiles: map[manifest.DeletedFileEntry]*manifest.FileMetadata{
-					deletedFileEntry{Level: 0, FileNum: 0}: {
-						Smallest: manifest.InternalKey{UserKey: []byte("a")},
-						Largest:  manifest.InternalKey{UserKey: []byte("c")},
-					},
-					deletedFileEntry{Level: 0, FileNum: 1}: {
-						Smallest: manifest.InternalKey{UserKey: []byte(badKey)},
-						Largest:  manifest.InternalKey{UserKey: []byte("z")},
-					},
+					deletedFileEntry{Level: 0, FileNum: 0}: newFileMeta(
+						manifest.InternalKey{UserKey: []byte("a")},
+						manifest.InternalKey{UserKey: []byte("c")},
+					),
+					deletedFileEntry{Level: 0, FileNum: 1}: newFileMeta(
+						manifest.InternalKey{UserKey: []byte(badKey)},
+						manifest.InternalKey{UserKey: []byte("z")},
+					),
 				},
 			},
 			vFunc:   validateFn,
@@ -1050,28 +1173,28 @@ func TestValidateVersionEdit(t *testing.T) {
 				NewFiles: []manifest.NewFileEntry{
 					{
 						Level: 0,
-						Meta: &fileMetadata{
-							Smallest: manifest.InternalKey{UserKey: []byte("b")},
-							Largest:  manifest.InternalKey{UserKey: []byte("c")},
-						},
+						Meta: newFileMeta(
+							manifest.InternalKey{UserKey: []byte("b")},
+							manifest.InternalKey{UserKey: []byte("c")},
+						),
 					},
 					{
 						Level: 0,
-						Meta: &fileMetadata{
-							Smallest: manifest.InternalKey{UserKey: []byte("d")},
-							Largest:  manifest.InternalKey{UserKey: []byte("g")},
-						},
+						Meta: newFileMeta(
+							manifest.InternalKey{UserKey: []byte("d")},
+							manifest.InternalKey{UserKey: []byte("g")},
+						),
 					},
 				},
 				DeletedFiles: map[manifest.DeletedFileEntry]*manifest.FileMetadata{
-					deletedFileEntry{Level: 6, FileNum: 0}: {
-						Smallest: manifest.InternalKey{UserKey: []byte("a")},
-						Largest:  manifest.InternalKey{UserKey: []byte("d")},
-					},
-					deletedFileEntry{Level: 6, FileNum: 1}: {
-						Smallest: manifest.InternalKey{UserKey: []byte("x")},
-						Largest:  manifest.InternalKey{UserKey: []byte("z")},
-					},
+					deletedFileEntry{Level: 6, FileNum: 0}: newFileMeta(
+						manifest.InternalKey{UserKey: []byte("a")},
+						manifest.InternalKey{UserKey: []byte("d")},
+					),
+					deletedFileEntry{Level: 6, FileNum: 1}: newFileMeta(
+						manifest.InternalKey{UserKey: []byte("x")},
+						manifest.InternalKey{UserKey: []byte("z")},
+					),
 				},
 			},
 			vFunc: validateFn,
@@ -1099,6 +1222,7 @@ func TestManualCompaction(t *testing.T) {
 	var d *DB
 	defer func() {
 		if d != nil {
+			require.NoError(t, closeAllSnapshots(d))
 			require.NoError(t, d.Close())
 		}
 	}()
@@ -1113,6 +1237,7 @@ func TestManualCompaction(t *testing.T) {
 
 	reset := func(minVersion, maxVersion FormatMajorVersion) {
 		if d != nil {
+			require.NoError(t, closeAllSnapshots(d))
 			require.NoError(t, d.Close())
 		}
 		mem = vfs.NewMem()
@@ -1123,14 +1248,50 @@ func TestManualCompaction(t *testing.T) {
 			DebugCheck:         DebugCheckLevels,
 			FormatMajorVersion: randVersion(minVersion, maxVersion),
 		}
-		opts.private.disableAutomaticCompactions = true
+		opts.DisableAutomaticCompactions = true
 
 		var err error
 		d, err = Open("", opts)
 		require.NoError(t, err)
 	}
 
-	runTest := func(t *testing.T, testData string, minVersion, maxVersion FormatMajorVersion) {
+	// d.mu must be held when calling.
+	createOngoingCompaction := func(start, end []byte, startLevel, outputLevel int) (ongoingCompaction *compaction) {
+		ongoingCompaction = &compaction{
+			inputs:   []compactionLevel{{level: startLevel}, {level: outputLevel}},
+			smallest: InternalKey{UserKey: start},
+			largest:  InternalKey{UserKey: end},
+		}
+		ongoingCompaction.startLevel = &ongoingCompaction.inputs[0]
+		ongoingCompaction.outputLevel = &ongoingCompaction.inputs[1]
+		// Mark files as compacting.
+		curr := d.mu.versions.currentVersion()
+		ongoingCompaction.startLevel.files = curr.Overlaps(startLevel, d.cmp, start, end, false)
+		ongoingCompaction.outputLevel.files = curr.Overlaps(outputLevel, d.cmp, start, end, false)
+		for _, cl := range ongoingCompaction.inputs {
+			iter := cl.files.Iter()
+			for f := iter.First(); f != nil; f = iter.Next() {
+				f.CompactionState = manifest.CompactionStateCompacting
+			}
+		}
+		d.mu.compact.inProgress[ongoingCompaction] = struct{}{}
+		d.mu.compact.compactingCount++
+		return
+	}
+
+	// d.mu must be held when calling.
+	deleteOngoingCompaction := func(ongoingCompaction *compaction) {
+		for _, cl := range ongoingCompaction.inputs {
+			iter := cl.files.Iter()
+			for f := iter.First(); f != nil; f = iter.Next() {
+				f.CompactionState = manifest.CompactionStateNotCompacting
+			}
+		}
+		delete(d.mu.compact.inProgress, ongoingCompaction)
+		d.mu.compact.compactingCount--
+	}
+
+	runTest := func(t *testing.T, testData string, minVersion, maxVersion FormatMajorVersion, verbose bool) {
 		reset(minVersion, maxVersion)
 		var ongoingCompaction *compaction
 		datadriven.RunTest(t, testData, func(td *datadriven.TestData) string {
@@ -1157,10 +1318,23 @@ func TestManualCompaction(t *testing.T) {
 				if err := runCompactCmd(td, d); err != nil {
 					return err.Error()
 				}
-				return runLSMCmd(td, d)
+				d.mu.Lock()
+				s := d.mu.versions.currentVersion().String()
+				if verbose {
+					s = d.mu.versions.currentVersion().DebugString(base.DefaultFormatter)
+				}
+				d.mu.Unlock()
+				if td.HasArg("hide-file-num") {
+					re := regexp.MustCompile(`([0-9]*):\[`)
+					s = re.ReplaceAllString(s, "[")
+				}
+				return s
 
 			case "define":
 				if d != nil {
+					if err := closeAllSnapshots(d); err != nil {
+						return err.Error()
+					}
 					if err := d.Close(); err != nil {
 						return err.Error()
 					}
@@ -1168,27 +1342,34 @@ func TestManualCompaction(t *testing.T) {
 
 				mem = vfs.NewMem()
 				opts := &Options{
-					FS:                 mem,
-					DebugCheck:         DebugCheckLevels,
-					FormatMajorVersion: randVersion(minVersion, maxVersion),
+					FS:                          mem,
+					DebugCheck:                  DebugCheckLevels,
+					FormatMajorVersion:          randVersion(minVersion, maxVersion),
+					DisableAutomaticCompactions: true,
 				}
-				opts.private.disableAutomaticCompactions = true
 
 				var err error
 				if d, err = runDBDefineCmd(td, opts); err != nil {
 					return err.Error()
 				}
 
-				d.mu.Lock()
-				s := d.mu.versions.currentVersion().DebugString(base.DefaultFormatter)
-				d.mu.Unlock()
+				s := d.mu.versions.currentVersion().String()
+				if verbose {
+					s = d.mu.versions.currentVersion().DebugString(base.DefaultFormatter)
+				}
 				return s
 
 			case "ingest":
 				if err := runIngestCmd(td, d, mem); err != nil {
 					return err.Error()
 				}
-				return runLSMCmd(td, d)
+				d.mu.Lock()
+				s := d.mu.versions.currentVersion().String()
+				if verbose {
+					s = d.mu.versions.currentVersion().DebugString(base.DefaultFormatter)
+				}
+				d.mu.Unlock()
+				return s
 
 			case "iter":
 				// TODO(peter): runDBDefineCmd doesn't properly update the visible
@@ -1211,7 +1392,7 @@ func TestManualCompaction(t *testing.T) {
 						return
 					}
 					d.mu.Lock()
-					s = d.mu.versions.currentVersion().DebugString(base.DefaultFormatter)
+					s = d.mu.versions.currentVersion().String()
 					d.mu.Unlock()
 					close(ch)
 				}()
@@ -1250,8 +1431,7 @@ func TestManualCompaction(t *testing.T) {
 				}
 
 				d.mu.Lock()
-				delete(d.mu.compact.inProgress, ongoingCompaction)
-				d.mu.compact.compactingCount--
+				deleteOngoingCompaction(ongoingCompaction)
 				ongoingCompaction = nil
 				d.maybeScheduleCompaction()
 				d.mu.Unlock()
@@ -1263,29 +1443,30 @@ func TestManualCompaction(t *testing.T) {
 			case "add-ongoing-compaction":
 				var startLevel int
 				var outputLevel int
+				var start string
+				var end string
 				td.ScanArgs(t, "startLevel", &startLevel)
 				td.ScanArgs(t, "outputLevel", &outputLevel)
-				ongoingCompaction = &compaction{
-					inputs: []compactionLevel{{level: startLevel}, {level: outputLevel}},
-				}
-				ongoingCompaction.startLevel = &ongoingCompaction.inputs[0]
-				ongoingCompaction.outputLevel = &ongoingCompaction.inputs[1]
+				td.ScanArgs(t, "start", &start)
+				td.ScanArgs(t, "end", &end)
 				d.mu.Lock()
-				d.mu.compact.inProgress[ongoingCompaction] = struct{}{}
-				d.mu.compact.compactingCount++
+				ongoingCompaction = createOngoingCompaction([]byte(start), []byte(end), startLevel, outputLevel)
 				d.mu.Unlock()
 				return ""
 
 			case "remove-ongoing-compaction":
 				d.mu.Lock()
-				delete(d.mu.compact.inProgress, ongoingCompaction)
-				d.mu.compact.compactingCount--
+				deleteOngoingCompaction(ongoingCompaction)
 				ongoingCompaction = nil
 				d.mu.Unlock()
 				return ""
 
 			case "set-concurrent-compactions":
-				td.ScanArgs(t, "num", &d.opts.MaxConcurrentCompactions)
+				var concurrentCompactions int
+				td.ScanArgs(t, "num", &concurrentCompactions)
+				d.opts.MaxConcurrentCompactions = func() int {
+					return concurrentCompactions
+				}
 				return ""
 
 			case "wait-pending-table-stats":
@@ -1315,6 +1496,7 @@ func TestManualCompaction(t *testing.T) {
 		testData   string
 		minVersion FormatMajorVersion
 		maxVersion FormatMajorVersion // inclusive
+		verbose    bool
 	}{
 		{
 			testData:   "testdata/manual_compaction",
@@ -1336,11 +1518,17 @@ func TestManualCompaction(t *testing.T) {
 			minVersion: FormatSetWithDelete,
 			maxVersion: FormatNewest,
 		},
+		{
+			testData:   "testdata/manual_compaction_range_keys",
+			minVersion: FormatRangeKeys,
+			maxVersion: FormatNewest,
+			verbose:    true,
+		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.testData, func(t *testing.T) {
-			runTest(t, tc.testData, tc.minVersion, tc.maxVersion)
+			runTest(t, tc.testData, tc.minVersion, tc.maxVersion, tc.verbose)
 		})
 	}
 }
@@ -1356,11 +1544,14 @@ func TestCompactionFindGrandparentLimit(t *testing.T) {
 			t.Fatalf("malformed table spec: %s", s)
 		}
 		fileNum++
-		return &fileMetadata{
-			FileNum:  fileNum,
-			Smallest: InternalKey{UserKey: []byte(parts[0])},
-			Largest:  InternalKey{UserKey: []byte(parts[1])},
-		}
+		m := (&fileMetadata{
+			FileNum: fileNum,
+		}).ExtendPointKeyBounds(
+			cmp,
+			InternalKey{UserKey: []byte(parts[0])},
+			InternalKey{UserKey: []byte(parts[1])},
+		)
+		return m
 	}
 
 	datadriven.RunTest(t, "testdata/compaction_find_grandparent_limit",
@@ -1390,6 +1581,8 @@ func TestCompactionFindGrandparentLimit(t *testing.T) {
 			case "compact":
 				c := &compaction{
 					cmp:          cmp,
+					equal:        DefaultComparer.Equal,
+					comparer:     DefaultComparer,
 					grandparents: manifest.NewLevelSliceKeySorted(cmp, grandparents),
 				}
 				if len(d.CmdArgs) != 1 {
@@ -1438,11 +1631,13 @@ func TestCompactionFindL0Limit(t *testing.T) {
 		if len(parts) != 2 {
 			return nil, errors.Errorf("malformed table spec: %s", s)
 		}
-		m := &fileMetadata{
-			FileNum:  base.FileNum(fileNumCounter),
-			Smallest: base.ParseInternalKey(strings.TrimSpace(parts[0])),
-			Largest:  base.ParseInternalKey(strings.TrimSpace(parts[1])),
-		}
+		m := (&fileMetadata{
+			FileNum: base.FileNum(fileNumCounter),
+		}).ExtendPointKeyBounds(
+			cmp,
+			base.ParseInternalKey(strings.TrimSpace(parts[0])),
+			base.ParseInternalKey(strings.TrimSpace(parts[1])),
+		)
 		fileNumCounter++
 		m.SmallestSeqNum = m.Smallest.SeqNum()
 		m.LargestSeqNum = m.Largest.SeqNum()
@@ -1505,7 +1700,7 @@ func TestCompactionFindL0Limit(t *testing.T) {
 				flushSplitKeys := vers.L0Sublevels.FlushSplitKeys()
 
 				var buf strings.Builder
-				buf.WriteString(vers.DebugString(base.DefaultFormatter))
+				buf.WriteString(vers.String())
 				buf.WriteString("flush split keys:\n")
 				for _, key := range flushSplitKeys {
 					fmt.Fprintf(&buf, "\t%s\n", base.DefaultFormatter(key))
@@ -1516,6 +1711,8 @@ func TestCompactionFindL0Limit(t *testing.T) {
 			case "flush":
 				c := &compaction{
 					cmp:      cmp,
+					equal:    DefaultComparer.Equal,
+					comparer: DefaultComparer,
 					version:  vers,
 					l0Limits: vers.L0Sublevels.FlushSplitKeys(),
 					inputs:   []compactionLevel{{level: -1}, {level: 0}},
@@ -1563,8 +1760,8 @@ func TestCompactionOutputLevel(t *testing.T) {
 				var start, base int
 				d.ScanArgs(t, "start", &start)
 				d.ScanArgs(t, "base", &base)
-				pc := newPickedCompaction(opts, version, start, base)
-				c := newCompaction(pc, opts, new(uint64))
+				pc := newPickedCompaction(opts, version, start, defaultOutputLevel(start, base), base)
+				c := newCompaction(pc, opts)
 				return fmt.Sprintf("output=%d\nmax-output-file-size=%d\n",
 					c.outputLevel.level, c.maxOutputFileSize)
 
@@ -1583,10 +1780,12 @@ func TestCompactionAtomicUnitBounds(t *testing.T) {
 		if len(parts) != 2 {
 			t.Fatalf("malformed table spec: %s", s)
 		}
-		return &fileMetadata{
-			Smallest: base.ParseInternalKey(parts[0]),
-			Largest:  base.ParseInternalKey(parts[1]),
-		}
+		m := (&fileMetadata{}).ExtendPointKeyBounds(
+			cmp,
+			base.ParseInternalKey(parts[0]),
+			base.ParseInternalKey(parts[1]),
+		)
+		return m
 	}
 
 	datadriven.RunTest(t, "testdata/compaction_atomic_unit_bounds",
@@ -1608,8 +1807,10 @@ func TestCompactionAtomicUnitBounds(t *testing.T) {
 
 			case "atomic-unit-bounds":
 				c := &compaction{
-					cmp:    cmp,
-					inputs: []compactionLevel{{files: files}, {}},
+					cmp:      cmp,
+					equal:    DefaultComparer.Equal,
+					comparer: DefaultComparer,
+					inputs:   []compactionLevel{{files: files}, {}},
 				}
 				c.startLevel, c.outputLevel = &c.inputs[0], &c.inputs[1]
 				if len(d.CmdArgs) != 1 {
@@ -1644,48 +1845,80 @@ func TestCompactionDeleteOnlyHints(t *testing.T) {
 	var d *DB
 	defer func() {
 		if d != nil {
+			require.NoError(t, closeAllSnapshots(d))
 			require.NoError(t, d.Close())
 		}
 	}()
 
 	var compactInfo *CompactionInfo // protected by d.mu
+	reset := func() (*Options, error) {
+		if d != nil {
+			compactInfo = nil
+			if err := closeAllSnapshots(d); err != nil {
+				return nil, err
+			}
+			if err := d.Close(); err != nil {
+				return nil, err
+			}
+		}
+		opts := &Options{
+			FS:         vfs.NewMem(),
+			DebugCheck: DebugCheckLevels,
+			EventListener: EventListener{
+				CompactionEnd: func(info CompactionInfo) {
+					if compactInfo != nil {
+						return
+					}
+					compactInfo = &info
+				},
+			},
+			FormatMajorVersion: FormatNewest,
+		}
 
+		// Collection of table stats can trigger compactions. As we want full
+		// control over when compactions are run, disable stats by default.
+		opts.private.disableTableStats = true
+
+		return opts, nil
+	}
+
+	compactionString := func() string {
+		for d.mu.compact.compactingCount > 0 {
+			d.mu.compact.cond.Wait()
+		}
+
+		s := "(none)"
+		if compactInfo != nil {
+			// Fix the job ID and durations for determinism.
+			compactInfo.JobID = 100
+			compactInfo.Duration = time.Second
+			compactInfo.TotalDuration = 2 * time.Second
+			s = compactInfo.String()
+			compactInfo = nil
+		}
+		return s
+	}
+
+	var err error
+	var opts *Options
 	datadriven.RunTest(t, "testdata/compaction_delete_only_hints",
 		func(td *datadriven.TestData) string {
 			switch td.Cmd {
 			case "define":
-				if d != nil {
-					compactInfo = nil
-					if err := d.Close(); err != nil {
-						return err.Error()
-					}
+				opts, err = reset()
+				if err != nil {
+					return err.Error()
 				}
-				opts := &Options{
-					FS:         vfs.NewMem(),
-					DebugCheck: DebugCheckLevels,
-					EventListener: EventListener{
-						CompactionEnd: func(info CompactionInfo) {
-							compactInfo = &info
-						},
-					},
-				}
-				opts.private.disableTableStats = true
-				var err error
 				d, err = runDBDefineCmd(td, opts)
 				if err != nil {
 					return err.Error()
 				}
 				d.mu.Lock()
-				t := time.Now()
-				d.timeNow = func() time.Time {
-					t = t.Add(time.Second)
-					return t
-				}
-				s := d.mu.versions.currentVersion().DebugString(base.DefaultFormatter)
+				s := d.mu.versions.currentVersion().String()
 				d.mu.Unlock()
 				return s
 
-			case "set-hints":
+			case "force-set-hints":
 				d.mu.Lock()
 				defer d.mu.Unlock()
 				d.mu.compact.deletionHints = d.mu.compact.deletionHints[:0]
@@ -1698,18 +1931,28 @@ func TestCompactionDeleteOnlyHints(t *testing.T) {
 
 					var tombstoneFile *fileMetadata
 					tombstoneLevel := int(parseUint64(parts[0][1:]))
-					// Find the file in the current version.
-					v := d.mu.versions.currentVersion()
-					overlaps := v.Overlaps(tombstoneLevel, d.opts.Comparer.Compare, start, end)
-					iter := overlaps.Iter()
-					for m := iter.First(); m != nil; m = iter.Next() {
-						if m.FileNum.String() == parts[1] {
-							tombstoneFile = m
-						}
+
+					// Set file number to the value provided in the input.
+					tombstoneFile = &fileMetadata{
+						FileNum: base.FileNum(parseUint64(parts[1])),
 					}
+
+					var hintType deleteCompactionHintType
+					switch typ := parts[7]; typ {
+					case "point_key_only":
+						hintType = deleteCompactionHintTypePointKeyOnly
+					case "range_key_only":
+						hintType = deleteCompactionHintTypeRangeKeyOnly
+					case "point_and_range_key":
+						hintType = deleteCompactionHintTypePointAndRangeKey
+					default:
+						return fmt.Sprintf("unknown hint type: %s", typ)
+					}
+
 					h := deleteCompactionHint{
-						start:                   []byte(parts[2]),
-						end:                     []byte(parts[3]),
+						hintType:                hintType,
+						start:                   start,
+						end:                     end,
 						fileSmallestSeqNum:      parseUint64(parts[4]),
 						tombstoneLevel:          tombstoneLevel,
 						tombstoneFile:           tombstoneFile,
@@ -1721,12 +1964,44 @@ func TestCompactionDeleteOnlyHints(t *testing.T) {
 				}
 				return buf.String()
 
+			case "get-hints":
+				d.mu.Lock()
+				defer d.mu.Unlock()
+
+				// Force collection of table stats. This requires re-enabling the
+				// collection flag. We also do not want compactions to run as part of
+				// the stats collection job, so we disable it temporarily.
+				d.opts.private.disableTableStats = false
+				d.opts.DisableAutomaticCompactions = true
+				defer func() {
+					d.opts.private.disableTableStats = true
+					d.opts.DisableAutomaticCompactions = false
+				}()
+
+				// NB: collectTableStats attempts to acquire the lock. Temporarily
+				// unlock here to avoid a deadlock.
+				d.mu.Unlock()
+				didRun := d.collectTableStats()
+				d.mu.Lock()
+
+				if !didRun {
+					// If a job was already running, wait for the results.
+					d.waitTableStats()
+				}
+
+				hints := d.mu.compact.deletionHints
+				if len(hints) == 0 {
+					return "(none)"
+				}
+				var buf bytes.Buffer
+				for _, h := range hints {
+					buf.WriteString(h.String() + "\n")
+				}
+				return buf.String()
+
 			case "maybe-compact":
 				d.mu.Lock()
 				d.maybeScheduleCompaction()
-				for d.mu.compact.compactingCount > 0 {
-					d.mu.compact.cond.Wait()
-				}
 
 				var buf bytes.Buffer
 				fmt.Fprintf(&buf, "Deletion hints:\n")
@@ -1737,14 +2012,7 @@ func TestCompactionDeleteOnlyHints(t *testing.T) {
 					fmt.Fprintf(&buf, "  (none)\n")
 				}
 				fmt.Fprintf(&buf, "Compactions:\n")
-				s := "(none)"
-				if compactInfo != nil {
-					// JobID's aren't deterministic, especially w/ table stats
-					// enabled. Use a fixed job ID for data-driven test output.
-					compactInfo.JobID = 100
-					s = compactInfo.String()
-				}
-				fmt.Fprintf(&buf, "  %s", s)
+				fmt.Fprintf(&buf, "  %s", compactionString())
 				d.mu.Unlock()
 				return buf.String()
 
@@ -1754,7 +2022,67 @@ func TestCompactionDeleteOnlyHints(t *testing.T) {
 				}
 				d.mu.Lock()
 				compactInfo = nil
-				s := d.mu.versions.currentVersion().DebugString(base.DefaultFormatter)
+				s := d.mu.versions.currentVersion().String()
+				d.mu.Unlock()
+				return s
+
+			case "close-snapshot":
+				seqNum, err := strconv.ParseUint(strings.TrimSpace(td.Input), 0, 64)
+				if err != nil {
+					return err.Error()
+				}
+				d.mu.Lock()
+				var s *Snapshot
+				l := &d.mu.snapshots
+				for i := l.root.next; i != &l.root; i = i.next {
+					if i.seqNum == seqNum {
+						s = i
+					}
+				}
+				d.mu.Unlock()
+				if s == nil {
+					return "(not found)"
+				} else if err := s.Close(); err != nil {
+					return err.Error()
+				}
+
+				d.mu.Lock()
+				// Closing the snapshot may have triggered a compaction.
+				str := compactionString()
+				d.mu.Unlock()
+				return str
+
+			case "iter":
+				snap := Snapshot{
+					db:     d,
+					seqNum: InternalKeySeqNumMax,
+				}
+				iter := snap.NewIter(nil)
+				return runIterCmd(td, iter, true)
+
+			case "reset":
+				opts, err = reset()
+				if err != nil {
+					return err.Error()
+				}
+				d, err = Open("", opts)
+				if err != nil {
+					return err.Error()
+				}
+				return ""
+
+			case "ingest":
+				if err = runBuildCmd(td, d, d.opts.FS); err != nil {
+					return err.Error()
+				}
+				if err = runIngestCmd(td, d, d.opts.FS); err != nil {
+					return err.Error()
+				}
+				return "OK"
+
+			case "describe-lsm":
+				d.mu.Lock()
+				s := d.mu.versions.currentVersion().String()
 				d.mu.Unlock()
 				return s
 
@@ -1768,6 +2096,7 @@ func TestCompactionTombstones(t *testing.T) {
 	var d *DB
 	defer func() {
 		if d != nil {
+			require.NoError(t, closeAllSnapshots(d))
 			require.NoError(t, d.Close())
 		}
 	}()
@@ -1781,9 +2110,10 @@ func TestCompactionTombstones(t *testing.T) {
 
 		s := "(none)"
 		if compactInfo != nil {
-			// JobID's aren't deterministic, especially w/ table stats
-			// enabled. Use a fixed job ID for data-driven test output.
+			// Fix the job ID and durations for determinism.
 			compactInfo.JobID = 100
+			compactInfo.Duration = time.Second
+			compactInfo.TotalDuration = 2 * time.Second
 			s = compactInfo.String()
 			compactInfo = nil
 		}
@@ -1796,6 +2126,7 @@ func TestCompactionTombstones(t *testing.T) {
 			case "define":
 				if d != nil {
 					compactInfo = nil
+					require.NoError(t, closeAllSnapshots(d))
 					if err := d.Close(); err != nil {
 						return err.Error()
 					}
@@ -1808,6 +2139,7 @@ func TestCompactionTombstones(t *testing.T) {
 							compactInfo = &info
 						},
 					},
+					FormatMajorVersion: FormatNewest,
 				}
 				var err error
 				d, err = runDBDefineCmd(td, opts)
@@ -1815,18 +2147,13 @@ func TestCompactionTombstones(t *testing.T) {
 					return err.Error()
 				}
 				d.mu.Lock()
-				t := time.Now()
-				d.timeNow = func() time.Time {
-					t = t.Add(time.Second)
-					return t
-				}
-				s := d.mu.versions.currentVersion().DebugString(base.DefaultFormatter)
+				s := d.mu.versions.currentVersion().String()
 				d.mu.Unlock()
 				return s
 
 			case "maybe-compact":
 				d.mu.Lock()
-				d.opts.private.disableAutomaticCompactions = false
+				d.opts.DisableAutomaticCompactions = false
 				d.maybeScheduleCompaction()
 				s := compactionString()
 				d.mu.Unlock()
@@ -1863,7 +2190,7 @@ func TestCompactionTombstones(t *testing.T) {
 
 			case "version":
 				d.mu.Lock()
-				s := d.mu.versions.currentVersion().DebugString(base.DefaultFormatter)
+				s := d.mu.versions.currentVersion().String()
 				d.mu.Unlock()
 				return s
 
@@ -1871,6 +2198,101 @@ func TestCompactionTombstones(t *testing.T) {
 				return fmt.Sprintf("unknown command: %s", td.Cmd)
 			}
 		})
+}
+
+func closeAllSnapshots(d *DB) error {
+	d.mu.Lock()
+	var ss []*Snapshot
+	l := &d.mu.snapshots
+	for i := l.root.next; i != &l.root; i = i.next {
+		ss = append(ss, i)
+	}
+	d.mu.Unlock()
+	for i := range ss {
+		if err := ss[i].Close(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func TestCompactionReadTriggeredQueue(t *testing.T) {
+
+	// Convert a read compaction to a string which this test
+	// understands.
+	showRC := func(rc *readCompaction) string {
+		return fmt.Sprintf(
+			"L%d: %s-%s %d\n", rc.level, string(rc.start), string(rc.end), rc.fileNum,
+		)
+	}
+
+	var queue *readCompactionQueue
+
+	datadriven.RunTest(t, "testdata/read_compaction_queue",
+		func(td *datadriven.TestData) string {
+			switch td.Cmd {
+			case "create":
+				queue = &readCompactionQueue{}
+				return "(success)"
+			case "add-compaction":
+				for _, line := range strings.Split(td.Input, "\n") {
+					if line == "" {
+						continue
+					}
+					parts := strings.Split(line, " ")
+
+					if len(parts) != 3 {
+						return "error: malformed data for add-compaction. usage: <level>: <start>-<end> <filenum>"
+					}
+					if l, err := strconv.Atoi(parts[0][1:2]); err == nil {
+						keys := strings.Split(parts[1], "-")
+						fileNum, _ := strconv.Atoi(parts[2])
+						rc := readCompaction{
+							level:   l,
+							start:   []byte(keys[0]),
+							end:     []byte(keys[1]),
+							fileNum: base.FileNum(fileNum),
+						}
+						queue.add(&rc, DefaultComparer.Compare)
+					} else {
+						return err.Error()
+					}
+				}
+				return ""
+			case "remove-compaction":
+				rc := queue.remove()
+				if rc == nil {
+					return "(nil)"
+				}
+				return showRC(rc)
+			case "print-size":
+				// Print the size of the queue.
+				return fmt.Sprintf("%d", queue.size)
+			case "print-queue":
+				// Print each element of the queue on a separate line.
+				var sb strings.Builder
+				if queue.size == 0 {
+					sb.WriteString("(empty)")
+				}
+
+				for i := 0; i < queue.size; i++ {
+					rc := queue.at(i)
+					sb.WriteString(showRC(rc))
+				}
+				return sb.String()
+			default:
+				return fmt.Sprintf("unknown command: %s", td.Cmd)
+			}
+		},
+	)
+}
+
+func (qu *readCompactionQueue) at(i int) *readCompaction {
+	if i >= qu.size {
+		return nil
+	}
+
+	return qu.queue[i]
 }
 
 func TestCompactionReadTriggered(t *testing.T) {
@@ -1890,9 +2312,10 @@ func TestCompactionReadTriggered(t *testing.T) {
 
 		s := "(none)"
 		if compactInfo != nil {
-			// JobID's aren't deterministic, especially w/ table stats
-			// enabled. Use a fixed job ID for data-driven test output.
+			// Fix the job ID and durations for determinism.
 			compactInfo.JobID = 100
+			compactInfo.Duration = time.Second
+			compactInfo.TotalDuration = 2 * time.Second
 			s = compactInfo.String()
 			compactInfo = nil
 		}
@@ -1924,12 +2347,7 @@ func TestCompactionReadTriggered(t *testing.T) {
 					return err.Error()
 				}
 				d.mu.Lock()
-				t := time.Now()
-				d.timeNow = func() time.Time {
-					t = t.Add(time.Second)
-					return t
-				}
-				s := d.mu.versions.currentVersion().DebugString(base.DefaultFormatter)
+				s := d.mu.versions.currentVersion().String()
 				d.mu.Unlock()
 				return s
 
@@ -1951,18 +2369,19 @@ func TestCompactionReadTriggered(t *testing.T) {
 						continue
 					}
 					parts := strings.Split(line, " ")
-					if len(parts) != 2 {
-						return "error: malformed data for add-read-compaction. usage: <level>: <start>-<end>"
+					if len(parts) != 3 {
+						return "error: malformed data for add-read-compaction. usage: <level>: <start>-<end> <filenum>"
 					}
 					if l, err := strconv.Atoi(parts[0][:1]); err == nil {
 						keys := strings.Split(parts[1], "-")
-
+						fileNum, _ := strconv.Atoi(parts[2])
 						rc := readCompaction{
-							level: l,
-							start: []byte(keys[0]),
-							end:   []byte(keys[1]),
+							level:   l,
+							start:   []byte(keys[0]),
+							end:     []byte(keys[1]),
+							fileNum: base.FileNum(fileNum),
 						}
-						d.mu.compact.readCompactions = append(d.mu.compact.readCompactions, rc)
+						d.mu.compact.readCompactions.add(&rc, DefaultComparer.Compare)
 					} else {
 						return err.Error()
 					}
@@ -1973,10 +2392,11 @@ func TestCompactionReadTriggered(t *testing.T) {
 			case "show-read-compactions":
 				d.mu.Lock()
 				var sb strings.Builder
-				if len(d.mu.compact.readCompactions) == 0 {
+				if d.mu.compact.readCompactions.size == 0 {
 					sb.WriteString("(none)")
 				}
-				for _, rc := range d.mu.compact.readCompactions {
+				for i := 0; i < d.mu.compact.readCompactions.size; i++ {
+					rc := d.mu.compact.readCompactions.at(i)
 					sb.WriteString(fmt.Sprintf("(level: %d, start: %s, end: %s)\n", rc.level, string(rc.start), string(rc.end)))
 				}
 				d.mu.Unlock()
@@ -1984,7 +2404,7 @@ func TestCompactionReadTriggered(t *testing.T) {
 
 			case "maybe-compact":
 				d.mu.Lock()
-				d.opts.private.disableAutomaticCompactions = false
+				d.opts.DisableAutomaticCompactions = false
 				d.maybeScheduleCompaction()
 				s := compactionString()
 				d.mu.Unlock()
@@ -1992,7 +2412,7 @@ func TestCompactionReadTriggered(t *testing.T) {
 
 			case "version":
 				d.mu.Lock()
-				s := d.mu.versions.currentVersion().DebugString(base.DefaultFormatter)
+				s := d.mu.versions.currentVersion().String()
 				d.mu.Unlock()
 				return s
 
@@ -2003,15 +2423,17 @@ func TestCompactionReadTriggered(t *testing.T) {
 }
 
 func TestCompactionInuseKeyRanges(t *testing.T) {
+	cmp := DefaultComparer.Compare
 	parseMeta := func(s string) *fileMetadata {
 		parts := strings.Split(s, "-")
 		if len(parts) != 2 {
 			t.Fatalf("malformed table spec: %s", s)
 		}
-		m := &fileMetadata{
-			Smallest: base.ParseInternalKey(strings.TrimSpace(parts[0])),
-			Largest:  base.ParseInternalKey(strings.TrimSpace(parts[1])),
-		}
+		m := (&fileMetadata{}).ExtendRangeKeyBounds(
+			cmp,
+			base.ParseInternalKey(strings.TrimSpace(parts[0])),
+			base.ParseInternalKey(strings.TrimSpace(parts[1])),
+		)
 		m.SmallestSeqNum = m.Smallest.SeqNum()
 		m.LargestSeqNum = m.Largest.SeqNum()
 		return m
@@ -2025,6 +2447,8 @@ func TestCompactionInuseKeyRanges(t *testing.T) {
 		case "define":
 			c = &compaction{
 				cmp:       DefaultComparer.Compare,
+				equal:     DefaultComparer.Equal,
+				comparer:  DefaultComparer,
 				formatKey: DefaultComparer.FormatKey,
 				inputs:    []compactionLevel{{}, {}},
 			}
@@ -2050,7 +2474,7 @@ func TestCompactionInuseKeyRanges(t *testing.T) {
 				}
 			}
 			c.version = newVersion(opts, files)
-			return c.version.DebugString(c.formatKey)
+			return c.version.String()
 
 		case "inuse-key-ranges":
 			var buf bytes.Buffer
@@ -2117,11 +2541,13 @@ func TestCompactionInuseKeyRangesRandomized(t *testing.T) {
 		}
 		makeFile := func(level, start, end int) *fileMetadata {
 			fileNum++
-			m := &fileMetadata{
-				FileNum:  fileNum,
-				Smallest: makeIK(level, start),
-				Largest:  makeIK(level, end),
-			}
+			m := (&fileMetadata{
+				FileNum: fileNum,
+			}).ExtendPointKeyBounds(
+				opts.Comparer.Compare,
+				makeIK(level, start),
+				makeIK(level, end),
+			)
 			m.SmallestSeqNum = m.Smallest.SeqNum()
 			m.LargestSeqNum = m.Largest.SeqNum()
 			return m
@@ -2160,7 +2586,7 @@ func TestCompactionInuseKeyRangesRandomized(t *testing.T) {
 			maxWidth := rng.Intn(endKeyspace-s) + 1
 			e := rng.Intn(maxWidth) + s
 			sKey, eKey := makeUserKey(s), makeUserKey(e)
-			keyRanges := calculateInuseKeyRanges(v, opts.Comparer.Compare, l, sKey, eKey)
+			keyRanges := calculateInuseKeyRanges(v, opts.Comparer.Compare, l, numLevels-1, sKey, eKey)
 
 			for level := l; level < numLevels; level++ {
 				for _, f := range files[level] {
@@ -2198,6 +2624,7 @@ func TestCompactionAllowZeroSeqNum(t *testing.T) {
 	var d *DB
 	defer func() {
 		if d != nil {
+			require.NoError(t, closeAllSnapshots(d))
 			require.NoError(t, d.Close())
 		}
 	}()
@@ -2214,11 +2641,13 @@ func TestCompactionAllowZeroSeqNum(t *testing.T) {
 			t.Fatalf("malformed table spec: %s: %s", s, err)
 		}
 		fileNum++
-		meta = &fileMetadata{
-			FileNum:  fileNum,
-			Smallest: InternalKey{UserKey: []byte(match[2])},
-			Largest:  InternalKey{UserKey: []byte(match[3])},
-		}
+		meta = (&fileMetadata{
+			FileNum: fileNum,
+		}).ExtendPointKeyBounds(
+			d.cmp,
+			InternalKey{UserKey: []byte(match[2])},
+			InternalKey{UserKey: []byte(match[3])},
+		)
 		return level, meta
 	}
 
@@ -2227,6 +2656,7 @@ func TestCompactionAllowZeroSeqNum(t *testing.T) {
 			switch td.Cmd {
 			case "define":
 				if d != nil {
+					require.NoError(t, closeAllSnapshots(d))
 					if err := d.Close(); err != nil {
 						return err.Error()
 					}
@@ -2245,9 +2675,10 @@ func TestCompactionAllowZeroSeqNum(t *testing.T) {
 			case "allow-zero-seqnum":
 				d.mu.Lock()
 				c := &compaction{
-					cmp:     d.cmp,
-					version: d.mu.versions.currentVersion(),
-					inputs:  []compactionLevel{{}, {}},
+					cmp:      d.cmp,
+					comparer: d.opts.Comparer,
+					version:  d.mu.versions.currentVersion(),
+					inputs:   []compactionLevel{{}, {}},
 				}
 				c.startLevel, c.outputLevel = &c.inputs[0], &c.inputs[1]
 				d.mu.Unlock()
@@ -2309,15 +2740,17 @@ func TestCompactionAllowZeroSeqNum(t *testing.T) {
 }
 
 func TestCompactionErrorOnUserKeyOverlap(t *testing.T) {
+	cmp := DefaultComparer.Compare
 	parseMeta := func(s string) *fileMetadata {
 		parts := strings.Split(s, "-")
 		if len(parts) != 2 {
 			t.Fatalf("malformed table spec: %s", s)
 		}
-		m := &fileMetadata{
-			Smallest: base.ParseInternalKey(strings.TrimSpace(parts[0])),
-			Largest:  base.ParseInternalKey(strings.TrimSpace(parts[1])),
-		}
+		m := (&fileMetadata{}).ExtendPointKeyBounds(
+			cmp,
+			base.ParseInternalKey(strings.TrimSpace(parts[0])),
+			base.ParseInternalKey(strings.TrimSpace(parts[1])),
+		)
 		m.SmallestSeqNum = m.Smallest.SeqNum()
 		m.LargestSeqNum = m.Largest.SeqNum()
 		return m
@@ -2329,6 +2762,7 @@ func TestCompactionErrorOnUserKeyOverlap(t *testing.T) {
 			case "error-on-user-key-overlap":
 				c := &compaction{
 					cmp:       DefaultComparer.Compare,
+					comparer:  DefaultComparer,
 					formatKey: DefaultComparer.FormatKey,
 				}
 				var files []manifest.NewFileEntry
@@ -2399,7 +2833,9 @@ func TestCompactionErrorCleanup(t *testing.T) {
 		f, err := mem.Create("ext")
 		require.NoError(t, err)
 
-		w := sstable.NewWriter(f, sstable.WriterOptions{})
+		w := sstable.NewWriter(f, sstable.WriterOptions{
+			TableFormat: d.FormatMajorVersion().MaxTableFormat(),
+		})
 		for _, k := range keys {
 			require.NoError(t, w.Set([]byte(k), nil))
 		}
@@ -2414,7 +2850,7 @@ func TestCompactionErrorCleanup(t *testing.T) {
 	d.mu.Lock()
 	initialSetupDone = true
 	d.mu.Unlock()
-	err = d.Compact([]byte("a"), []byte("d"))
+	err = d.Compact([]byte("a"), []byte("d"), false)
 	require.Error(t, err, "injected error")
 
 	d.mu.Lock()
@@ -2433,15 +2869,17 @@ func TestCompactionErrorCleanup(t *testing.T) {
 }
 
 func TestCompactionCheckOrdering(t *testing.T) {
+	cmp := DefaultComparer.Compare
 	parseMeta := func(s string) *fileMetadata {
 		parts := strings.Split(s, "-")
 		if len(parts) != 2 {
 			t.Fatalf("malformed table spec: %s", s)
 		}
-		m := &fileMetadata{
-			Smallest: base.ParseInternalKey(strings.TrimSpace(parts[0])),
-			Largest:  base.ParseInternalKey(strings.TrimSpace(parts[1])),
-		}
+		m := (&fileMetadata{}).ExtendPointKeyBounds(
+			cmp,
+			base.ParseInternalKey(strings.TrimSpace(parts[0])),
+			base.ParseInternalKey(strings.TrimSpace(parts[1])),
+		)
 		m.SmallestSeqNum = m.Smallest.SeqNum()
 		m.LargestSeqNum = m.Largest.SeqNum()
 		return m
@@ -2453,18 +2891,49 @@ func TestCompactionCheckOrdering(t *testing.T) {
 			case "check-ordering":
 				c := &compaction{
 					cmp:       DefaultComparer.Compare,
+					comparer:  DefaultComparer,
 					formatKey: DefaultComparer.FormatKey,
 					logger:    panicLogger{},
 					inputs:    []compactionLevel{{level: -1}, {level: -1}},
 				}
 				c.startLevel, c.outputLevel = &c.inputs[0], &c.inputs[1]
 				var startFiles, outputFiles []*fileMetadata
+				var sublevels []manifest.LevelSlice
 				var files *[]*fileMetadata
+				var sublevel []*fileMetadata
+				var sublevelNum int
+				var parsingSublevel bool
 				fileNum := FileNum(1)
 
+				switchSublevel := func() {
+					if sublevel != nil {
+						sublevels = append(
+							sublevels, manifest.NewLevelSliceSpecificOrder(sublevel),
+						)
+						sublevel = nil
+					}
+					parsingSublevel = false
+				}
+
 				for _, data := range strings.Split(d.Input, "\n") {
-					switch data {
-					case "L0", "L1", "L2", "L3", "L4", "L5", "L6":
+					if data[0] == 'L' && len(data) == 4 {
+						// Format L0.{sublevel}.
+						switchSublevel()
+						level, err := strconv.Atoi(data[1:2])
+						if err != nil {
+							return err.Error()
+						}
+						sublevelNum, err = strconv.Atoi(data[3:])
+						if err != nil {
+							return err.Error()
+						}
+						if c.startLevel.level == -1 {
+							c.startLevel.level = level
+							files = &startFiles
+						}
+						parsingSublevel = true
+					} else if data[0] == 'L' {
+						switchSublevel()
 						level, err := strconv.Atoi(data[1:])
 						if err != nil {
 							return err.Error()
@@ -2481,28 +2950,36 @@ func TestCompactionCheckOrdering(t *testing.T) {
 						} else {
 							return "outputLevel already set\n"
 						}
-
-					default:
+					} else {
 						meta := parseMeta(data)
 						meta.FileNum = fileNum
 						fileNum++
 						*files = append(*files, meta)
+						if parsingSublevel {
+							meta.SubLevel = sublevelNum
+							sublevel = append(sublevel, meta)
+						}
 					}
 				}
 
+				switchSublevel()
 				c.startLevel.files = manifest.NewLevelSliceSpecificOrder(startFiles)
 				c.outputLevel.files = manifest.NewLevelSliceSpecificOrder(outputFiles)
 				if c.outputLevel.level == -1 {
 					c.outputLevel.level = 0
 				}
+				if c.startLevel.level == 0 {
+					// We don't change the input files for the compaction beyond this point.
+					c.l0SublevelInfo = generateSublevelInfo(c.cmp, c.startLevel.files)
+				}
 
 				newIters := func(
-					_ *manifest.FileMetadata, _ *IterOptions, _ *uint64,
-				) (internalIterator, internalIterator, error) {
+					_ *manifest.FileMetadata, _ *IterOptions, _ internalIterOpts,
+				) (internalIterator, keyspan.FragmentIterator, error) {
 					return &errorIter{}, nil, nil
 				}
 				result := "OK"
-				_, err := c.newInputIter(newIters)
+				_, err := c.newInputIter(newIters, nil, nil)
 				if err != nil {
 					result = fmt.Sprint(err)
 				}
@@ -2530,6 +3007,7 @@ func (m *mockSplitter) onNewOutput(key *InternalKey) []byte {
 
 func TestCompactionOutputSplitters(t *testing.T) {
 	var main, child0, child1 compactionOutputSplitter
+	var prevUserKey []byte
 	pickSplitter := func(input string) *compactionOutputSplitter {
 		switch input {
 		case "main":
@@ -2566,7 +3044,10 @@ func TestCompactionOutputSplitters(t *testing.T) {
 					*splitterToInit = &mockSplitter{}
 				case "userkey":
 					*splitterToInit = &userKeyChangeSplitter{
-						cmp:      base.DefaultComparer.Compare,
+						cmp: base.DefaultComparer.Compare,
+						unsafePrevUserKey: func() []byte {
+							return prevUserKey
+						},
 						splitter: child0,
 					}
 				}
@@ -2594,6 +3075,9 @@ func TestCompactionOutputSplitters(t *testing.T) {
 				shouldSplit := main.shouldSplitBefore(&key, nil)
 				if shouldSplit == splitNow {
 					main.onNewOutput(&key)
+					prevUserKey = nil
+				} else {
+					prevUserKey = key.UserKey
 				}
 				return shouldSplit.String()
 			default:
@@ -2663,7 +3147,11 @@ func TestFlushInvariant(t *testing.T) {
 	}
 }
 
-func TestCompactFlushQueuedMemTable(t *testing.T) {
+func TestCompactFlushQueuedMemTableAndFlushMetrics(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test is flaky on windows")
+	}
+
 	// Verify that manual compaction forces a flush of a queued memtable.
 
 	mem := vfs.NewMem()
@@ -2673,11 +3161,18 @@ func TestCompactFlushQueuedMemTable(t *testing.T) {
 	require.NoError(t, err)
 
 	// Add the key "a" to the memtable, then fill up the memtable with the key
-	// "b". The compaction will only overlap with the queued memtable, not the
-	// mutable memtable.
-	require.NoError(t, d.Set([]byte("a"), nil, nil))
+	// prefix "b". The compaction will only overlap with the queued memtable,
+	// not the mutable memtable.
+	// NB: The initial memtable size is 256KB, which is filled up with random
+	// values which typically don't compress well. The test also appends the
+	// random value to the "b" key to limit overwriting of the same key, which
+	// would get collapsed at flush time since there are no open snapshots.
+	value := make([]byte, 50)
+	rand.Read(value)
+	require.NoError(t, d.Set([]byte("a"), value, nil))
 	for {
-		require.NoError(t, d.Set([]byte("b"), nil, nil))
+		rand.Read(value)
+		require.NoError(t, d.Set(append([]byte("b"), value...), value, nil))
 		d.mu.Lock()
 		done := len(d.mu.mem.queue) == 2
 		d.mu.Unlock()
@@ -2686,10 +3181,32 @@ func TestCompactFlushQueuedMemTable(t *testing.T) {
 		}
 	}
 
-	require.NoError(t, d.Compact([]byte("a"), []byte("a\x00")))
+	require.NoError(t, d.Compact([]byte("a"), []byte("a\x00"), false))
 	d.mu.Lock()
 	require.Equal(t, 1, len(d.mu.mem.queue))
 	d.mu.Unlock()
+	// Flush metrics are updated after and non-atomically with the memtable
+	// being removed from the queue.
+	func() {
+		begin := time.Now()
+		for {
+			metrics := d.InternalIntervalMetrics()
+			require.NotNil(t, metrics)
+			if int64(50<<10) < metrics.Flush.WriteThroughput.Bytes {
+				// The writes (during which the flush is idle) and the flush work
+				// should not be so fast as to be unrealistic. If these turn out to be
+				// flaky we could instead inject a clock.
+				tinyInterval := int64(50 * time.Microsecond)
+				require.Less(t, tinyInterval, int64(metrics.Flush.WriteThroughput.WorkDuration))
+				require.Less(t, tinyInterval, int64(metrics.Flush.WriteThroughput.IdleDuration))
+				return
+			}
+			if time.Since(begin) > 2*time.Second {
+				t.Fatal()
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
 	require.NoError(t, d.Close())
 }
 
@@ -2719,7 +3236,7 @@ func TestCompactFlushQueuedLargeBatch(t *testing.T) {
 	require.Greater(t, len(d.mu.mem.queue), 1)
 	d.mu.Unlock()
 
-	require.NoError(t, d.Compact([]byte("a"), []byte("a\x00")))
+	require.NoError(t, d.Compact([]byte("a"), []byte("a\x00"), false))
 	d.mu.Lock()
 	require.Equal(t, 1, len(d.mu.mem.queue))
 	d.mu.Unlock()
@@ -2841,7 +3358,464 @@ func TestCompactionInvalidBounds(t *testing.T) {
 	}))
 	require.NoError(t, err)
 	defer db.Close()
-	require.NoError(t, db.Compact([]byte("a"), []byte("b")))
-	require.Error(t, db.Compact([]byte("a"), []byte("a")))
-	require.Error(t, db.Compact([]byte("b"), []byte("a")))
+	require.NoError(t, db.Compact([]byte("a"), []byte("b"), false))
+	require.Error(t, db.Compact([]byte("a"), []byte("a"), false))
+	require.Error(t, db.Compact([]byte("b"), []byte("a"), false))
+}
+
+func Test_calculateInuseKeyRanges(t *testing.T) {
+	opts := (*Options)(nil).EnsureDefaults()
+	cmp := base.DefaultComparer.Compare
+	tests := []struct {
+		name     string
+		v        *version
+		level    int
+		depth    int
+		smallest []byte
+		largest  []byte
+		want     []manifest.UserKeyRange
+	}{
+		{
+			name: "No files in next level",
+			v: newVersion(opts, [numLevels][]*fileMetadata{
+				1: {
+					{
+						FileNum:  1,
+						Size:     1,
+						Smallest: base.ParseInternalKey("a.SET.2"),
+						Largest:  base.ParseInternalKey("c.SET.2"),
+					},
+					{
+						FileNum:  2,
+						Size:     1,
+						Smallest: base.ParseInternalKey("d.SET.2"),
+						Largest:  base.ParseInternalKey("e.SET.2"),
+					},
+				},
+			}),
+			level:    1,
+			depth:    2,
+			smallest: []byte("a"),
+			largest:  []byte("e"),
+			want: []manifest.UserKeyRange{
+				{
+					Start: []byte("a"),
+					End:   []byte("c"),
+				},
+				{
+					Start: []byte("d"),
+					End:   []byte("e"),
+				},
+			},
+		},
+		{
+			name: "No overlapping key ranges",
+			v: newVersion(opts, [numLevels][]*fileMetadata{
+				1: {
+					{
+						FileNum:  1,
+						Size:     1,
+						Smallest: base.ParseInternalKey("a.SET.1"),
+						Largest:  base.ParseInternalKey("c.SET.1"),
+					},
+					{
+						FileNum:  2,
+						Size:     1,
+						Smallest: base.ParseInternalKey("l.SET.1"),
+						Largest:  base.ParseInternalKey("p.SET.1"),
+					},
+				},
+				2: {
+					{
+						FileNum:  3,
+						Size:     1,
+						Smallest: base.ParseInternalKey("d.SET.1"),
+						Largest:  base.ParseInternalKey("i.SET.1"),
+					},
+					{
+						FileNum:  4,
+						Size:     1,
+						Smallest: base.ParseInternalKey("s.SET.1"),
+						Largest:  base.ParseInternalKey("w.SET.1"),
+					},
+				},
+			}),
+			level:    1,
+			depth:    2,
+			smallest: []byte("a"),
+			largest:  []byte("z"),
+			want: []manifest.UserKeyRange{
+				{
+					Start: []byte("a"),
+					End:   []byte("c"),
+				},
+				{
+					Start: []byte("d"),
+					End:   []byte("i"),
+				},
+				{
+					Start: []byte("l"),
+					End:   []byte("p"),
+				},
+				{
+					Start: []byte("s"),
+					End:   []byte("w"),
+				},
+			},
+		},
+		{
+			name: "First few non-overlapping, followed by overlapping",
+			v: newVersion(opts, [numLevels][]*fileMetadata{
+				1: {
+					{
+						FileNum:  1,
+						Size:     1,
+						Smallest: base.ParseInternalKey("a.SET.1"),
+						Largest:  base.ParseInternalKey("c.SET.1"),
+					},
+					{
+						FileNum:  2,
+						Size:     1,
+						Smallest: base.ParseInternalKey("d.SET.1"),
+						Largest:  base.ParseInternalKey("e.SET.1"),
+					},
+					{
+						FileNum:  3,
+						Size:     1,
+						Smallest: base.ParseInternalKey("n.SET.1"),
+						Largest:  base.ParseInternalKey("o.SET.1"),
+					},
+					{
+						FileNum:  4,
+						Size:     1,
+						Smallest: base.ParseInternalKey("p.SET.1"),
+						Largest:  base.ParseInternalKey("q.SET.1"),
+					},
+				},
+				2: {
+					{
+						FileNum:  5,
+						Size:     1,
+						Smallest: base.ParseInternalKey("m.SET.1"),
+						Largest:  base.ParseInternalKey("q.SET.1"),
+					},
+					{
+						FileNum:  6,
+						Size:     1,
+						Smallest: base.ParseInternalKey("s.SET.1"),
+						Largest:  base.ParseInternalKey("w.SET.1"),
+					},
+				},
+			}),
+			level:    1,
+			depth:    2,
+			smallest: []byte("a"),
+			largest:  []byte("z"),
+			want: []manifest.UserKeyRange{
+				{
+					Start: []byte("a"),
+					End:   []byte("c"),
+				},
+				{
+					Start: []byte("d"),
+					End:   []byte("e"),
+				},
+				{
+					Start: []byte("m"),
+					End:   []byte("q"),
+				},
+				{
+					Start: []byte("s"),
+					End:   []byte("w"),
+				},
+			},
+		},
+		{
+			name: "All overlapping",
+			v: newVersion(opts, [numLevels][]*fileMetadata{
+				1: {
+					{
+						FileNum:  1,
+						Size:     1,
+						Smallest: base.ParseInternalKey("d.SET.1"),
+						Largest:  base.ParseInternalKey("e.SET.1"),
+					},
+					{
+						FileNum:  2,
+						Size:     1,
+						Smallest: base.ParseInternalKey("n.SET.1"),
+						Largest:  base.ParseInternalKey("o.SET.1"),
+					},
+					{
+						FileNum:  3,
+						Size:     1,
+						Smallest: base.ParseInternalKey("p.SET.1"),
+						Largest:  base.ParseInternalKey("q.SET.1"),
+					},
+				},
+				2: {
+					{
+						FileNum:  4,
+						Size:     1,
+						Smallest: base.ParseInternalKey("a.SET.1"),
+						Largest:  base.ParseInternalKey("c.SET.1"),
+					},
+					{
+						FileNum:  5,
+						Size:     1,
+						Smallest: base.ParseInternalKey("d.SET.1"),
+						Largest:  base.ParseInternalKey("w.SET.1"),
+					},
+				},
+			}),
+			level:    1,
+			depth:    2,
+			smallest: []byte("a"),
+			largest:  []byte("z"),
+			want: []manifest.UserKeyRange{
+				{
+					Start: []byte("a"),
+					End:   []byte("c"),
+				},
+				{
+					Start: []byte("d"),
+					End:   []byte("w"),
+				},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := calculateInuseKeyRanges(tt.v, cmp, tt.level, tt.depth, tt.smallest, tt.largest); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("calculateInuseKeyRanges() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMarkedForCompaction(t *testing.T) {
+	var mem vfs.FS = vfs.NewMem()
+	var d *DB
+	defer func() {
+		if d != nil {
+			require.NoError(t, d.Close())
+		}
+	}()
+
+	var buf bytes.Buffer
+	opts := &Options{
+		FS:                          mem,
+		DebugCheck:                  DebugCheckLevels,
+		DisableAutomaticCompactions: true,
+		FormatMajorVersion:          FormatNewest,
+		EventListener: EventListener{
+			CompactionEnd: func(info CompactionInfo) {
+				// Fix the job ID and durations for determinism.
+				info.JobID = 100
+				info.Duration = time.Second
+				info.TotalDuration = 2 * time.Second
+				fmt.Fprintln(&buf, info)
+			},
+		},
+	}
+
+	reset := func() {
+		if d != nil {
+			require.NoError(t, d.Close())
+		}
+		mem = vfs.NewMem()
+		require.NoError(t, mem.MkdirAll("ext", 0755))
+
+		var err error
+		d, err = Open("", opts)
+		require.NoError(t, err)
+	}
+	datadriven.RunTest(t, "testdata/marked_for_compaction", func(td *datadriven.TestData) string {
+		switch td.Cmd {
+		case "reset":
+			reset()
+			return ""
+
+		case "define":
+			if d != nil {
+				if err := d.Close(); err != nil {
+					return err.Error()
+				}
+			}
+			var err error
+			if d, err = runDBDefineCmd(td, opts); err != nil {
+				return err.Error()
+			}
+			d.mu.Lock()
+			defer d.mu.Unlock()
+			t := time.Now()
+			d.timeNow = func() time.Time {
+				t = t.Add(time.Second)
+				return t
+			}
+			s := d.mu.versions.currentVersion().DebugString(base.DefaultFormatter)
+			return s
+
+		case "mark-for-compaction":
+			d.mu.Lock()
+			defer d.mu.Unlock()
+			vers := d.mu.versions.currentVersion()
+			var fileNum uint64
+			td.ScanArgs(t, "file", &fileNum)
+			for l, lm := range vers.Levels {
+				iter := lm.Iter()
+				for f := iter.First(); f != nil; f = iter.Next() {
+					if f.FileNum != base.FileNum(fileNum) {
+						continue
+					}
+					f.MarkedForCompaction = true
+					vers.Stats.MarkedForCompaction++
+					vers.Levels[l].InvalidateAnnotation(markedForCompactionAnnotator{})
+					return fmt.Sprintf("marked L%d.%s", l, f.FileNum)
+				}
+			}
+			return "not-found"
+
+		case "maybe-compact":
+			d.mu.Lock()
+			defer d.mu.Unlock()
+			d.opts.DisableAutomaticCompactions = false
+			d.maybeScheduleCompaction()
+			for d.mu.compact.compactingCount > 0 {
+				d.mu.compact.cond.Wait()
+			}
+
+			fmt.Fprintln(&buf, d.mu.versions.currentVersion().DebugString(base.DefaultFormatter))
+			s := strings.TrimSpace(buf.String())
+			buf.Reset()
+			opts.DisableAutomaticCompactions = true
+			return s
+
+		default:
+			return fmt.Sprintf("unknown command: %s", td.Cmd)
+		}
+	})
+}
+
+// createManifestErrorInjector injects errors (when enabled) into vfs.FS calls
+// to create MANIFEST files.
+type createManifestErrorInjector struct {
+	enabled uint32 // atomic
+}
+
+// enable enables error injection for the vfs.FS.
+func (i *createManifestErrorInjector) enable() {
+	atomic.StoreUint32(&i.enabled, 1)
+}
+
+// MaybeError implements errorfs.Injector.
+func (i *createManifestErrorInjector) MaybeError(op errorfs.Op, path string) error {
+	if atomic.LoadUint32(&i.enabled) == 0 {
+		return nil
+	}
+	// This necessitates having a MaxManifestSize of 1, to reliably induce
+	// logAndApply errors.
+	if strings.Contains(path, "MANIFEST") && op == errorfs.OpCreate {
+		return errorfs.ErrInjected
+	}
+	return nil
+}
+
+var _ errorfs.Injector = &createManifestErrorInjector{}
+
+// TestCompaction_LogAndApplyFails exercises a flush or ingest encountering an
+// unrecoverable error during logAndApply.
+//
+// Regression test for #1669.
+func TestCompaction_LogAndApplyFails(t *testing.T) {
+	// flushKeys writes the given keys to the DB, flushing the resulting memtable.
+	var key = []byte("foo")
+	flushErrC := make(chan error)
+	flushKeys := func(db *DB) error {
+		b := db.NewBatch()
+		err := b.Set(key, nil, nil)
+		require.NoError(t, err)
+		err = b.Commit(nil)
+		require.NoError(t, err)
+		// An error from a failing flush is returned asynchronously.
+		go func() { _ = db.Flush() }()
+		return <-flushErrC
+	}
+
+	// ingestKeys adds the given keys to the DB via an ingestion.
+	ingestKeys := func(db *DB) error {
+		// Create an SST for ingestion.
+		const fName = "ext"
+		f, err := db.opts.FS.Create(fName)
+		require.NoError(t, err)
+		w := sstable.NewWriter(f, sstable.WriterOptions{})
+		require.NoError(t, w.Set(key, nil))
+		require.NoError(t, w.Close())
+		// Ingest the SST.
+		return db.Ingest([]string{fName})
+	}
+
+	testCases := []struct {
+		name              string
+		addFn             func(db *DB) error
+		backgroundErrorFn func(*DB, error)
+	}{
+		{
+			name:  "flush",
+			addFn: flushKeys,
+			backgroundErrorFn: func(db *DB, err error) {
+				require.True(t, errors.Is(err, errorfs.ErrInjected))
+				flushErrC <- err
+				// A flush will attempt to retry in the background. For the purposes of
+				// testing this particular scenario, where we would have crashed anyway,
+				// drop the memtable on the floor to short circuit the retry loop.
+				// NB: we hold db.mu here.
+				var cur *flushableEntry
+				cur, db.mu.mem.queue = db.mu.mem.queue[0], db.mu.mem.queue[1:]
+				cur.readerUnref()
+			},
+		},
+		{
+			name:  "ingest",
+			addFn: ingestKeys,
+		},
+	}
+
+	runTest := func(t *testing.T, addFn func(db *DB) error, bgFn func(*DB, error)) {
+		var db *DB
+		inj := &createManifestErrorInjector{}
+		logger := &fatalCapturingLogger{}
+		opts := &Options{
+			FS: errorfs.Wrap(vfs.NewMem(), inj),
+			// Rotate the manifest after each write. This is required to trigger a
+			// file creation, into which errors can be injected.
+			MaxManifestFileSize: 1,
+			Logger:              logger,
+			EventListener: EventListener{
+				BackgroundError: func(err error) {
+					if bgFn != nil {
+						bgFn(db, err)
+					}
+				},
+			},
+			DisableAutomaticCompactions: true,
+		}
+
+		db, err := Open("", opts)
+		require.NoError(t, err)
+		defer func() { _ = db.Close() }()
+
+		inj.enable()
+		err = addFn(db)
+		require.True(t, errors.Is(err, errorfs.ErrInjected))
+
+		// Under normal circumstances, such an error in logAndApply would panic and
+		// cause the DB to terminate here. Assert that we captured the fatal error.
+		require.True(t, errors.Is(logger.err, errorfs.ErrInjected))
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			runTest(t, tc.addFn, tc.backgroundErrorFn)
+		})
+	}
 }

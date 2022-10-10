@@ -12,6 +12,7 @@ import (
 
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/internal/base"
+	"github.com/cockroachdb/pebble/internal/keyspan"
 	"github.com/cockroachdb/pebble/internal/manifest"
 	"github.com/cockroachdb/pebble/internal/private"
 	"github.com/cockroachdb/pebble/internal/rangedel"
@@ -352,7 +353,7 @@ func (f *findT) searchLogs(searchKey []byte, refs []findRef) []findRef {
 						}
 					case base.InternalKeyKindRangeDelete:
 						// Output tombstones that contain or end with the search key.
-						t := rangedel.Tombstone{Start: ikey, End: value}
+						t := rangedel.Decode(ikey, value, nil)
 						if !t.Contains(cmp, searchKey) && cmp(t.End, searchKey) != 0 {
 							continue
 						}
@@ -427,50 +428,45 @@ func (f *findT) searchTables(searchKey []byte, refs []findRef) []findRef {
 				return err
 			}
 			defer iter.Close()
-			key, value := iter.SeekGE(searchKey)
+			key, value := iter.SeekGE(searchKey, base.SeekGEFlagsNone)
 
 			// We configured sstable.Reader to return raw tombstones which requires a
 			// bit more work here to put them in a form that can be iterated in
 			// parallel with the point records.
-			rangeDelIter, err := func() (base.InternalIterator, error) {
+			rangeDelIter, err := func() (keyspan.FragmentIterator, error) {
 				iter, err := r.NewRawRangeDelIter()
 				if err != nil {
 					return nil, err
 				}
 				if iter == nil {
-					return rangedel.NewIter(r.Compare, nil), nil
+					return keyspan.NewIter(r.Compare, nil), nil
 				}
 				defer iter.Close()
 
-				var tombstones []rangedel.Tombstone
-				for key, value := iter.First(); key != nil; key, value = iter.Next() {
-					t := rangedel.Tombstone{
-						Start: *key,
-						End:   value,
-					}
+				var tombstones []keyspan.Span
+				for t := iter.First(); t != nil; t = iter.Next() {
 					if !t.Contains(r.Compare, searchKey) {
 						continue
 					}
-					tombstones = append(tombstones, t)
+					tombstones = append(tombstones, t.ShallowClone())
 				}
 
 				sort.Slice(tombstones, func(i, j int) bool {
-					return r.Compare(tombstones[i].Start.UserKey, tombstones[j].Start.UserKey) < 0
+					return r.Compare(tombstones[i].Start, tombstones[j].Start) < 0
 				})
-				return rangedel.NewIter(r.Compare, tombstones), nil
+				return keyspan.NewIter(r.Compare, tombstones), nil
 			}()
 			if err != nil {
 				return err
 			}
 
 			defer rangeDelIter.Close()
-			rangeDelKey, rangeDelValue := rangeDelIter.First()
+			rangeDel := rangeDelIter.First()
 
 			foundRef := false
-			for key != nil || rangeDelKey != nil {
+			for key != nil || rangeDel != nil {
 				if key != nil &&
-					(rangeDelKey == nil ||
-						base.InternalCompare(r.Compare, *key, *rangeDelKey) < 0) {
+					(rangeDel == nil || r.Compare(key.UserKey, rangeDel.Start) < 0) {
 					if r.Compare(searchKey, key.UserKey) != 0 {
 						key, value = nil, nil
 						continue
@@ -483,12 +479,20 @@ func (f *findT) searchTables(searchKey []byte, refs []findRef) []findRef {
 					})
 					key, value = iter.Next()
 				} else {
-					refs = append(refs, findRef{
-						key:     rangeDelKey.Clone(),
-						value:   append([]byte(nil), rangeDelValue...),
-						fileNum: fileNum,
+					// Use rangedel.Encode to add a reference for each key
+					// within the span.
+					err := rangedel.Encode(rangeDel, func(k base.InternalKey, v []byte) error {
+						refs = append(refs, findRef{
+							key:     k.Clone(),
+							value:   append([]byte(nil), v...),
+							fileNum: fileNum,
+						})
+						return nil
 					})
-					rangeDelKey, rangeDelValue = rangeDelIter.Next()
+					if err != nil {
+						return err
+					}
+					rangeDel = rangeDelIter.Next()
 				}
 				foundRef = true
 			}

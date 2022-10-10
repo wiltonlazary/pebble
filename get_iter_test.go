@@ -10,7 +10,9 @@ import (
 
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
+	"github.com/cockroachdb/pebble/internal/keyspan"
 	"github.com/cockroachdb/pebble/internal/manifest"
+	"github.com/cockroachdb/pebble/internal/testkeys"
 )
 
 func TestGetIter(t *testing.T) {
@@ -462,16 +464,16 @@ func TestGetIter(t *testing.T) {
 		},
 	}
 
-	cmp := DefaultComparer.Compare
-	equal := DefaultComparer.Equal
+	cmp := testkeys.Comparer.Compare
+	equal := testkeys.Comparer.Equal
 	for _, tc := range testCases {
 		desc := tc.description[:strings.Index(tc.description, ":")]
 
 		// m is a map from file numbers to DBs.
 		m := map[FileNum]*memTable{}
 		newIter := func(
-			file *manifest.FileMetadata, _ *IterOptions, _ *uint64,
-		) (internalIterator, internalIterator, error) {
+			file *manifest.FileMetadata, _ *IterOptions, _ internalIterOpts,
+		) (internalIterator, keyspan.FragmentIterator, error) {
 			d, ok := m[file.FileNum]
 			if !ok {
 				return nil, nil, errors.New("no such file")
@@ -482,7 +484,6 @@ func TestGetIter(t *testing.T) {
 		var files [numLevels][]*fileMetadata
 		for _, tt := range tc.tables {
 			d := newMemTable(memTableOptions{})
-			defer d.close()
 			m[tt.fileNum] = d
 
 			meta := &fileMetadata{
@@ -496,18 +497,11 @@ func TestGetIter(t *testing.T) {
 					t.Fatalf("desc=%q: memtable Set: %v", desc, err)
 				}
 
+				meta.ExtendPointKeyBounds(cmp, ikey, ikey)
 				if i == 0 {
-					meta.Smallest = ikey
 					meta.SmallestSeqNum = ikey.SeqNum()
-					meta.Largest = ikey
 					meta.LargestSeqNum = ikey.SeqNum()
 				} else {
-					if base.InternalCompare(cmp, ikey, meta.Smallest) < 0 {
-						meta.Smallest = ikey
-					}
-					if base.InternalCompare(cmp, ikey, meta.Largest) > 0 {
-						meta.Largest = ikey
-					}
 					if meta.SmallestSeqNum > ikey.SeqNum() {
 						meta.SmallestSeqNum = ikey.SeqNum()
 					}
@@ -545,8 +539,7 @@ func TestGetIter(t *testing.T) {
 			get.snapshot = ikey.SeqNum() + 1
 
 			i := &buf.dbi
-			i.cmp = cmp
-			i.equal = equal
+			i.comparer = *testkeys.Comparer
 			i.merge = DefaultMerger.Merge
 			i.iter = get
 

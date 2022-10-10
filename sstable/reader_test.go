@@ -9,7 +9,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math"
 	"os"
 	"path"
@@ -29,6 +28,55 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/exp/rand"
 )
+
+// get is a testing helper that simulates a read and helps verify bloom filters
+// until they are available through iterators.
+func (r *Reader) get(key []byte) (value []byte, err error) {
+	if r.err != nil {
+		return nil, r.err
+	}
+
+	if r.tableFilter != nil {
+		dataH, err := r.readFilter(nil /* stats */)
+		if err != nil {
+			return nil, err
+		}
+		var lookupKey []byte
+		if r.Split != nil {
+			lookupKey = key[:r.Split(key)]
+		} else {
+			lookupKey = key
+		}
+		mayContain := r.tableFilter.mayContain(dataH.Get(), lookupKey)
+		dataH.Release()
+		if !mayContain {
+			return nil, base.ErrNotFound
+		}
+	}
+
+	i, err := r.NewIter(nil /* lower */, nil /* upper */)
+	if err != nil {
+		return nil, err
+	}
+	ikey, value := i.SeekGE(key, base.SeekGEFlagsNone)
+
+	if ikey == nil || r.Compare(key, ikey.UserKey) != 0 {
+		err := i.Close()
+		if err == nil {
+			err = base.ErrNotFound
+		}
+		return nil, err
+	}
+
+	// The value will be "freed" when the iterator is closed, so make a copy
+	// which will outlast the lifetime of the iterator.
+	newValue := make([]byte, len(value))
+	copy(newValue, value)
+	if err := i.Close(); err != nil {
+		return nil, err
+	}
+	return newValue, nil
+}
 
 // iterAdapter adapts the new Iterator API which returns the key and value from
 // positioning methods (Seek*, First, Last, Next, Prev) to the old API which
@@ -55,16 +103,16 @@ func (i *iterAdapter) String() string {
 	return "iter-adapter"
 }
 
-func (i *iterAdapter) SeekGE(key []byte) bool {
-	return i.update(i.Iterator.SeekGE(key))
+func (i *iterAdapter) SeekGE(key []byte, flags base.SeekGEFlags) bool {
+	return i.update(i.Iterator.SeekGE(key, flags))
 }
 
-func (i *iterAdapter) SeekPrefixGE(prefix, key []byte, trySeekUsingNext bool) bool {
-	return i.update(i.Iterator.SeekPrefixGE(prefix, key, trySeekUsingNext))
+func (i *iterAdapter) SeekPrefixGE(prefix, key []byte, flags base.SeekGEFlags) bool {
+	return i.update(i.Iterator.SeekPrefixGE(prefix, key, flags))
 }
 
-func (i *iterAdapter) SeekLT(key []byte) bool {
-	return i.update(i.Iterator.SeekLT(key))
+func (i *iterAdapter) SeekLT(key []byte, flags base.SeekLTFlags) bool {
+	return i.update(i.Iterator.SeekLT(key, flags))
 }
 
 func (i *iterAdapter) First() bool {
@@ -108,18 +156,18 @@ func (i *iterAdapter) SetBounds(lower, upper []byte) {
 func TestReader(t *testing.T) {
 	writerOpts := map[string]WriterOptions{
 		// No bloom filters.
-		"default": WriterOptions{},
-		"bloom10bit": WriterOptions{
+		"default": {},
+		"bloom10bit": {
 			// The standard policy.
 			FilterPolicy: bloom.FilterPolicy(10),
 			FilterType:   base.TableFilter,
 		},
-		"bloom1bit": WriterOptions{
+		"bloom1bit": {
 			// A policy with many false positives.
 			FilterPolicy: bloom.FilterPolicy(1),
 			FilterType:   base.TableFilter,
 		},
-		"bloom100bit": WriterOptions{
+		"bloom100bit": {
 			// A policy unlikely to have false positives.
 			FilterPolicy: bloom.FilterPolicy(100),
 			FilterType:   base.TableFilter,
@@ -155,7 +203,10 @@ func TestReader(t *testing.T) {
 					t.Run(
 						fmt.Sprintf("opts=%s,writerOpts=%s,blockSize=%s,indexSize=%s",
 							oName, lName, dName, iName),
-						func(t *testing.T) { runTestReader(t, tableOpt, testDirs[oName], nil /* Reader */) })
+						func(t *testing.T) {
+							runTestReader(
+								t, tableOpt, testDirs[oName], nil /* Reader */, 0)
+						})
 				}
 			}
 		}
@@ -182,9 +233,17 @@ func TestHamletReader(t *testing.T) {
 
 		t.Run(
 			fmt.Sprintf("sst=%s", prebuiltSST),
-			func(t *testing.T) { runTestReader(t, WriterOptions{}, "testdata/hamletreader", r) },
+			func(t *testing.T) { runTestReader(t, WriterOptions{}, "testdata/hamletreader", r, 0) },
 		)
 	}
+}
+
+func TestReaderStats(t *testing.T) {
+	tableOpt := WriterOptions{
+		BlockSize:      30,
+		IndexBlockSize: 30,
+	}
+	runTestReader(t, tableOpt, "testdata/readerstats", nil, 10000)
 }
 
 func TestInjectedErrors(t *testing.T) {
@@ -260,7 +319,7 @@ func TestInvalidReader(t *testing.T) {
 	}
 }
 
-func runTestReader(t *testing.T, o WriterOptions, dir string, r *Reader) {
+func runTestReader(t *testing.T, o WriterOptions, dir string, r *Reader, cacheSize int) {
 	datadriven.Walk(t, dir, func(t *testing.T, path string) {
 		defer func() {
 			if r != nil {
@@ -277,14 +336,30 @@ func runTestReader(t *testing.T, o WriterOptions, dir string, r *Reader) {
 					r = nil
 				}
 				var err error
-				_, r, err = runBuildCmd(d, o)
+				_, r, err = runBuildCmd(d, &o, cacheSize)
 				if err != nil {
 					return err.Error()
 				}
 				return ""
 
 			case "iter":
-				return runIterCmd(d, r)
+				seqNum, err := scanGlobalSeqNum(d)
+				if err != nil {
+					return err.Error()
+				}
+				var stats base.InternalIteratorStats
+				r.Properties.GlobalSeqNum = seqNum
+				iter, err := r.NewIterWithBlockPropertyFilters(
+					nil,  /* lower */
+					nil,  /* upper */
+					nil,  /* filterer */
+					true, /* use filter block */
+					&stats,
+				)
+				if err != nil {
+					return err.Error()
+				}
+				return runIterCmd(d, iter, runIterCmdStats(&stats))
 
 			case "get":
 				var b bytes.Buffer
@@ -573,7 +648,7 @@ func TestReaderChecksumErrors(t *testing.T) {
 						// block.
 						orig, err := mem.Open("test")
 						require.NoError(t, err)
-						data, err := ioutil.ReadAll(orig)
+						data, err := io.ReadAll(orig)
 						require.NoError(t, err)
 						require.NoError(t, orig.Close())
 
@@ -753,7 +828,7 @@ func TestValidateBlockChecksums(t *testing.T) {
 			var bh BlockHandle
 			switch location {
 			case corruptionLocationData:
-				bh = layout.Data[rng.Intn(len(layout.Data))]
+				bh = layout.Data[rng.Intn(len(layout.Data))].BlockHandle
 			case corruptionLocationIndex:
 				bh = layout.Index[rng.Intn(len(layout.Index))]
 			case corruptionLocationTopIndex:
@@ -808,6 +883,35 @@ func TestValidateBlockChecksums(t *testing.T) {
 				testFn(t, file, tc.corruptionLocations)
 			})
 		}
+	}
+}
+
+func TestReader_TableFormat(t *testing.T) {
+	test := func(t *testing.T, want TableFormat) {
+		fs := vfs.NewMem()
+		f, err := fs.Create("test")
+		require.NoError(t, err)
+
+		opts := WriterOptions{TableFormat: want}
+		w := NewWriter(f, opts)
+		err = w.Close()
+		require.NoError(t, err)
+
+		f, err = fs.Open("test")
+		require.NoError(t, err)
+		r, err := NewReader(f, ReaderOptions{})
+		require.NoError(t, err)
+		defer r.Close()
+
+		got, err := r.TableFormat()
+		require.NoError(t, err)
+		require.Equal(t, want, got)
+	}
+
+	for tf := TableFormatLevelDB; tf <= TableFormatMax; tf++ {
+		t.Run(tf.String(), func(t *testing.T) {
+			test(t, tf)
+		})
 	}
 }
 
@@ -926,7 +1030,7 @@ func BenchmarkTableIterSeekGE(b *testing.B) {
 
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
-					it.SeekGE(keys[rng.Intn(len(keys))])
+					it.SeekGE(keys[rng.Intn(len(keys))], base.SeekGEFlagsNone)
 				}
 
 				b.StopTimer()
@@ -947,7 +1051,7 @@ func BenchmarkTableIterSeekLT(b *testing.B) {
 
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
-					it.SeekLT(keys[rng.Intn(len(keys))])
+					it.SeekLT(keys[rng.Intn(len(keys))], base.SeekLTFlagsNone)
 				}
 
 				b.StopTimer()
@@ -976,7 +1080,7 @@ func BenchmarkTableIterNext(b *testing.B) {
 					key, _ = it.Next()
 				}
 				if testing.Verbose() {
-					fmt.Fprint(ioutil.Discard, sum)
+					fmt.Fprint(io.Discard, sum)
 				}
 
 				b.StopTimer()
@@ -1005,7 +1109,7 @@ func BenchmarkTableIterPrev(b *testing.B) {
 					key, _ = it.Prev()
 				}
 				if testing.Verbose() {
-					fmt.Fprint(ioutil.Discard, sum)
+					fmt.Fprint(io.Discard, sum)
 				}
 
 				b.StopTimer()
@@ -1013,4 +1117,14 @@ func BenchmarkTableIterPrev(b *testing.B) {
 				r.Close()
 			})
 	}
+}
+
+func BenchmarkLayout(b *testing.B) {
+	r, _ := buildBenchmarkTable(b, WriterOptions{})
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		r.Layout()
+	}
+	b.StopTimer()
+	r.Close()
 }

@@ -6,12 +6,13 @@ package vfs
 
 import (
 	"io"
-	"io/ioutil"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func runTestCases(t *testing.T, testCases []string, fs *MemFS) {
@@ -112,7 +113,23 @@ func runTestCases(t *testing.T, testCases []string, fs *MemFS) {
 			}
 		}
 	}
+
+	// Both "" and "/" are allowed to be used to refer to the root of the FS
+	// for the purposes of cloning.
+	checkClonedIsEquivalent(t, fs, "")
+	checkClonedIsEquivalent(t, fs, "/")
 }
+
+// Test that the FS can be cloned and that the clone serializes identically.
+func checkClonedIsEquivalent(t *testing.T, fs *MemFS, path string) {
+	t.Helper()
+	clone := NewMem()
+	cloned, err := Clone(fs, clone, path, path)
+	require.NoError(t, err)
+	require.True(t, cloned)
+	require.Equal(t, fs.String(), clone.String())
+}
+
 func TestBasics(t *testing.T) {
 	fs := NewMem()
 	testCases := []string{
@@ -167,6 +184,9 @@ func TestBasics(t *testing.T) {
 		"10a: reuseForWrite /bar/caz/z /bar/z",
 		"10b: open /bar/caz/z fails",
 		"10c: open /bar/z",
+		// Opening the root directory works.
+		"11a: f = open /",
+		"11b: f.stat.name == /",
 	}
 	runTestCases(t, testCases, fs)
 }
@@ -255,7 +275,7 @@ func TestList(t *testing.T) {
 func TestMemFile(t *testing.T) {
 	want := "foo"
 	f := NewMemFile([]byte(want))
-	buf, err := ioutil.ReadAll(f)
+	buf, err := io.ReadAll(f)
 	if err != nil {
 		t.Fatalf("%v", err)
 	}

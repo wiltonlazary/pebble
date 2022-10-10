@@ -6,7 +6,12 @@ b.DEL.2:
 c.SET.1:1
 c.MERGE.2:2
 1.RANGEDEL.3:
+2.RANGEKEYSET.4:
+1.RANGEKEYDEL.3:
+2.RANGEKEYUNSET.3:
 ----
+
+# NB: The range keys get fragmented.
 
 dump seq=0
 ----
@@ -16,7 +21,10 @@ b#3,0:
 b#2,1:1
 c#5,2:2
 c#4,1:1
-1#6,15:3
+1-3:{(#6,RANGEDEL)}
+1-2:{(#8,RANGEKEYDEL)}
+2-3:{(#9,RANGEKEYUNSET,3) (#8,RANGEKEYDEL) (#7,RANGEKEYSET,4,4)}
+3-4:{(#7,RANGEKEYSET,4,4)}
 
 dump seq=100
 ----
@@ -26,7 +34,10 @@ b#103,0:
 b#102,1:1
 c#105,2:2
 c#104,1:1
-1#106,15:3
+1-3:{(#106,RANGEDEL)}
+1-2:{(#108,RANGEKEYDEL)}
+2-3:{(#109,RANGEKEYUNSET,3) (#108,RANGEKEYDEL) (#107,RANGEKEYSET,4,4)}
+3-4:{(#107,RANGEKEYSET,4,4)}
 
 define
 c.SET.1:1

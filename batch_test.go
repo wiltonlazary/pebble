@@ -8,15 +8,20 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"math"
+	"math/rand"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/batchskl"
 	"github.com/cockroachdb/pebble/internal/datadriven"
+	"github.com/cockroachdb/pebble/internal/keyspan"
+	"github.com/cockroachdb/pebble/internal/testkeys"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/stretchr/testify/require"
 )
@@ -46,6 +51,9 @@ func TestBatch(t *testing.T) {
 		}
 	}
 
+	// RangeKeySet and RangeKeyUnset are untested here because they don't expose
+	// deferred variants. This is a consequence of these keys' more complex
+	// value encodings.
 	testCases := []testCase{
 		{InternalKeyKindSet, "roses", "red"},
 		{InternalKeyKindSet, "violets", "blue"},
@@ -69,6 +77,8 @@ func TestBatch(t *testing.T) {
 		{InternalKeyKindRangeDelete, "", ""},
 		{InternalKeyKindLogData, "logdata", ""},
 		{InternalKeyKindLogData, "", ""},
+		{InternalKeyKindRangeKeyDelete, "grass", "green"},
+		{InternalKeyKindRangeKeyDelete, "", ""},
 	}
 	var b Batch
 	for _, tc := range testCases {
@@ -85,6 +95,8 @@ func TestBatch(t *testing.T) {
 			_ = b.DeleteRange([]byte(tc.key), []byte(tc.value), nil)
 		case InternalKeyKindLogData:
 			_ = b.LogData([]byte(tc.key), nil)
+		case InternalKeyKindRangeKeyDelete:
+			_ = b.RangeKeyDelete([]byte(tc.key), []byte(tc.value), nil)
 		}
 	}
 	verifyTestCases(&b, testCases)
@@ -123,46 +135,64 @@ func TestBatch(t *testing.T) {
 			d.Finish()
 		case InternalKeyKindLogData:
 			_ = b.LogData([]byte(tc.key), nil)
+		case InternalKeyKindRangeKeyDelete:
+			d := b.RangeKeyDeleteDeferred(len(key), len(value))
+			copy(d.Key, key)
+			copy(d.Value, value)
+			d.Finish()
 		}
 	}
 	verifyTestCases(&b, testCases)
+}
+
+func TestBatchLen(t *testing.T) {
+	var b Batch
+
+	requireLenAndReprEq := func(size int) {
+		require.Equal(t, size, b.Len())
+		require.Equal(t, size, len(b.Repr()))
+	}
+
+	requireLenAndReprEq(batchHeaderLen)
+
+	key := "test-key"
+	value := "test-value"
+
+	err := b.Set([]byte(key), []byte(value), nil)
+	require.NoError(t, err)
+
+	requireLenAndReprEq(33)
+
+	err = b.Delete([]byte(key), nil)
+	require.NoError(t, err)
+
+	requireLenAndReprEq(43)
 }
 
 func TestBatchEmpty(t *testing.T) {
 	var b Batch
 	require.True(t, b.Empty())
 
-	b.Set(nil, nil, nil)
-	require.False(t, b.Empty())
-	b.Reset()
-	require.True(t, b.Empty())
-	// Reset may choose to reuse b.data, so clear it to the zero value in
-	// order to test the lazy initialization of b.data.
-	b = Batch{}
+	ops := []func(*Batch) error{
+		func(b *Batch) error { return b.Set(nil, nil, nil) },
+		func(b *Batch) error { return b.Merge(nil, nil, nil) },
+		func(b *Batch) error { return b.Delete(nil, nil) },
+		func(b *Batch) error { return b.DeleteRange(nil, nil, nil) },
+		func(b *Batch) error { return b.LogData(nil, nil) },
+		func(b *Batch) error { return b.RangeKeySet(nil, nil, nil, nil, nil) },
+		func(b *Batch) error { return b.RangeKeyUnset(nil, nil, nil, nil) },
+		func(b *Batch) error { return b.RangeKeyDelete(nil, nil, nil) },
+	}
 
-	b.Merge(nil, nil, nil)
-	require.False(t, b.Empty())
-	b.Reset()
-	require.True(t, b.Empty())
-	b = Batch{}
-
-	b.Delete(nil, nil)
-	require.False(t, b.Empty())
-	b.Reset()
-	require.True(t, b.Empty())
-	b = Batch{}
-
-	b.DeleteRange(nil, nil, nil)
-	require.False(t, b.Empty())
-	b.Reset()
-	require.True(t, b.Empty())
-	b = Batch{}
-
-	b.LogData(nil, nil)
-	require.False(t, b.Empty())
-	b.Reset()
-	require.True(t, b.Empty())
-	b = Batch{}
+	for _, op := range ops {
+		require.NoError(t, op(&b))
+		require.False(t, b.Empty())
+		b.Reset()
+		require.True(t, b.Empty())
+		// Reset may choose to reuse b.data, so clear it to the zero value in
+		// order to test the lazy initialization of b.data.
+		b = Batch{}
+	}
 
 	_ = b.Reader()
 	require.True(t, b.Empty())
@@ -184,10 +214,10 @@ func TestBatchEmpty(t *testing.T) {
 	ib := newIndexedBatch(d, DefaultComparer)
 	iter := ib.NewIter(nil)
 	require.False(t, iter.First())
-	iter2, err := iter.Clone()
+	iter2, err := iter.Clone(CloneOptions{})
 	require.NoError(t, err)
 	require.NoError(t, iter.Close())
-	_, err = iter.Clone()
+	_, err = iter.Clone(CloneOptions{})
 	require.True(t, err != nil)
 	require.False(t, iter2.First())
 	require.NoError(t, iter2.Close())
@@ -202,18 +232,21 @@ func TestBatchReset(t *testing.T) {
 	key := "test-key"
 	value := "test-value"
 	b := db.NewBatch()
-	b.Set([]byte(key), []byte(value), nil)
+	require.NoError(t, b.Set([]byte(key), []byte(value), nil))
 	dd := b.DeleteRangeDeferred(len(key), len(value))
 	copy(dd.Key, key)
 	copy(dd.Value, value)
 	dd.Finish()
 
+	require.NoError(t, b.RangeKeySet([]byte(key), []byte(value), []byte(value), []byte(value), nil))
+
 	b.setSeqNum(100)
 	b.applied = 1
 	b.commitErr = errors.New("test-error")
 	b.commit.Add(1)
-	require.Equal(t, uint32(2), b.Count())
+	require.Equal(t, uint32(3), b.Count())
 	require.Equal(t, uint64(1), b.countRangeDels)
+	require.Equal(t, uint64(1), b.countRangeKeys)
 	require.True(t, len(b.data) > 0)
 	require.True(t, b.SeqNum() > 0)
 	require.True(t, b.memTableSize > 0)
@@ -225,6 +258,7 @@ func TestBatchReset(t *testing.T) {
 	require.Nil(t, b.commitErr)
 	require.Equal(t, uint32(0), b.Count())
 	require.Equal(t, uint64(0), b.countRangeDels)
+	require.Equal(t, uint64(0), b.countRangeKeys)
 	require.Equal(t, batchHeaderLen, len(b.data))
 	require.Equal(t, uint64(0), b.SeqNum())
 	require.Equal(t, uint64(0), b.memTableSize)
@@ -266,6 +300,9 @@ func TestIndexedBatchReset(t *testing.T) {
 	value := "test-value"
 	b.DeleteRange([]byte(start), []byte(end), nil)
 	b.Set([]byte(key), []byte(value), nil)
+	require.NoError(t, b.
+		RangeKeySet([]byte(start), []byte(end), []byte("suffix"), []byte(value), nil))
+	require.NotNil(t, b.rangeKeyIndex)
 	require.NotNil(t, b.rangeDelIndex)
 	require.NotNil(t, b.index)
 	require.Equal(t, 1, indexCount(b.index))
@@ -276,11 +313,12 @@ func TestIndexedBatchReset(t *testing.T) {
 	require.NotNil(t, b.abbreviatedKey)
 	require.NotNil(t, b.index)
 	require.Nil(t, b.rangeDelIndex)
+	require.Nil(t, b.rangeKeyIndex)
 
 	count := func(ib *Batch) int {
 		iter := ib.NewIter(nil)
 		defer iter.Close()
-		iter2, err := iter.Clone()
+		iter2, err := iter.Clone(CloneOptions{})
 		require.NoError(t, err)
 		defer iter2.Close()
 		var count [2]int
@@ -295,7 +333,7 @@ func TestIndexedBatchReset(t *testing.T) {
 	contains := func(ib *Batch, key, value string) bool {
 		iter := ib.NewIter(nil)
 		defer iter.Close()
-		iter2, err := iter.Clone()
+		iter2, err := iter.Clone(CloneOptions{})
 		require.NoError(t, err)
 		defer iter2.Close()
 		var found [2]bool
@@ -322,6 +360,165 @@ func TestIndexedBatchReset(t *testing.T) {
 	require.Equal(t, 1, indexCount(b.rangeDelIndex))
 	require.Equal(t, 0, count(b))
 	require.False(t, contains(b, key, value))
+}
+
+// TestIndexedBatchMutation tests mutating an indexed batch with an open
+// iterator.
+func TestIndexedBatchMutation(t *testing.T) {
+	opts := &Options{
+		Comparer:           testkeys.Comparer,
+		FS:                 vfs.NewMem(),
+		FormatMajorVersion: FormatNewest,
+	}
+	d, err := Open("", opts)
+	require.NoError(t, err)
+	defer func() { d.Close() }()
+
+	b := newIndexedBatch(d, DefaultComparer)
+	iters := map[string]*Iterator{}
+	defer func() {
+		for _, iter := range iters {
+			require.NoError(t, iter.Close())
+		}
+	}()
+
+	datadriven.RunTest(t, "testdata/indexed_batch_mutation", func(td *datadriven.TestData) string {
+		switch td.Cmd {
+		case "batch":
+			writeBatch := newBatch(d)
+			if err := runBatchDefineCmd(td, writeBatch); err != nil {
+				return err.Error()
+			}
+			if err := writeBatch.Commit(nil); err != nil {
+				return err.Error()
+			}
+			return ""
+		case "new-batch-iter":
+			name := td.CmdArgs[0].String()
+			iters[name] = b.NewIter(&IterOptions{
+				KeyTypes: IterKeyTypePointsAndRanges,
+			})
+			return ""
+		case "new-db-iter":
+			name := td.CmdArgs[0].String()
+			iters[name] = d.NewIter(&IterOptions{
+				KeyTypes: IterKeyTypePointsAndRanges,
+			})
+			return ""
+		case "new-batch":
+			if b != nil {
+				require.NoError(t, b.Close())
+			}
+			b = newIndexedBatch(d, opts.Comparer)
+			if err := runBatchDefineCmd(td, b); err != nil {
+				return err.Error()
+			}
+			return ""
+		case "flush":
+			require.NoError(t, d.Flush())
+			return ""
+		case "iter":
+			var iter string
+			td.ScanArgs(t, "iter", &iter)
+			return runIterCmd(td, iters[iter], false /* closeIter */)
+		case "mutate":
+			mut := newBatch(d)
+			if err := runBatchDefineCmd(td, mut); err != nil {
+				return err.Error()
+			}
+			if err := b.Apply(mut, nil); err != nil {
+				return err.Error()
+			}
+			return ""
+		case "clone":
+			var from, to string
+			var refreshBatchView bool
+			td.ScanArgs(t, "from", &from)
+			td.ScanArgs(t, "to", &to)
+			td.ScanArgs(t, "refresh-batch", &refreshBatchView)
+			var err error
+			iters[to], err = iters[from].Clone(CloneOptions{RefreshBatchView: refreshBatchView})
+			if err != nil {
+				return err.Error()
+			}
+			return ""
+		case "reset":
+			for key, iter := range iters {
+				if err := iter.Close(); err != nil {
+					return err.Error()
+				}
+				delete(iters, key)
+			}
+			if d != nil {
+				if err := d.Close(); err != nil {
+					return err.Error()
+				}
+			}
+			opts.FS = vfs.NewMem()
+			d, err = Open("", opts)
+			require.NoError(t, err)
+			return ""
+		default:
+			return fmt.Sprintf("unrecognized command %q", td.Cmd)
+		}
+	})
+}
+
+func TestIndexedBatch_GlobalVisibility(t *testing.T) {
+	opts := &Options{
+		FS:                 vfs.NewMem(),
+		FormatMajorVersion: FormatNewest,
+		Comparer:           testkeys.Comparer,
+	}
+	d, err := Open("", opts)
+	require.NoError(t, err)
+	defer d.Close()
+
+	require.NoError(t, d.Set([]byte("foo"), []byte("foo"), nil))
+
+	// Create an iterator over an empty indexed batch.
+	b := newIndexedBatch(d, DefaultComparer)
+	iterOpts := IterOptions{KeyTypes: IterKeyTypePointsAndRanges}
+	iter := b.NewIter(&iterOpts)
+	defer iter.Close()
+
+	// Mutate the database's committed state.
+	mut := newBatch(d)
+	require.NoError(t, mut.Set([]byte("bar"), []byte("bar"), nil))
+	require.NoError(t, mut.DeleteRange([]byte("e"), []byte("g"), nil))
+	require.NoError(t, mut.RangeKeySet([]byte("a"), []byte("c"), []byte("@1"), []byte("v"), nil))
+	require.NoError(t, mut.Commit(nil))
+
+	scanIter := func() string {
+		var buf bytes.Buffer
+		for valid := iter.First(); valid; valid = iter.Next() {
+			fmt.Fprintf(&buf, "%s: (", iter.Key())
+			hasPoint, hasRange := iter.HasPointAndRange()
+			if hasPoint {
+				fmt.Fprintf(&buf, "%s,", iter.Value())
+			} else {
+				fmt.Fprintf(&buf, ".,")
+			}
+			if hasRange {
+				start, end := iter.RangeBounds()
+				fmt.Fprintf(&buf, "[%s-%s)", start, end)
+				writeRangeKeys(&buf, iter)
+			} else {
+				fmt.Fprintf(&buf, ".")
+			}
+			fmt.Fprintln(&buf, ")")
+		}
+		return strings.TrimSpace(buf.String())
+	}
+	// Scanning the iterator should only see the point key written before the
+	// iterator was constructed.
+	require.Equal(t, `foo: (foo,.)`, scanIter())
+
+	// After calling SetOptions, the iterator should still only see the point
+	// key written before the iterator was constructed. SetOptions refreshes the
+	// iterator's view of its own indexed batch, but not committed state.
+	iter.SetOptions(&iterOpts)
+	require.Equal(t, `foo: (foo,.)`, scanIter())
 }
 
 func TestFlushableBatchReset(t *testing.T) {
@@ -371,6 +568,10 @@ func TestBatchIncrement(t *testing.T) {
 		want := tc + 1
 		if got != want {
 			t.Errorf("input=%d: got %d, want %d", tc, got, want)
+		}
+		_, count := ReadBatch(b.Repr())
+		if got != want {
+			t.Errorf("input=%d: got %d, want %d", tc, count, want)
 		}
 	}
 
@@ -443,7 +644,7 @@ func TestBatchGet(t *testing.T) {
 		memTableSize int
 	}{
 		{"build", 64 << 20},
-		{"build", 1 << 10},
+		{"build", 2 << 10},
 		{"apply", 64 << 20},
 	}
 
@@ -572,10 +773,10 @@ func TestBatchIter(t *testing.T) {
 	}
 }
 
-func TestBatchDeleteRange(t *testing.T) {
+func TestBatchRangeOps(t *testing.T) {
 	var b *Batch
 
-	datadriven.RunTest(t, "testdata/batch_delete_range", func(td *datadriven.TestData) string {
+	datadriven.RunTest(t, "testdata/batch_range_ops", func(td *datadriven.TestData) string {
 		switch td.Cmd {
 		case "clear":
 			b = nil
@@ -604,25 +805,43 @@ func TestBatchDeleteRange(t *testing.T) {
 			return ""
 
 		case "scan":
-			var iter internalIterAdapter
 			if len(td.CmdArgs) > 1 {
 				return fmt.Sprintf("%s expects at most 1 argument", td.Cmd)
 			}
+			var fragmentIter keyspan.FragmentIterator
+			var internalIter base.InternalIterator
 			if len(td.CmdArgs) == 1 {
-				if td.CmdArgs[0].String() != "range-del" {
+				switch td.CmdArgs[0].String() {
+				case "range-del":
+					fragmentIter = b.newRangeDelIter(nil, math.MaxUint64)
+					defer fragmentIter.Close()
+				case "range-key":
+					fragmentIter = b.newRangeKeyIter(nil, math.MaxUint64)
+					defer fragmentIter.Close()
+				default:
 					return fmt.Sprintf("%s unknown argument %s", td.Cmd, td.CmdArgs[0])
 				}
-				iter.internalIterator = b.newRangeDelIter(nil)
 			} else {
-				iter.internalIterator = b.newInternalIter(nil)
+				internalIter = b.newInternalIter(nil)
+				defer internalIter.Close()
 			}
-			defer iter.Close()
 
 			var buf bytes.Buffer
-			for valid := iter.First(); valid; valid = iter.Next() {
-				key := iter.Key()
-				key.SetSeqNum(key.SeqNum() &^ InternalKeySeqNumBatch)
-				fmt.Fprintf(&buf, "%s:%s\n", key, iter.Value())
+			if fragmentIter != nil {
+				for s := fragmentIter.First(); s != nil; s = fragmentIter.Next() {
+					for i := range s.Keys {
+						s.Keys[i].Trailer = base.MakeTrailer(
+							s.Keys[i].SeqNum()&^base.InternalKeySeqNumBatch,
+							s.Keys[i].Kind(),
+						)
+					}
+					fmt.Fprintln(&buf, s)
+				}
+			} else {
+				for k, v := internalIter.First(); k != nil; k, v = internalIter.Next() {
+					k.SetSeqNum(k.SeqNum() &^ InternalKeySeqNumBatch)
+					fmt.Fprintf(&buf, "%s:%s\n", k, v)
+				}
 			}
 			return buf.String()
 
@@ -684,13 +903,19 @@ func TestFlushableBatch(t *testing.T) {
 				value := []byte(fmt.Sprint(ikey.SeqNum()))
 				switch ikey.Kind() {
 				case InternalKeyKindDelete:
-					batch.Delete(ikey.UserKey, nil)
+					require.NoError(t, batch.Delete(ikey.UserKey, nil))
 				case InternalKeyKindSet:
-					batch.Set(ikey.UserKey, value, nil)
+					require.NoError(t, batch.Set(ikey.UserKey, value, nil))
 				case InternalKeyKindMerge:
-					batch.Merge(ikey.UserKey, value, nil)
+					require.NoError(t, batch.Merge(ikey.UserKey, value, nil))
 				case InternalKeyKindRangeDelete:
-					batch.DeleteRange(ikey.UserKey, value, nil)
+					require.NoError(t, batch.DeleteRange(ikey.UserKey, value, nil))
+				case InternalKeyKindRangeKeyDelete:
+					require.NoError(t, batch.RangeKeyDelete(ikey.UserKey, value, nil))
+				case InternalKeyKindRangeKeySet:
+					require.NoError(t, batch.RangeKeySet(ikey.UserKey, value, value, value, nil))
+				case InternalKeyKindRangeKeyUnset:
+					require.NoError(t, batch.RangeKeyUnset(ikey.UserKey, value, value, nil))
 				}
 			}
 			b = newFlushableBatch(batch, DefaultComparer)
@@ -735,11 +960,12 @@ func TestFlushableBatch(t *testing.T) {
 			iter.Close()
 
 			if rangeDelIter := b.newRangeDelIter(nil); rangeDelIter != nil {
-				iter := newInternalIterAdapter(rangeDelIter)
-				for valid := iter.First(); valid; valid = iter.Next() {
-					fmt.Fprintf(&buf, "%s:%s\n", iter.Key(), iter.Value())
-				}
-				iter.Close()
+				scanKeyspanIterator(&buf, rangeDelIter)
+				rangeDelIter.Close()
+			}
+			if rangeKeyIter := b.newRangeKeyIter(nil); rangeKeyIter != nil {
+				scanKeyspanIterator(&buf, rangeKeyIter)
+				rangeKeyIter.Close()
 			}
 			return buf.String()
 
@@ -774,7 +1000,7 @@ func TestFlushableBatchDeleteRange(t *testing.T) {
 			return ""
 
 		case "scan":
-			var iter internalIterAdapter
+			var buf bytes.Buffer
 			if len(td.CmdArgs) > 1 {
 				return fmt.Sprintf("%s expects at most 1 argument", td.Cmd)
 			}
@@ -782,15 +1008,13 @@ func TestFlushableBatchDeleteRange(t *testing.T) {
 				if td.CmdArgs[0].String() != "range-del" {
 					return fmt.Sprintf("%s unknown argument %s", td.Cmd, td.CmdArgs[0])
 				}
-				iter.internalIterator = fb.newRangeDelIter(nil)
+				fi := fb.newRangeDelIter(nil)
+				defer fi.Close()
+				scanKeyspanIterator(&buf, fi)
 			} else {
-				iter.internalIterator = fb.newIter(nil)
-			}
-			defer iter.Close()
-
-			var buf bytes.Buffer
-			for valid := iter.First(); valid; valid = iter.Next() {
-				fmt.Fprintf(&buf, "%s:%s\n", iter.Key(), iter.Value())
+				ii := fb.newIter(nil)
+				defer ii.Close()
+				scanInternalIterator(&buf, ii)
 			}
 			return buf.String()
 
@@ -798,6 +1022,18 @@ func TestFlushableBatchDeleteRange(t *testing.T) {
 			return fmt.Sprintf("unknown command: %s", td.Cmd)
 		}
 	})
+}
+
+func scanInternalIterator(w io.Writer, ii internalIterator) {
+	for k, v := ii.First(); k != nil; k, v = ii.Next() {
+		fmt.Fprintf(w, "%s:%s\n", k, v)
+	}
+}
+
+func scanKeyspanIterator(w io.Writer, ki keyspan.FragmentIterator) {
+	for s := ki.First(); s != nil; s = ki.Next() {
+		fmt.Fprintln(w, s)
+	}
 }
 
 func TestFlushableBatchBytesIterated(t *testing.T) {
@@ -972,4 +1208,102 @@ func TestBatchMemTableSizeOverflow(t *testing.T) {
 	require.Greater(t, b.memTableSize, uint64(math.MaxUint32))
 	require.NoError(t, b.Close())
 	require.NoError(t, d.Close())
+}
+
+// TestBatchSpanCaching stress tests the caching of keyspan.Spans for range
+// tombstones and range keys.
+func TestBatchSpanCaching(t *testing.T) {
+	opts := &Options{
+		Comparer:           testkeys.Comparer,
+		FS:                 vfs.NewMem(),
+		FormatMajorVersion: FormatNewest,
+	}
+	d, err := Open("", opts)
+	require.NoError(t, err)
+	defer d.Close()
+
+	ks := testkeys.Alpha(1)
+	b := d.NewIndexedBatch()
+	for i := 0; i < ks.Count(); i++ {
+		k := testkeys.Key(ks, i)
+		require.NoError(t, b.Set(k, k, nil))
+	}
+
+	seed := int64(time.Now().UnixNano())
+	t.Logf("seed = %d", seed)
+	rng := rand.New(rand.NewSource(seed))
+	iters := make([][]*Iterator, ks.Count())
+	defer func() {
+		for _, keyIters := range iters {
+			for _, iter := range keyIters {
+				_ = iter.Close()
+			}
+		}
+	}()
+
+	// This test begins with one point key for every letter of the alphabet.
+	// Over the course of the test, point keys are 'replaced' with range keys
+	// with narrow bounds from left to right. Iterators are created at random,
+	// sometimes from the batch and sometimes by cloning existing iterators.
+
+	checkIter := func(iter *Iterator, nextKey int) {
+		var i int
+		for valid := iter.First(); valid; valid = iter.Next() {
+			hasPoint, hasRange := iter.HasPointAndRange()
+			require.Equal(t, testkeys.Key(ks, i), iter.Key())
+			if i < nextKey {
+				// This key should not exist as a point key, just a range key.
+				require.False(t, hasPoint)
+				require.True(t, hasRange)
+			} else {
+				require.True(t, hasPoint)
+				require.False(t, hasRange)
+			}
+			i++
+		}
+		require.Equal(t, ks.Count(), i)
+	}
+
+	// Each iteration of the below loop either reads or writes.
+	//
+	// A write iteration writes a new RANGEDEL and RANGEKEYSET into the batch,
+	// covering a single point key seeded above. Writing these two span keys
+	// together 'replaces' the point key with a range key. Each write iteration
+	// ratchets nextWriteKey so the next write iteration will write the next
+	// key.
+	//
+	// A read iteration creates a new iterator and ensures its state is
+	// expected: some prefix of only point keys, followed by a suffix of only
+	// range keys. Iterators created through Clone should observe the point keys
+	// that existed when the cloned iterator was created.
+	for nextWriteKey := 0; nextWriteKey < ks.Count(); {
+		p := rng.Float64()
+		switch {
+		case p < .10: /* 10 % */
+			// Write a new range deletion and range key.
+			start := testkeys.Key(ks, nextWriteKey)
+			end := append(start, 0x00)
+			require.NoError(t, b.DeleteRange(start, end, nil))
+			require.NoError(t, b.RangeKeySet(start, end, nil, []byte("foo"), nil))
+			nextWriteKey++
+		case p < .55: /* 45 % */
+			// Create a new iterator directly from the batch and check that it
+			// observes the correct state.
+			iter := b.NewIter(&IterOptions{KeyTypes: IterKeyTypePointsAndRanges})
+			checkIter(iter, nextWriteKey)
+			iters[nextWriteKey] = append(iters[nextWriteKey], iter)
+		default: /* 45 % */
+			// Create a new iterator through cloning a random existing iterator
+			// and check that it observes the right state.
+			readKey := rng.Intn(nextWriteKey + 1)
+			itersForReadKey := iters[readKey]
+			if len(itersForReadKey) == 0 {
+				continue
+			}
+			iter, err := itersForReadKey[rng.Intn(len(itersForReadKey))].Clone(CloneOptions{})
+			require.NoError(t, err)
+			checkIter(iter, readKey)
+			iters[readKey] = append(iters[readKey], iter)
+		}
+	}
 }

@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"runtime/debug"
 	"runtime/pprof"
 	"sync"
@@ -17,6 +18,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/invariants"
+	"github.com/cockroachdb/pebble/internal/keyspan"
 	"github.com/cockroachdb/pebble/internal/manifest"
 	"github.com/cockroachdb/pebble/internal/private"
 	"github.com/cockroachdb/pebble/sstable"
@@ -24,18 +26,43 @@ import (
 )
 
 var emptyIter = &errorIter{err: nil}
+var emptyKeyspanIter = &errorKeyspanIter{err: nil}
+
+// filteredAll is a singleton internalIterator implementation used when an
+// sstable does contain point keys, but all the keys are filtered by the active
+// PointKeyFilters set in the iterator's IterOptions.
+//
+// filteredAll implements filteredIter, ensuring the level iterator recognizes
+// when it may need to return file boundaries to keep the rangeDelIter open
+// during mergingIter operation.
+var filteredAll = &filteredAllKeysIter{errorIter: errorIter{err: nil}}
+
+var _ filteredIter = filteredAll
+
+type filteredAllKeysIter struct {
+	errorIter
+}
+
+func (s *filteredAllKeysIter) MaybeFilteredKeys() bool {
+	return true
+}
 
 var tableCacheLabels = pprof.Labels("pebble", "table-cache")
 
 // tableCacheOpts contains the db specific fields
 // of a table cache. This is stored in the tableCacheContainer
 // along with the table cache.
+// NB: It is important to make sure that the fields in this
+// struct are read-only. Since the fields here are shared
+// by every single tableCacheShard, if non read-only fields
+// are updated, we could have unnecessary evictions of those
+// fields, and the surrounding fields from the CPU caches.
 type tableCacheOpts struct {
 	atomic struct {
 		// iterCount in the tableCacheOpts keeps track of iterators
 		// opened or closed by a DB. It's used to keep track of
 		// leaked iterators on a per-db level.
-		iterCount int32
+		iterCount *int32
 	}
 
 	logger        Logger
@@ -43,7 +70,7 @@ type tableCacheOpts struct {
 	dirname       string
 	fs            vfs.FS
 	opts          sstable.ReaderOptions
-	filterMetrics FilterMetrics
+	filterMetrics *FilterMetrics
 }
 
 // tableCacheContainer contains the table cache and
@@ -51,7 +78,7 @@ type tableCacheOpts struct {
 type tableCacheContainer struct {
 	tableCache *TableCache
 
-	// dbOpts contains fields relevent to the table cache
+	// dbOpts contains fields relevant to the table cache
 	// which are unique to each DB.
 	dbOpts tableCacheOpts
 }
@@ -59,8 +86,8 @@ type tableCacheContainer struct {
 // newTableCacheContainer will panic if the underlying cache in the table cache
 // doesn't match Options.Cache.
 func newTableCacheContainer(
-	tc *TableCache, cacheID uint64, dirname string,
-	fs vfs.FS, opts *Options, size int) *tableCacheContainer {
+	tc *TableCache, cacheID uint64, dirname string, fs vfs.FS, opts *Options, size int,
+) *tableCacheContainer {
 	// We will release a ref to table cache acquired here when tableCacheContainer.close is called.
 	if tc != nil {
 		if tc.cache != opts.Cache {
@@ -80,6 +107,8 @@ func newTableCacheContainer(
 	t.dbOpts.dirname = dirname
 	t.dbOpts.fs = fs
 	t.dbOpts.opts = opts.MakeReaderOptions()
+	t.dbOpts.filterMetrics = &FilterMetrics{}
+	t.dbOpts.atomic.iterCount = new(int32)
 	return t
 }
 
@@ -90,7 +119,7 @@ func (c *tableCacheContainer) close() error {
 	// by the DB using this container. Note that we'll still perform cleanup
 	// below in the case that there are leaked iterators.
 	var err error
-	if v := atomic.LoadInt32(&c.dbOpts.atomic.iterCount); v > 0 {
+	if v := atomic.LoadInt32(c.dbOpts.atomic.iterCount); v > 0 {
 		err = errors.Errorf("leaked iterators: %d", errors.Safe(v))
 	}
 
@@ -104,9 +133,15 @@ func (c *tableCacheContainer) close() error {
 }
 
 func (c *tableCacheContainer) newIters(
-	file *manifest.FileMetadata, opts *IterOptions, bytesIterated *uint64,
-) (internalIterator, internalIterator, error) {
-	return c.tableCache.getShard(file.FileNum).newIters(file, opts, bytesIterated, &c.dbOpts)
+	file *manifest.FileMetadata, opts *IterOptions, internalOpts internalIterOpts,
+) (internalIterator, keyspan.FragmentIterator, error) {
+	return c.tableCache.getShard(file.FileNum).newIters(file, opts, internalOpts, &c.dbOpts)
+}
+
+func (c *tableCacheContainer) newRangeKeyIter(
+	file *manifest.FileMetadata, opts *keyspan.SpanIterOptions,
+) (keyspan.FragmentIterator, error) {
+	return c.tableCache.getShard(file.FileNum).newRangeKeyIter(file, opts, &c.dbOpts)
 }
 
 func (c *tableCacheContainer) getTableProperties(file *fileMetadata) (*sstable.Properties, error) {
@@ -147,7 +182,7 @@ func (c *tableCacheContainer) withReader(meta *fileMetadata, fn func(*sstable.Re
 }
 
 func (c *tableCacheContainer) iterCount() int64 {
-	return int64(atomic.LoadInt32(&c.dbOpts.atomic.iterCount))
+	return int64(atomic.LoadInt32(c.dbOpts.atomic.iterCount))
 }
 
 // TableCache is a shareable cache for open sstables.
@@ -253,7 +288,7 @@ type tableCacheShard struct {
 		sync.RWMutex
 		nodes map[tableCacheKey]*tableCacheNode
 		// The iters map is only created and populated in race builds.
-		iters map[sstable.Iterator][]byte
+		iters map[io.Closer][]byte
 
 		handHot  *tableCacheNode
 		handCold *tableCacheNode
@@ -264,8 +299,9 @@ type tableCacheShard struct {
 		sizeCold   int
 		sizeTest   int
 	}
-	releasing   sync.WaitGroup
-	releasingCh chan *tableCacheValue
+	releasing       sync.WaitGroup
+	releasingCh     chan *tableCacheValue
+	releaseLoopExit sync.WaitGroup
 }
 
 func (c *tableCacheShard) init(size int) {
@@ -274,25 +310,57 @@ func (c *tableCacheShard) init(size int) {
 	c.mu.nodes = make(map[tableCacheKey]*tableCacheNode)
 	c.mu.coldTarget = size
 	c.releasingCh = make(chan *tableCacheValue, 100)
+	c.releaseLoopExit.Add(1)
 	go c.releaseLoop()
 
 	if invariants.RaceEnabled {
-		c.mu.iters = make(map[sstable.Iterator][]byte)
+		c.mu.iters = make(map[io.Closer][]byte)
 	}
 }
 
 func (c *tableCacheShard) releaseLoop() {
 	pprof.Do(context.Background(), tableCacheLabels, func(context.Context) {
+		defer c.releaseLoopExit.Done()
 		for v := range c.releasingCh {
 			v.release(c)
 		}
 	})
 }
 
+// checkAndIntersectFilters checks the specific table and block property filters
+// for intersection with any available table and block-level properties. Returns
+// true for ok if this table should be read by this iterator.
+func (c *tableCacheShard) checkAndIntersectFilters(
+	v *tableCacheValue,
+	tableFilter func(userProps map[string]string) bool,
+	blockPropertyFilters []BlockPropertyFilter,
+	boundLimitedFilter sstable.BoundLimitedBlockPropertyFilter,
+) (ok bool, filterer *sstable.BlockPropertiesFilterer, err error) {
+	if tableFilter != nil &&
+		!tableFilter(v.reader.Properties.UserProperties) {
+		return false, nil, nil
+	}
+
+	if boundLimitedFilter != nil || len(blockPropertyFilters) > 0 {
+		filterer = sstable.NewBlockPropertiesFilterer(blockPropertyFilters, boundLimitedFilter)
+		intersects, err :=
+			filterer.IntersectsUserPropsAndFinishInit(v.reader.Properties.UserProperties)
+		if err != nil {
+			return false, nil, err
+		}
+		if !intersects {
+			return false, nil, nil
+		}
+	}
+	return true, filterer, nil
+}
+
 func (c *tableCacheShard) newIters(
-	file *manifest.FileMetadata, opts *IterOptions, bytesIterated *uint64,
+	file *manifest.FileMetadata,
+	opts *IterOptions,
+	internalOpts internalIterOpts,
 	dbOpts *tableCacheOpts,
-) (internalIterator, internalIterator, error) {
+) (internalIterator, keyspan.FragmentIterator, error) {
 	// Calling findNode gives us the responsibility of decrementing v's
 	// refCount. If opening the underlying table resulted in error, then we
 	// decrement this straight away. Otherwise, we pass that responsibility to
@@ -304,53 +372,126 @@ func (c *tableCacheShard) newIters(
 		return nil, nil, v.err
 	}
 
-	if opts != nil &&
-		opts.TableFilter != nil &&
-		!opts.TableFilter(v.reader.Properties.UserProperties) {
-		// Return the empty iterator. This iterator has no mutable state, so
-		// using a singleton is fine.
-		c.unrefValue(v)
-		return emptyIter, nil, nil
-	}
-
-	var iter sstable.Iterator
+	ok := true
+	var filterer *sstable.BlockPropertiesFilterer
 	var err error
-	if bytesIterated != nil {
-		iter, err = v.reader.NewCompactionIter(bytesIterated)
-	} else {
-		iter, err = v.reader.NewIter(opts.GetLowerBound(), opts.GetUpperBound())
+	if opts != nil {
+		ok, filterer, err = c.checkAndIntersectFilters(v, opts.TableFilter,
+			opts.PointKeyFilters, internalOpts.boundLimitedFilter)
 	}
 	if err != nil {
 		c.unrefValue(v)
 		return nil, nil, err
-	}
-	// NB: v.closeHook takes responsibility for calling unrefValue(v) here.
-	iter.SetCloseHook(v.closeHook)
-
-	atomic.AddInt32(&c.atomic.iterCount, 1)
-	atomic.AddInt32(&dbOpts.atomic.iterCount, 1)
-	if invariants.RaceEnabled {
-		c.mu.Lock()
-		c.mu.iters[iter] = debug.Stack()
-		c.mu.Unlock()
 	}
 
 	// NB: range-del iterator does not maintain a reference to the table, nor
 	// does it need to read from it after creation.
 	rangeDelIter, err := v.reader.NewRawRangeDelIter()
 	if err != nil {
-		_ = iter.Close()
+		c.unrefValue(v)
 		return nil, nil, err
 	}
-	if rangeDelIter != nil {
-		return iter, rangeDelIter, nil
+
+	if !ok {
+		c.unrefValue(v)
+		// Return an empty iterator. This iterator has no mutable state, so
+		// using a singleton is fine.
+		// NB: We still return the potentially non-empty rangeDelIter. This
+		// ensures the iterator observes the file's range deletions even if the
+		// block property filters exclude all the file's point keys. The range
+		// deletions may still delete keys lower in the LSM in files that DO
+		// match the active filters.
+		//
+		// The point iterator returned must implement the filteredIter
+		// interface, so that the level iterator surfaces file boundaries when
+		// range deletions are present.
+		return filteredAll, rangeDelIter, err
 	}
-	// NB: Translate a nil range-del iterator into a nil interface.
-	return iter, nil, nil
+
+	var iter sstable.Iterator
+	useFilter := true
+	if opts != nil {
+		useFilter = manifest.LevelToInt(opts.level) != 6 || opts.UseL6Filters
+	}
+	if internalOpts.bytesIterated != nil {
+		iter, err = v.reader.NewCompactionIter(internalOpts.bytesIterated)
+	} else {
+		iter, err = v.reader.NewIterWithBlockPropertyFilters(
+			opts.GetLowerBound(), opts.GetUpperBound(), filterer, useFilter, internalOpts.stats)
+	}
+	if err != nil {
+		if rangeDelIter != nil {
+			_ = rangeDelIter.Close()
+		}
+		c.unrefValue(v)
+		return nil, nil, err
+	}
+	// NB: v.closeHook takes responsibility for calling unrefValue(v) here. Take
+	// care to avoid introduceingan allocation here by adding a closure.
+	iter.SetCloseHook(v.closeHook)
+
+	atomic.AddInt32(&c.atomic.iterCount, 1)
+	atomic.AddInt32(dbOpts.atomic.iterCount, 1)
+	if invariants.RaceEnabled {
+		c.mu.Lock()
+		c.mu.iters[iter] = debug.Stack()
+		c.mu.Unlock()
+	}
+	return iter, rangeDelIter, nil
+}
+
+func (c *tableCacheShard) newRangeKeyIter(
+	file *manifest.FileMetadata, opts *keyspan.SpanIterOptions, dbOpts *tableCacheOpts,
+) (keyspan.FragmentIterator, error) {
+	// Calling findNode gives us the responsibility of decrementing v's
+	// refCount. If opening the underlying table resulted in error, then we
+	// decrement this straight away. Otherwise, we pass that responsibility to
+	// the sstable iterator, which decrements when it is closed.
+	v := c.findNode(file, dbOpts)
+	if v.err != nil {
+		defer c.unrefValue(v)
+		base.MustExist(dbOpts.fs, v.filename, dbOpts.logger, v.err)
+		return nil, v.err
+	}
+
+	ok := true
+	var err error
+	// Don't filter a table's range keys if the file contains RANGEKEYDELs.
+	// The RANGEKEYDELs may delete range keys in other levels. Skipping the
+	// file's range key blocks may surface deleted range keys below. This is
+	// done here, rather than deferring to the block-property collector in order
+	// to maintain parity with point keys and the treatment of RANGEDELs.
+	if opts != nil && v.reader.Properties.NumRangeKeyDels == 0 {
+		ok, _, err = c.checkAndIntersectFilters(v, nil, opts.RangeKeyFilters, nil)
+	}
+	if err != nil {
+		c.unrefValue(v)
+		return nil, err
+	}
+	if !ok {
+		c.unrefValue(v)
+		// Return the empty iterator. This iterator has no mutable state, so
+		// using a singleton is fine.
+		return emptyKeyspanIter, err
+	}
+
+	var iter keyspan.FragmentIterator
+	iter, err = v.reader.NewRawRangeKeyIter()
+	// iter is a block iter that holds the entire value of the block in memory.
+	// No need to hold onto a ref of the cache value.
+	c.unrefValue(v)
+
+	if err != nil || iter == nil {
+		return nil, err
+	}
+
+	return iter, nil
 }
 
 // getTableProperties return sst table properties for target file
-func (c *tableCacheShard) getTableProperties(file *fileMetadata, dbOpts *tableCacheOpts) (*sstable.Properties, error) {
+func (c *tableCacheShard) getTableProperties(
+	file *fileMetadata, dbOpts *tableCacheOpts,
+) (*sstable.Properties, error) {
 	// Calling findNode gives us the responsibility of decrementing v's refCount here
 	v := c.findNode(file, dbOpts)
 	defer c.unrefValue(v)
@@ -429,8 +570,7 @@ func (c *tableCacheShard) unrefValue(v *tableCacheValue) {
 // that node if it didn't already exist. The caller is responsible for
 // decrementing the returned node's refCount.
 func (c *tableCacheShard) findNode(meta *fileMetadata, dbOpts *tableCacheOpts) *tableCacheValue {
-	// Fast-path for a hit in the cache. We grab the lock in shared mode, and use
-	// a batching mechanism to perform updates to the LRU list.
+	// Fast-path for a hit in the cache.
 	c.mu.RLock()
 	key := tableCacheKey{dbOpts.cacheID, meta.FileNum}
 	if n := c.mu.nodes[key]; n != nil && n.value != nil {
@@ -502,7 +642,7 @@ func (c *tableCacheShard) findNode(meta *fileMetadata, dbOpts *tableCacheOpts) *
 		}
 		c.unrefValue(v)
 		atomic.AddInt32(&c.atomic.iterCount, -1)
-		atomic.AddInt32(&dbOpts.atomic.iterCount, -1)
+		atomic.AddInt32(dbOpts.atomic.iterCount, -1)
 		return nil
 	}
 	n.value = v
@@ -716,10 +856,14 @@ func (c *tableCacheShard) Close() error {
 	// complete. This behavior is used by iterator leak tests. Leaking the
 	// goroutine for these tests is less bad not closing the iterator which
 	// triggers other warnings about block cache handles not being released.
-	if err == nil {
-		close(c.releasingCh)
+	if err != nil {
+		c.releasing.Wait()
+		return err
 	}
+
+	close(c.releasingCh)
 	c.releasing.Wait()
+	c.releaseLoopExit.Wait()
 	return err
 }
 
@@ -737,12 +881,12 @@ type tableCacheValue struct {
 func (v *tableCacheValue) load(meta *fileMetadata, c *tableCacheShard, dbOpts *tableCacheOpts) {
 	// Try opening the fileTypeTable first.
 	var f vfs.File
-	v.filename = base.MakeFilename(dbOpts.fs, dbOpts.dirname, fileTypeTable, meta.FileNum)
+	v.filename = base.MakeFilepath(dbOpts.fs, dbOpts.dirname, fileTypeTable, meta.FileNum)
 	f, v.err = dbOpts.fs.Open(v.filename, vfs.RandomReadsOption)
 	if v.err == nil {
 		cacheOpts := private.SSTableCacheOpts(dbOpts.cacheID, meta.FileNum).(sstable.ReaderOption)
 		reopenOpt := sstable.FileReopenOpt{FS: dbOpts.fs, Filename: v.filename}
-		v.reader, v.err = sstable.NewReader(f, dbOpts.opts, cacheOpts, &dbOpts.filterMetrics, reopenOpt)
+		v.reader, v.err = sstable.NewReader(f, dbOpts.opts, cacheOpts, dbOpts.filterMetrics, reopenOpt)
 	}
 	if v.err == nil {
 		if meta.SmallestSeqNum == meta.LargestSeqNum {
