@@ -17,7 +17,7 @@ import (
 	"github.com/cockroachdb/pebble/bloom"
 	"github.com/cockroachdb/pebble/internal/cache"
 	"github.com/cockroachdb/pebble/internal/testkeys"
-	"github.com/cockroachdb/pebble/internal/testkeys/blockprop"
+	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/vfs"
 	"golang.org/x/exp/rand"
 )
@@ -295,6 +295,7 @@ func randomOptions(rng *rand.Rand) *testOptions {
 		opts.FormatMajorVersion += pebble.FormatMajorVersion(rng.Intn(n))
 	}
 	opts.Experimental.L0CompactionConcurrency = 1 + rng.Intn(4)    // 1-4
+	opts.Experimental.LevelMultiplier = 5 << rng.Intn(7)           // 5 - 320
 	opts.Experimental.MinDeletionRate = 1 << uint(20+rng.Intn(10)) // 1MB - 1GB
 	opts.Experimental.ValidateOnIngest = rng.Intn(2) != 0
 	opts.L0CompactionThreshold = 1 + rng.Intn(100)     // 1 - 100
@@ -347,13 +348,13 @@ func randomOptions(rng *rand.Rand) *testOptions {
 	return testOpts
 }
 
-func setupInitialState(dir string, testOpts *testOptions) error {
-	// Copy (vfs.Default,<initialStatePath>) to (testOpts.opts.FS,<dir>).
+func setupInitialState(dataDir string, testOpts *testOptions) error {
+	// Copy (vfs.Default,<initialStatePath>/data) to (testOpts.opts.FS,<dataDir>).
 	ok, err := vfs.Clone(
 		vfs.Default,
 		testOpts.opts.FS,
-		testOpts.initialStatePath,
-		dir,
+		vfs.Default.PathJoin(testOpts.initialStatePath, "data"),
+		dataDir,
 		vfs.CloneSync,
 		vfs.CloneSkip(func(filename string) bool {
 			// Skip the archive of historical files, any checkpoints created by
@@ -371,15 +372,15 @@ func setupInitialState(dir string, testOpts *testOptions) error {
 	// database (initialStatePath) could've had wal_dir set, or the current test
 	// options (testOpts) could have wal_dir set, or both.
 	fs := testOpts.opts.FS
-	walDir := fs.PathJoin(dir, "wal")
+	walDir := fs.PathJoin(dataDir, "wal")
 	if err := fs.MkdirAll(walDir, os.ModePerm); err != nil {
 		return err
 	}
 
-	// Copy <dir>/wal/*.log -> <dir>.
-	src, dst := walDir, dir
+	// Copy <dataDir>/wal/*.log -> <dataDir>.
+	src, dst := walDir, dataDir
 	if testOpts.opts.WALDir != "" {
-		// Copy <dir>/*.log -> <dir>/wal.
+		// Copy <dataDir>/*.log -> <dataDir>/wal.
 		src, dst = dst, src
 	}
 	return moveLogs(fs, src, dst)
@@ -404,5 +405,5 @@ func moveLogs(fs vfs.FS, srcDir, dstDir string) error {
 }
 
 var blockPropertyCollectorConstructors = []func() pebble.BlockPropertyCollector{
-	blockprop.NewBlockPropertyCollector,
+	sstable.NewTestKeysBlockPropertyCollector,
 }

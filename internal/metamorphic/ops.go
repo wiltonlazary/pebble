@@ -18,7 +18,6 @@ import (
 	"github.com/cockroachdb/pebble/internal/errorfs"
 	"github.com/cockroachdb/pebble/internal/keyspan"
 	"github.com/cockroachdb/pebble/internal/private"
-	"github.com/cockroachdb/pebble/internal/testkeys/blockprop"
 	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/vfs"
 )
@@ -112,6 +111,12 @@ type closeOp struct {
 
 func (o *closeOp) run(t *test, h historyRecorder) {
 	c := t.getCloser(o.objID)
+	if o.objID.tag() == dbTag && t.opts.DisableWAL {
+		// Special case: If WAL is disabled, do a flush right before DB Close. This
+		// allows us to reuse this run's data directory as initial state for
+		// future runs without losing any mutations.
+		_ = t.db.Flush()
+	}
 	t.clearObj(o.objID)
 	err := c.Close()
 	h.Recordf("%s // %v", o, err)
@@ -462,7 +467,7 @@ func (o *ingestOp) build(t *test, h historyRecorder, b *pebble.Batch, i int) (st
 		lastUserKey = key.UserKey
 
 		key.SetSeqNum(0)
-		if err := w.Add(*key, value); err != nil {
+		if err := w.Add(*key, value.InPlaceValue()); err != nil {
 			return "", err
 		}
 	}
@@ -560,9 +565,9 @@ func (o *ingestOp) collapseBatch(
 			case pebble.InternalKeyKindSingleDelete:
 				err = collapsed.SingleDelete(key.UserKey, nil)
 			case pebble.InternalKeyKindSet:
-				err = collapsed.Set(key.UserKey, value, nil)
+				err = collapsed.Set(key.UserKey, value.InPlaceValue(), nil)
 			case pebble.InternalKeyKindMerge:
-				err = collapsed.Merge(key.UserKey, value, nil)
+				err = collapsed.Merge(key.UserKey, value.InPlaceValue(), nil)
 			case pebble.InternalKeyKindLogData:
 				err = collapsed.LogData(key.UserKey, nil)
 			default:
@@ -818,12 +823,12 @@ func iterOptions(o iterOpts) *pebble.IterOptions {
 	}
 	if opts.RangeKeyMasking.Suffix != nil {
 		opts.RangeKeyMasking.Filter = func() pebble.BlockPropertyFilterMask {
-			return blockprop.NewMaskingFilter()
+			return sstable.NewTestKeysMaskingFilter()
 		}
 	}
 	if o.filterMax > 0 {
 		opts.PointKeyFilters = []pebble.BlockPropertyFilter{
-			blockprop.NewBlockPropertyFilter(o.filterMin, o.filterMax),
+			sstable.NewTestKeysBlockPropertyFilter(o.filterMin, o.filterMax),
 		}
 	}
 	return opts

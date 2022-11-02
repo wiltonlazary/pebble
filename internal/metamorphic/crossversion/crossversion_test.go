@@ -29,9 +29,10 @@ import (
 )
 
 var (
-	factor   int
-	seed     int64
-	versions pebbleVersions
+	factor       int
+	seed         int64
+	versions     pebbleVersions
+	artifactsDir string
 )
 
 func init() {
@@ -57,6 +58,9 @@ the set of versions to test. The order of the versions
 is significant and database states generated from earlier
 versions will be used to initialize runs of subsequent
 versions.`)
+	flag.StringVar(&artifactsDir, "artifacts", "",
+		`the path to a directory where test artifacts should be
+moved on failure. Defaults to the current working directory.`)
 }
 
 func reproductionCommand() string {
@@ -69,7 +73,8 @@ func TestMetaCrossVersion(t *testing.T) {
 	if seed == 0 {
 		seed = time.Now().UnixNano()
 	}
-	t.Logf("Test directory: %s\n", t.TempDir())
+	tempDir := t.TempDir()
+	t.Logf("Test directory: %s\n", tempDir)
 	t.Logf("Reproduction:\n  %s\n", reproductionCommand())
 
 	// Print all the versions supplied and ensure all the test binaries
@@ -79,16 +84,22 @@ func TestMetaCrossVersion(t *testing.T) {
 			// Use shortened SHAs for readability.
 			versions[i].SHA = versions[i].SHA[:8]
 		}
-		if _, err := os.Stat(v.TestBinaryPath); err != nil {
+		absPath, err := filepath.Abs(v.TestBinaryPath)
+		if err != nil {
 			t.Fatal(err)
 		}
-		t.Logf("%d: %s", i, v.String())
+		fi, err := os.Stat(absPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		versions[i].TestBinaryPath = absPath
+		t.Logf("%d: %s (Mode = %s)", i, v.String(), fi.Mode())
 	}
 
 	// All randomness should be derived from `seed`. This makes reproducing a
 	// failure locally easier.
 	ctx := context.Background()
-	require.NoError(t, runCrossVersion(ctx, t, versions, seed, factor))
+	require.NoError(t, runCrossVersion(ctx, t, tempDir, versions, seed, factor))
 }
 
 type pebbleVersion struct {
@@ -110,7 +121,12 @@ func (s initialState) String() string {
 }
 
 func runCrossVersion(
-	ctx context.Context, t *testing.T, versions pebbleVersions, seed int64, factor int,
+	ctx context.Context,
+	t *testing.T,
+	tempDir string,
+	versions pebbleVersions,
+	seed int64,
+	factor int,
 ) error {
 	prng := rand.New(rand.NewSource(seed))
 	// Use prng to derive deterministic seeds to provide to the child
@@ -121,7 +137,7 @@ func runCrossVersion(
 		versionSeeds[i] = prng.Uint64()
 	}
 
-	rootDir := filepath.Join(t.TempDir(), strconv.FormatInt(seed, 10))
+	rootDir := filepath.Join(tempDir, strconv.FormatInt(seed, 10))
 	if err := os.MkdirAll(rootDir, os.ModePerm); err != nil {
 		return err
 	}
@@ -142,23 +158,25 @@ func runCrossVersion(
 		for j, s := range initialStates {
 			runID := fmt.Sprintf("%s_%d_%03d", versions[i].SHA, seed, j)
 
-			t.Logf("  Running test with version %s with initial state %s.", versions[i].SHA, s)
 			r := metamorphicTestRun{
 				seed:           versionSeeds[i],
 				dir:            filepath.Join(rootDir, runID),
 				vers:           versions[i],
 				initialState:   s,
-				testBinaryName: filepath.Base(versions[i].TestBinaryPath),
+				testBinaryPath: versions[i].TestBinaryPath,
 			}
 			if err := os.MkdirAll(r.dir, os.ModePerm); err != nil {
 				return err
 			}
-			if err := os.Link(versions[i].TestBinaryPath, filepath.Join(r.dir, r.testBinaryName)); err != nil {
-				return err
+
+			var out io.Writer = &buf
+			if testing.Verbose() {
+				out = io.MultiWriter(out, os.Stderr)
 			}
-			err := r.run(ctx, &buf)
-			if err != nil {
-				t.Fatalf("Metamorphic test failed: %s\nOutput:%s\n", err, buf.String())
+			t.Logf("  Running test with version %s with initial state %s.",
+				versions[i].SHA, s)
+			if err := r.run(ctx, out); err != nil {
+				fatalf(t, rootDir, "Metamorphic test failed: %s\nOutput:%s\n", err, buf.String())
 			}
 
 			// dir is a directory containing the ops file and subdirectories for
@@ -191,7 +209,7 @@ func runCrossVersion(
 		// version's metamorphic runs used the same seed, so all of the
 		// resulting histories should be identical.
 		if h, diff := metamorphic.CompareHistories(t, histories); h > 0 {
-			t.Fatalf("Metamorphic test divergence between %q and %q:\nDiff:\n%s",
+			fatalf(t, rootDir, "Metamorphic test divergence between %q and %q:\nDiff:\n%s",
 				nextInitialStates[0].desc, nextInitialStates[h].desc, diff)
 		}
 
@@ -212,12 +230,24 @@ func runCrossVersion(
 	return nil
 }
 
+func fatalf(t testing.TB, dir string, msg string, args ...interface{}) {
+	if artifactsDir == "" {
+		var err error
+		artifactsDir, err = os.Getwd()
+		require.NoError(t, err)
+	}
+	dst := filepath.Join(artifactsDir, filepath.Base(dir))
+	t.Logf("Moving test dir %q to %q.", dir, dst)
+	require.NoError(t, os.Rename(dir, dst))
+	t.Fatalf(msg, args...)
+}
+
 type metamorphicTestRun struct {
 	seed           uint64
 	dir            string
 	vers           pebbleVersion
 	initialState   initialState
-	testBinaryName string
+	testBinaryPath string
 }
 
 func (r *metamorphicTestRun) run(ctx context.Context, output io.Writer) error {
@@ -225,16 +255,36 @@ func (r *metamorphicTestRun) run(ctx context.Context, output io.Writer) error {
 		"-test.run", "TestMeta$",
 		"-seed", strconv.FormatUint(r.seed, 10),
 		"-keep",
+		// Use an op-count distribution that includes a low lower bound, so that
+		// some intermediary versions do very little work besides opening the
+		// database. This helps exercise state from version n that survives to
+		// versions ≥ n+2.
+		"-ops", "uniform:1-10000",
+		// Explicitly specify the location of the _meta directory. In Cockroach
+		// CI when built using bazel, the subprocesses may be given a different
+		// current working directory than the one provided below. To ensure we
+		// can find this run's artifacts, explicitly pass the intended dir.
+		"-dir", filepath.Join(r.dir, "_meta"),
+	}
+	// Propagate the verbose flag, if necessary.
+	if testing.Verbose() {
+		args = append(args, "-test.v")
 	}
 	if r.initialState.path != "" {
 		args = append(args,
 			"--initial-state", r.initialState.path,
 			"--initial-state-desc", r.initialState.desc)
 	}
-	cmd := exec.CommandContext(ctx, filepath.Join(r.dir, r.testBinaryName), args...)
+	cmd := exec.CommandContext(ctx, r.testBinaryPath, args...)
 	cmd.Dir = r.dir
 	cmd.Stderr = output
 	cmd.Stdout = output
+
+	// Print the command itself before executing it.
+	if testing.Verbose() {
+		fmt.Fprintln(output, cmd)
+	}
+
 	return cmd.Run()
 }
 

@@ -13,7 +13,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/HdrHistogram/hdrhistogram-go"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/arenaskl"
 	"github.com/cockroachdb/pebble/internal/base"
@@ -25,6 +24,7 @@ import (
 	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/cockroachdb/pebble/vfs/atomicfs"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 const (
@@ -169,17 +169,39 @@ type Writer interface {
 	RangeKeyDelete(start, end []byte, opts *WriteOptions) error
 }
 
-// CPUWorkPermissionGranter is used to request permission to opportunistically
-// use additional CPUs to speed up internal background work. Each granted "proc"
-// can be used to spin up a CPU bound goroutine, i.e, if scheduled each such
-// goroutine can consume one P in the goroutine scheduler. The calls to
-// ReturnProcs can be a bit delayed, since Pebble interacts with this interface
-// in a coarse manner. So one should assume that the total number of granted
-// procs is a non tight upper bound on the CPU that will get consumed.
-type CPUWorkPermissionGranter interface {
-	TryGetProcs(count int) int
-	ReturnProcs(count int)
+// CPUWorkHandle represents a handle used by the CPUWorkPermissionGranter API.
+type CPUWorkHandle interface {
+	// Permitted indicates whether Pebble can use additional CPU resources.
+	Permitted() bool
 }
+
+// CPUWorkPermissionGranter is used to request permission to opportunistically
+// use additional CPUs to speed up internal background work.
+type CPUWorkPermissionGranter interface {
+	// GetPermission returns a handle regardless of whether permission is granted
+	// or not. In the latter case, the handle is only useful for recording
+	// the CPU time actually spent on this calling goroutine.
+	GetPermission(time.Duration) CPUWorkHandle
+	// CPUWorkDone must be called regardless of whether CPUWorkHandle.Permitted
+	// returns true or false.
+	CPUWorkDone(CPUWorkHandle)
+}
+
+// Use a default implementation for the CPU work granter to avoid excessive nil
+// checks in the code.
+type defaultCPUWorkHandle struct{}
+
+func (d defaultCPUWorkHandle) Permitted() bool {
+	return false
+}
+
+type defaultCPUWorkGranter struct{}
+
+func (d defaultCPUWorkGranter) GetPermission(_ time.Duration) CPUWorkHandle {
+	return defaultCPUWorkHandle{}
+}
+
+func (d defaultCPUWorkGranter) CPUWorkDone(_ CPUWorkHandle) {}
 
 // DB provides a concurrent, persistent ordered key/value store.
 //
@@ -342,7 +364,10 @@ type DB struct {
 			// (i.e. makeRoomForWrite).
 			*record.LogWriter
 			// Can be nil.
-			metrics record.LogWriterMetrics
+			metrics struct {
+				fsyncLatency prometheus.Histogram
+				record.LogWriterMetrics
+			}
 		}
 
 		mem struct {
@@ -414,10 +439,6 @@ type DB struct {
 			// DB.{disable,Enable}FileDeletions().
 			disabled int
 		}
-
-		// Stores the Metrics for the previous call to InternalIntervalMetrics() in
-		// order to compute the current intervals metrics
-		lastMetrics *Metrics
 
 		// The list of active snapshots.
 		snapshots snapshotList
@@ -1317,6 +1338,12 @@ func (d *DB) Close() error {
 	d.compactionSchedulers.Wait()
 	d.mu.Lock()
 
+	// As a sanity check, ensure that there are no zombie tables. A non-zero count
+	// hints at a reference count leak.
+	if ztbls := len(d.mu.versions.zombieTables); ztbls > 0 {
+		err = firstError(err, errors.Errorf("non-zero zombie file count: %d", ztbls))
+	}
+
 	// If the options include a closer to 'close' the filesystem, close it.
 	if d.opts.private.fsCloser != nil {
 		d.opts.private.fsCloser.Close()
@@ -1510,42 +1537,6 @@ func (d *DB) AsyncFlush() (<-chan struct{}, error) {
 	return flushed, nil
 }
 
-// InternalIntervalMetrics returns the InternalIntervalMetrics and resets for
-// the next interval (which is until the next call to this method).
-// Deprecated: Use Metrics.Flush and Metrics.LogWriter instead
-func (d *DB) InternalIntervalMetrics() *InternalIntervalMetrics {
-	m := d.Metrics()
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	// Copy the relevant metrics, ensuring to perform a deep clone of the histogram
-	// to avoid mutating it.
-	logDelta := m.LogWriter
-	if m.LogWriter.SyncLatencyMicros != nil {
-		logDelta.SyncLatencyMicros = hdrhistogram.Import(m.LogWriter.SyncLatencyMicros.Export())
-	}
-	flushDelta := m.Flush.WriteThroughput
-
-	// Subtract the cumulative metrics at the time of the last InternalIntervalMetrics call,
-	// if any, in order to compute the delta.
-	if d.mu.lastMetrics != nil {
-		logDelta.Subtract(&d.mu.lastMetrics.LogWriter)
-		flushDelta.Subtract(d.mu.lastMetrics.Flush.WriteThroughput)
-	}
-
-	// Save the *Metrics we used so that a subsequent call to InternalIntervalMetrics
-	// can compute the delta relative to it.
-	d.mu.lastMetrics = m
-
-	iim := &InternalIntervalMetrics{}
-	iim.LogWriter.PendingBufferUtilization = logDelta.PendingBufferLen.Mean() / record.CapAllocatedBlocks
-	iim.LogWriter.SyncQueueUtilization = logDelta.SyncQueueLen.Mean() / record.SyncConcurrency
-	iim.LogWriter.SyncLatencyMicros = logDelta.SyncLatencyMicros
-	iim.LogWriter.WriteThroughput = logDelta.WriteThroughput
-	iim.Flush.WriteThroughput = flushDelta
-	return iim
-}
-
 // Metrics returns metrics about the database.
 func (d *DB) Metrics() *Metrics {
 	metrics := &Metrics{}
@@ -1607,7 +1598,8 @@ func (d *DB) Metrics() *Metrics {
 	metrics.private.manifestFileSize = uint64(d.mu.versions.manifest.Size())
 	d.mu.versions.logUnlock()
 
-	if err := metrics.LogWriter.Merge(&d.mu.log.metrics); err != nil {
+	metrics.LogWriter.FsyncLatency = d.mu.log.metrics.fsyncLatency
+	if err := metrics.LogWriter.Merge(&d.mu.log.metrics.LogWriterMetrics); err != nil {
 		d.opts.Logger.Infof("metrics error: %s", err)
 	}
 	metrics.Flush.WriteThroughput = d.mu.compact.flushWriteThroughput
@@ -1990,8 +1982,10 @@ func (d *DB) makeRoomForWrite(b *Batch) error {
 
 		if !d.opts.DisableWAL {
 			d.mu.log.queue = append(d.mu.log.queue, fileInfo{fileNum: newLogNum, fileSize: newLogSize})
-			d.mu.log.LogWriter = record.NewLogWriter(newLogFile, newLogNum)
-			d.mu.log.LogWriter.SetMinSyncInterval(d.opts.WALMinSyncInterval)
+			d.mu.log.LogWriter = record.NewLogWriter(newLogFile, newLogNum, record.LogWriterConfig{
+				WALFsyncLatency:    d.mu.log.metrics.fsyncLatency,
+				WALMinSyncInterval: d.opts.WALMinSyncInterval,
+			})
 		}
 
 		immMem := d.mu.mem.mutable

@@ -6,14 +6,15 @@ package pebble
 
 import (
 	"fmt"
+	"time"
 
-	"github.com/HdrHistogram/hdrhistogram-go"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/cache"
 	"github.com/cockroachdb/pebble/internal/humanize"
 	"github.com/cockroachdb/pebble/record"
 	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/redact"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // CacheMetrics holds metrics for the block and table cache.
@@ -229,13 +230,25 @@ type Metrics struct {
 		BytesWritten uint64
 	}
 
-	LogWriter record.LogWriterMetrics
+	LogWriter struct {
+		FsyncLatency prometheus.Histogram
+		record.LogWriterMetrics
+	}
 
 	private struct {
 		optionsFileSize  uint64
 		manifestFileSize uint64
 	}
 }
+
+var (
+	// FsyncLatencyBuckets are prometheus histogram buckets suitable for a histogram
+	// that records latencies for fsyncs.
+	FsyncLatencyBuckets = append(
+		prometheus.LinearBuckets(0.0, float64(time.Microsecond*100), 50),
+		prometheus.ExponentialBucketsRange(float64(time.Millisecond*5), float64(10*time.Second), 50)...,
+	)
+)
 
 // DiskSpaceUsage returns the total disk space used by the database in bytes,
 // including live and obsolete files.
@@ -432,42 +445,4 @@ func hitRate(hits, misses int64) float64 {
 		return 0
 	}
 	return 100 * float64(hits) / float64(sum)
-}
-
-// InternalIntervalMetrics exposes metrics about internal subsystems, that can
-// be useful for deep observability purposes, and for higher-level admission
-// control systems that are trying to estimate the capacity of the DB. These
-// are experimental and subject to change, since they expose internal
-// implementation details, so do not rely on these without discussion with the
-// Pebble team.
-// These represent the metrics over the interval of time from the last call to
-// retrieve these metrics. These are not cumulative, unlike Metrics. The main
-// challenge in making these cumulative is the hdrhistogram.Histogram, which
-// does not have the ability to subtract a histogram from a preceding metric
-// retrieval.
-type InternalIntervalMetrics struct {
-	// LogWriter metrics.
-	LogWriter struct {
-		// WriteThroughput is the WAL throughput.
-		WriteThroughput ThroughputMetric
-		// PendingBufferUtilization is the utilization of the WAL writer's
-		// finite-sized pending blocks buffer. It provides an additional signal
-		// regarding how close to "full" the WAL writer is. The value is in the
-		// interval [0,1].
-		PendingBufferUtilization float64
-		// SyncQueueUtilization is the utilization of the WAL writer's
-		// finite-sized queue of work that is waiting to sync. The value is in the
-		// interval [0,1].
-		SyncQueueUtilization float64
-		// SyncLatencyMicros is a distribution of the fsync latency observed by
-		// the WAL writer. It can be nil if there were no fsyncs.
-		SyncLatencyMicros *hdrhistogram.Histogram
-	}
-	// Flush loop metrics.
-	Flush struct {
-		// WriteThroughput is the flushing throughput.
-		WriteThroughput ThroughputMetric
-	}
-	// NB: the LogWriter throughput and the Flush throughput are not directly
-	// comparable because the former does not compress, unlike the latter.
 }

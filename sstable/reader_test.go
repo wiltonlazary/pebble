@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/cache"
 	"github.com/cockroachdb/pebble/internal/datadriven"
 	"github.com/cockroachdb/pebble/internal/errorfs"
+	"github.com/cockroachdb/pebble/internal/testkeys"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/exp/rand"
@@ -58,7 +59,12 @@ func (r *Reader) get(key []byte) (value []byte, err error) {
 	if err != nil {
 		return nil, err
 	}
-	ikey, value := i.SeekGE(key, base.SeekGEFlagsNone)
+	var v base.LazyValue
+	ikey, v := i.SeekGE(key, base.SeekGEFlagsNone)
+	value, _, err = v.Value(nil)
+	if err != nil {
+		return nil, err
+	}
 
 	if ikey == nil || r.Compare(key, ikey.UserKey) != 0 {
 		err := i.Close()
@@ -93,9 +99,14 @@ func newIterAdapter(iter Iterator) *iterAdapter {
 	}
 }
 
-func (i *iterAdapter) update(key *InternalKey, val []byte) bool {
+func (i *iterAdapter) update(key *InternalKey, val base.LazyValue) bool {
 	i.key = key
-	i.val = val
+	if v, _, err := val.Value(nil); err != nil {
+		i.key = nil
+		i.val = nil
+	} else {
+		i.val = v
+	}
 	return i.key != nil
 }
 
@@ -129,7 +140,7 @@ func (i *iterAdapter) Next() bool {
 
 func (i *iterAdapter) NextIgnoreResult() {
 	i.Iterator.Next()
-	i.update(nil, nil)
+	i.update(nil, base.LazyValue{})
 }
 
 func (i *iterAdapter) Prev() bool {
@@ -205,7 +216,7 @@ func TestReader(t *testing.T) {
 							oName, lName, dName, iName),
 						func(t *testing.T) {
 							runTestReader(
-								t, tableOpt, testDirs[oName], nil /* Reader */, 0)
+								t, tableOpt, testDirs[oName], nil /* Reader */, 0, false)
 						})
 				}
 			}
@@ -233,7 +244,9 @@ func TestHamletReader(t *testing.T) {
 
 		t.Run(
 			fmt.Sprintf("sst=%s", prebuiltSST),
-			func(t *testing.T) { runTestReader(t, WriterOptions{}, "testdata/hamletreader", r, 0) },
+			func(t *testing.T) {
+				runTestReader(t, WriterOptions{}, "testdata/hamletreader", r, 0, false)
+			},
 		)
 	}
 }
@@ -243,7 +256,19 @@ func TestReaderStats(t *testing.T) {
 		BlockSize:      30,
 		IndexBlockSize: 30,
 	}
-	runTestReader(t, tableOpt, "testdata/readerstats", nil, 10000)
+	runTestReader(t, tableOpt, "testdata/readerstats", nil, 10000, false)
+}
+
+func TestReaderWithBlockPropertyFilter(t *testing.T) {
+	writerOpt := WriterOptions{
+		BlockSize:               1,
+		IndexBlockSize:          40,
+		Comparer:                testkeys.Comparer,
+		TableFormat:             TableFormatMax,
+		BlockPropertyCollectors: []func() BlockPropertyCollector{NewTestKeysBlockPropertyCollector},
+	}
+	runTestReader(
+		t, writerOpt, "testdata/reader_bpf", nil /* Reader */, 0, true)
 }
 
 func TestInjectedErrors(t *testing.T) {
@@ -277,7 +302,14 @@ func TestInjectedErrors(t *testing.T) {
 				return err
 			}
 			defer func() { reterr = firstError(reterr, iter.Close()) }()
-			for k, v := iter.First(); k != nil && v != nil; k, v = iter.Next() {
+			for k, v := iter.First(); k != nil; k, v = iter.Next() {
+				val, _, err := v.Value(nil)
+				if err != nil {
+					return err
+				}
+				if val == nil {
+					break
+				}
 			}
 			if err = iter.Error(); err != nil {
 				return err
@@ -319,7 +351,44 @@ func TestInvalidReader(t *testing.T) {
 	}
 }
 
-func runTestReader(t *testing.T, o WriterOptions, dir string, r *Reader, cacheSize int) {
+func indexLayoutString(t *testing.T, r *Reader) string {
+	indexH, err := r.readIndex(nil /* stats */)
+	require.NoError(t, err)
+	defer indexH.Release()
+	var buf strings.Builder
+	twoLevelIndex := r.Properties.IndexType == twoLevelIndex
+	buf.WriteString("index entries:\n")
+	iter, err := newBlockIter(r.Compare, indexH.Get())
+	defer func() {
+		require.NoError(t, iter.Close())
+	}()
+	require.NoError(t, err)
+	for key, value := iter.First(); key != nil; key, value = iter.Next() {
+		bh, err := decodeBlockHandleWithProperties(value.InPlaceValue())
+		require.NoError(t, err)
+		fmt.Fprintf(&buf, " %s: size %d\n", string(key.UserKey), bh.Length)
+		if twoLevelIndex {
+			b, err := r.readBlock(bh.BlockHandle, nil, nil, nil)
+			require.NoError(t, err)
+			defer b.Release()
+			iter2, err := newBlockIter(r.Compare, b.Get())
+			defer func() {
+				require.NoError(t, iter2.Close())
+			}()
+			require.NoError(t, err)
+			for key, value := iter2.First(); key != nil; key, value = iter2.Next() {
+				bh, err := decodeBlockHandleWithProperties(value.InPlaceValue())
+				require.NoError(t, err)
+				fmt.Fprintf(&buf, "   %s: size %d\n", string(key.UserKey), bh.Length)
+			}
+		}
+	}
+	return buf.String()
+}
+
+func runTestReader(
+	t *testing.T, o WriterOptions, dir string, r *Reader, cacheSize int, printLayout bool,
+) {
 	datadriven.Walk(t, dir, func(t *testing.T, path string) {
 		defer func() {
 			if r != nil {
@@ -340,6 +409,9 @@ func runTestReader(t *testing.T, o WriterOptions, dir string, r *Reader, cacheSi
 				if err != nil {
 					return err.Error()
 				}
+				if printLayout {
+					return indexLayoutString(t, r)
+				}
 				return ""
 
 			case "iter":
@@ -349,10 +421,25 @@ func runTestReader(t *testing.T, o WriterOptions, dir string, r *Reader, cacheSi
 				}
 				var stats base.InternalIteratorStats
 				r.Properties.GlobalSeqNum = seqNum
+				var filterer *BlockPropertiesFilterer
+				if d.HasArg("block-property-filter") {
+					var filterMin, filterMax uint64
+					d.ScanArgs(t, "block-property-filter", &filterMin, &filterMax)
+					bpf := NewTestKeysBlockPropertyFilter(filterMin, filterMax)
+					filterer = NewBlockPropertiesFilterer([]BlockPropertyFilter{bpf}, nil)
+					intersects, err :=
+						filterer.IntersectsUserPropsAndFinishInit(r.Properties.UserProperties)
+					if err != nil {
+						return err.Error()
+					}
+					if !intersects {
+						return "table does not intersect BlockPropertyFilter"
+					}
+				}
 				iter, err := r.NewIterWithBlockPropertyFilters(
-					nil,  /* lower */
-					nil,  /* upper */
-					nil,  /* filterer */
+					nil, /* lower */
+					nil, /* upper */
+					filterer,
 					true, /* use filter block */
 					&stats,
 				)
